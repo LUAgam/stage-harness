@@ -1,0 +1,15 @@
+{
+  "epic_id": "<epic-id>",
+  "version": "1.0",
+  "scenarios": [
+    {
+      "scenario_id": "SCN-001",
+      "pattern": "",
+      "source_signals": [],
+      "confidence": "high",
+      "scenario": "",
+      "why_it_matters": "",
+      "expected_followup": "DEC"
+    }
+  ]
+}

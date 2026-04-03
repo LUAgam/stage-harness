@@ -1,0 +1,8 @@
+{
+  "epic_id": "",
+  "risk_level": "medium",
+  "total_budget": 2,
+  "consumed": 0,
+  "allowed_checkpoints": ["PLAN→EXECUTE", "VERIFY→DONE"],
+  "history": []
+}

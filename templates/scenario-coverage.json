@@ -1,0 +1,12 @@
+{
+  "epic_id": "<epic-id>",
+  "version": "1.0",
+  "scenarios": [
+    {
+      "scenario_id": "SCN-001",
+      "status": "covered",
+      "mapped_to": ["REQ-001"],
+      "notes": ""
+    }
+  ]
+}

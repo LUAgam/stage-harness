@@ -1,0 +1,14 @@
+{
+  "task_id": "",
+  "phase": "EXECUTE",
+  "preflight": {"passed": false, "checks": []},
+  "implementation": {
+    "base_commit": "",
+    "head_commit": "",
+    "files_changed": 0
+  },
+  "smoke": {"passed": false, "commands": []},
+  "evidence": {},
+  "new_risks": [],
+  "timestamp": ""
+}

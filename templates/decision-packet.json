@@ -1,0 +1,9 @@
+{
+  "version": "1.0",
+  "epic_id": "",
+  "stage": "CLARIFY",
+  "packet_id": "DP-CLARIFY-001",
+  "created_at": "",
+  "questions": [],
+  "auto_release_if_all_answered": true
+}

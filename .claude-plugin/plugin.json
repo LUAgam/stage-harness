@@ -1,0 +1,36 @@
+{
+  "name": "stage-harness",
+  "version": "0.1.0",
+  "description": "阶段化 AI 开发 Harness — 从模糊需求到交付的端到端 Claude Code 插件",
+  "author": {
+    "name": "stage-harness"
+  },
+  "commands": ["./commands/"],
+  "agents": [
+    "./agents/code-reviewer.md",
+    "./agents/config-scout.md",
+    "./agents/challenger.md",
+    "./agents/deep-dive-specialist.md",
+    "./agents/dependency-mapper.md",
+    "./agents/design-scout.md",
+    "./agents/docs-scout.md",
+    "./agents/domain-scout.md",
+    "./agents/impact-analyst.md",
+    "./agents/lead-orchestrator.md",
+    "./agents/logic-reviewer.md",
+    "./agents/plan-reviewer.md",
+    "./agents/project-surface-router.md",
+    "./agents/quality-auditor.md",
+    "./agents/release-reviewer.md",
+    "./agents/requirement-analyst.md",
+    "./agents/repo-router.md",
+    "./agents/runtime-auditor.md",
+    "./agents/security-reviewer.md",
+    "./agents/skill-miner.md",
+    "./agents/symbol-navigator.md",
+    "./agents/system-observer.md",
+    "./agents/test-reviewer.md",
+    "./agents/worker.md"
+  ],
+  "skills": ["./skills/"]
+}

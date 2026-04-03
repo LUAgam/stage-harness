@@ -1,0 +1,28 @@
+{
+  "epic": "<epic-id>",
+  "created_at": "",
+  "surfaces": [
+    {
+      "type": "code_repository",
+      "repo_id": "",
+      "path": "src/",
+      "priority": "P0",
+      "reason": "Primary code surface for this epic",
+      "dive_strategy": "targeted",
+      "scan_budget": { "max_files": 15, "max_grep_rounds": 3 },
+      "evidence_level": "source",
+      "assigned_to": "repo-router"
+    }
+  ],
+  "excluded": [],
+  "scout_assignments": {
+    "repo-router": ["src/"],
+    "docs-scout": [],
+    "config-scout": [],
+    "design-scout": [],
+    "symbol-navigator": [],
+    "dependency-mapper": []
+  },
+  "total_surfaces": 1,
+  "excluded_surfaces": 0
+}

@@ -1,0 +1,27 @@
+{
+  "epic": "<epic-id>",
+  "generated_at": "",
+  "repos": [
+    {
+      "repo_id": "example-service",
+      "impact": "high",
+      "reason": "REQ touches user API implemented here",
+      "confidence": "high"
+    }
+  ],
+  "interfaces": [
+    {
+      "kind": "openapi",
+      "path": "api/openapi.yaml",
+      "repo_id": "example-service",
+      "notes": ""
+    }
+  ],
+  "shared_artifacts": [],
+  "excluded_repos": [
+    {
+      "repo_id": "other-service",
+      "reason": "No REQ or dependency path touches this repo"
+    }
+  ]
+}

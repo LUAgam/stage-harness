@@ -1,0 +1,17 @@
+# Multi-repo workspace catalog (optional).
+# Place at .harness/repo-catalog.yaml when workspace_mode is multi-repo.
+# Copy from stage-harness/templates/repo-catalog.yaml and fill in repos.
+
+version: 1
+workspace_mode: multi-repo
+repos:
+  - repo_id: example-service
+    path: services/example-service
+    primary_language: typescript
+    framework: ""
+    domain_tags: [api, users]
+    role: core_path
+    owner: ""
+    package_aliases: []
+    import_prefixes: []
+notes: "One entry per sibling repo or monorepo root you treat as a logical repo."

@@ -1,0 +1,29 @@
+type: backend-service
+risk_level: medium
+primary_language: typescript
+framework: ""
+build_tool: npm
+test_framework: jest
+has_database: true
+has_auth: false
+has_docker: true
+has_ci: true
+estimated_size: medium
+intensity:
+  agent_parallelism: 3
+  council_size: 3
+  harness_strength: standard
+notes: ""
+# workspace_mode: single-repo | monorepo | multi-repo | docs-heavy | infra-heavy
+workspace_mode: single-repo
+scan:
+  max_repos_deep_scan: 5
+  max_files_deep_read_per_scout: 20
+  max_subagents_wave: 4
+primary_surfaces: [src/]
+check_focus:
+  - api_contract
+  - state_idempotency
+detected_at: ""
+confidence: 0.0
+overrides: {}

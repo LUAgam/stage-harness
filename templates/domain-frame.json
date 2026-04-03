@@ -1,0 +1,13 @@
+{
+  "epic_id": "<epic-id>",
+  "version": "1.0",
+  "business_goals": [],
+  "domain_constraints": [],
+  "invariants": [],
+  "semantic_signals": [],
+  "candidate_edge_cases": [],
+  "candidate_open_questions": [],
+  "state_transition_scenarios": [],
+  "constraint_conflicts": [],
+  "anti_patterns": []
+}
