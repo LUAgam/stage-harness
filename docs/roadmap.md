@@ -5,9 +5,17 @@
 ## 使用方式
 
 - 新方向先加到「方向清单」，再决定是否进入 `P0` / `P1` / `P2`
-- 每个方向至少写清：目标、价值、风险、核心落点、验收信号
-- 已进入实施的方向，补充状态：`proposed` / `planned` / `in_progress` / `done`
+- 每个方向至少写清：目标、价值、风险、核心落点、当前落地情况、待补强点、验收信号
+- 每个方向同时维护两类状态：
+  - **实现状态**：`未实现` / `部分实现` / `基础已落地`
+  - **推进状态**：`proposed` / `planned` / `in_progress` / `done`
 - 若某方向改变了边界或优先级，优先改本文件，再改具体设计文档
+
+## 状态图例
+
+- `未实现`：基本还停留在文档或设想层，没有稳定产品入口
+- `部分实现`：已有局部能力或首版机制，但还没形成完整闭环
+- `基础已落地`：已有可用核心能力，可对外宣传，但仍有明显扩展空间
 
 ## 总览
 
@@ -26,17 +34,39 @@
 
 ## 优先级总表
 
-| 优先级 | 方向 | 来源 | 当前判断 | 核心原因 |
-|------|------|------|------|------|
-| P0 | setup / doctor / repair 安装与运行自检体系 | 推荐 | 强烈建议优先做 | 直接决定插件是否能稳定安装、诊断和恢复，是产品化与 `/plugin install` 的关键基础设施 |
-| P0 | 期间分析自动落地成文档 | 用户 | 强烈建议优先做 | 是后续复用、并行、自学习的共同基础 |
-| P0 | 可回放执行证据链 | 推荐 | 强烈建议优先做 | 没有证据链就很难审计、复盘、学习 |
-| P0 | Focus Points 机制增强 | 推荐 | 建议优先做 | 最直接提升“用户点名关注是否被真正跟进” |
-| P1 | 多仓代码分析并行 | 用户 | 很值得做 | 多仓场景收益明显，但要先有统一收口与证据 |
-| P1 | 项目画像持续刷新 | 推荐 | 很值得做 | 能减少后续 Epic 重复扫描，提升路由精度 |
-| P1 | 复用资产库 | 推荐 | 很值得做 | 把零散产物变成长期可复用能力 |
-| P2 | 记忆 + 自学习到 skills | 用户 | 值得做但应后置 | 没有高质量沉淀层时容易学歪 |
-| P2 | ROI / 成功率度量 | 推荐 | 值得做但应后置 | 应建立在前面能力稳定之后 |
+| 优先级 | 方向 | 来源 | 实现状态 | 当前判断 | 核心原因 |
+|------|------|------|------|------|------|
+| P0 | setup / doctor / repair 安装与运行自检体系 | 推荐 | 未实现 | 强烈建议优先做 | 直接决定插件是否能稳定安装、诊断和恢复，是产品化与 `/plugin install` 的关键基础设施 |
+| P0 | 期间分析自动落地成文档 | 用户 | 基础已落地 | 强烈建议继续做深 | 已有大量阶段产物，但还缺更强的复用摘要层和主动消费机制 |
+| P0 | 可回放执行证据链 | 推荐 | 部分实现 | 强烈建议优先补强 | 已有 `execution-trace` 基础，但还缺 session archive、audit findings、replay 视图 |
+| P0 | Focus Points 机制增强 | 推荐 | 部分实现 | 建议优先补强 | CLARIFY 闭环已有首版，但还未完整贯穿 TASK / TEST / VERIFY |
+| P1 | 多仓代码分析并行 | 用户 | 部分实现 | 很值得做 | 多仓分析与路由基础已在，但执行并行与统一收口仍需继续完善 |
+| P1 | 项目画像持续刷新 | 推荐 | 部分实现 | 很值得做 | 目前更像初始化检测，动态刷新与热点演化机制还没完成 |
+| P1 | 复用资产库 | 推荐 | 基础已落地 | 很值得做 | `codemap` / `pitfalls` 已有基础，但还未形成更广义资产库 |
+| P2 | 记忆 + 自学习到 skills | 用户 | 部分实现 | 值得做但应后置 | 已有 `skill-miner` 与 candidate-skill 基础，但还没有完整 shadow / replay 闭环 |
+| P2 | ROI / 成功率度量 | 推荐 | 部分实现 | 值得做但应后置 | 已有 `scan-metrics` / `scan-roi` 基础，但指标面仍偏窄 |
+
+## 当前实现概览
+
+### 已有明显基础，可直接对外宣传
+
+- 阶段化开发主链与 `FIX` 回路
+- 结构化分析产物：`domain-frame`、`impact-scan`、`scenario-coverage`、`decision-bundle`、`verification`、`delivery-summary` 等
+- 阶段门禁、自检与产物校验：`stage-gate check`、`clarify-selfcheck`、`verify-artifacts.sh`
+- 多仓基础能力：`workspace_mode`、`repo-catalog`、`cross-repo-impact-index`、`surface-routing`
+- 复用资产基础：`memory/pitfalls.md`、`memory/codemaps/*`、`codemap-audit`
+
+### 已有首版或局部实现，但还不宜宣传为完整能力
+
+- `execution-trace.jsonl` 与 trace 事件体系
+- `Focus Points` 闭环校验
+- `skill-miner` 与 candidate-skills
+- `profile detect`、扫描预算与工作区画像
+- `metrics derive/show`、`scan-metrics.json`、`scan-roi.jsonl`
+
+### 目前最明显的空白项
+
+- `setup / doctor / repair` 安装与运行自检体系
 
 ## 推荐推进顺序
 
@@ -64,7 +94,8 @@
 
 - 来源：推荐
 - 优先级：`P0`
-- 建议状态：`planned`
+- 实现状态：`未实现`
+- 推进状态：`planned`
 
 ### 目标
 
@@ -75,6 +106,18 @@
 - 这是把 `stage-harness` 从“本地可用仓库”升级为“可分发产品”的关键基础设施
 - 对后续支持 `/plugin install`、marketplace 分发和更低摩擦 onboarding 非常重要
 - 运行失败时，用户最需要的是明确的诊断和可执行修复建议，而不是重新阅读长文档
+
+### 当前落地情况
+
+- 当前主要依赖 `README` / `docs/usage.md` 中的手工说明完成安装和配置
+- 运行时路径仍大量依赖 `HARNESSCTL` 或相对路径假设
+- 仓库内没有统一的 `setup`、`doctor`、`repair` 命令入口
+
+### 仍需补强
+
+- 把安装、环境检查、恢复入口标准化
+- 把常见错误从“文档说明”升级为“命令级诊断”
+- 支持低风险自动修复和明确的风险分级输出
 
 ### 核心内容
 
@@ -124,7 +167,8 @@
 
 - 来源：用户
 - 优先级：`P0`
-- 建议状态：`planned`
+- 实现状态：`基础已落地`
+- 推进状态：`planned`
 
 ### 目标
 
@@ -135,6 +179,19 @@
 - 这是后续记忆、自学习、并行分析的输入基础
 - 可以减少“看过但没落地、下一次又重做”的重复成本
 - 有利于人类复盘和多 agent 共享结论
+
+### 当前落地情况
+
+- CLARIFY / PLAN / VERIFY / DONE 已经会落大量结构化产物
+- 已有 `domain-frame.json`、`requirements-draft.md`、`impact-scan.md`、`scenario-coverage.json`
+- 已有 `surface-routing.json`、`decision-bundle.json`、`decision-packet.json`
+- 已有 `verification.json`、`delivery-summary.md`、`release-notes.md`
+
+### 仍需补强
+
+- 增加更统一的复用摘要层，例如 `analysis-summary.md`
+- 让后续 Epic 主动消费历史分析，而不是只把产物留在目录里
+- 把“文档存在”进一步推进为“文档可检索、可引用、可比较”
 
 ### 核心内容
 
@@ -177,7 +234,8 @@
 
 - 来源：用户
 - 优先级：`P2`
-- 建议状态：`proposed`
+- 实现状态：`部分实现`
+- 推进状态：`proposed`
 
 ### 目标
 
@@ -188,6 +246,19 @@
 - 长期可以形成 `stage-harness` 的复用壁垒
 - 能把“做过一次”升级为“下次更快做对”
 - 适合沉淀项目专有模式、通用套路和反模式
+
+### 当前落地情况
+
+- 已有 `skill-miner` agent
+- 已有 `.harness/memory/candidate-skills/`
+- 已有 `skill list` / `show` / `promote` / `archive`
+- DONE 阶段已经能挖掘候选技能，`memory/pitfalls.md` 也已存在
+
+### 仍需补强
+
+- 缺少统一的 `observation -> pattern -> candidate-skill -> promoted-skill` 分层
+- 缺少真正的 shadow validation / replay backtest
+- 还没有较强的 project-local 与 plugin-global 治理边界
 
 ### 核心内容
 
@@ -227,7 +298,8 @@
 
 - 来源：用户
 - 优先级：`P1`
-- 建议状态：`planned`
+- 实现状态：`部分实现`
+- 推进状态：`planned`
 
 ### 目标
 
@@ -238,6 +310,20 @@
 - 多仓场景下，串行扫描成本高
 - 分析和路由天然适合并行
 - 能明显降低 CLARIFY / PLAN 的等待时间
+
+### 当前落地情况
+
+- 已支持 `workspace_mode: multi-repo`
+- 已有 `.harness/repo-catalog.yaml`
+- 已有 `cross-repo-impact-index.json`
+- 已有 `surface-routing.json` 和扫描预算
+- PLAN 阶段已有多 scout 并行研究设计
+
+### 仍需补强
+
+- fan-out / fan-in 收口流程还需更明确
+- EXECUTE 的多仓并行边界和风险控制还不够成熟
+- `cross-repo verification`、`repo-level task lease` 仍未形成稳定能力
 
 ### 核心内容
 
@@ -275,7 +361,8 @@
 
 - 来源：推荐
 - 优先级：`P1`
-- 建议状态：`proposed`
+- 实现状态：`部分实现`
+- 推进状态：`proposed`
 
 ### 目标
 
@@ -286,6 +373,19 @@
 - 初始画像通常只够粗定位
 - 真正的高频改动面往往要经过多个 Epic 才能识别
 - 能提高多仓路由和分析边界的准确度
+
+### 当前落地情况
+
+- 已有 `profile detect`
+- 已有 `workspace_mode` 检测
+- 已有 primary surfaces、repo alias discovery、scan defaults
+- 已能根据工作区模式调整扫描边界
+
+### 仍需补强
+
+- 现在更像“初始化检测”，不是“持续刷新”
+- 还缺基于 Epic 历史的热点演化和证据驱动更新
+- 还缺 stale 字段治理与动态画像版本化
 
 ### 核心内容
 
@@ -313,7 +413,8 @@
 
 - 来源：推荐
 - 优先级：`P0`
-- 建议状态：`planned`
+- 实现状态：`部分实现`
+- 推进状态：`planned`
 
 ### 目标
 
@@ -324,6 +425,20 @@
 - 没有证据链，就无法回答“为什么走到这一步”
 - 是自动纠偏、candidate skill、ROI 统计的共同输入
 - 对排查 gate 误判、阶段漂移特别关键
+
+### 当前落地情况
+
+- 已有 `execution-trace.jsonl`
+- `harnessctl` 已在多处写入 trace event
+- 已有 `gate-skips.json`
+- 已有 `patch diagnose` 消费 trace 的能力
+- 已有部分 session log 目录准备和 JIT patch 诊断链路
+
+### 仍需补强
+
+- 还缺完整的 session archive
+- 还缺 `audit-findings.json` / `audit-summary.md`
+- 还缺更高层的 replay / audit 入口和更稳定的 trace schema 约束
 
 ### 核心内容
 
@@ -358,7 +473,8 @@
 
 - 来源：推荐
 - 优先级：`P0`
-- 建议状态：`planned`
+- 实现状态：`部分实现`
+- 推进状态：`planned`
 
 ### 目标
 
@@ -369,6 +485,18 @@
 - 能显著提高用户对系统“抓重点能力”的感知
 - 让关键关注点真正映射到任务、测试和验证
 - 避免“分析很完整，但没回答用户最在意的事”
+
+### 当前落地情况
+
+- 已支持 `clarification-notes.md` 的 Focus Points 小节
+- 已支持 `.harness/features/<epic-id>/focus-points.json`
+- `stage-gate check CLARIFY`、`clarify-selfcheck`、`verify-artifacts.sh` 已会校验映射闭环
+
+### 仍需补强
+
+- 重点仍集中在 CLARIFY，尚未完整贯穿 TASK / TEST / VERIFY
+- `verification.json` 里还缺更显式的 focus coverage 结构
+- 还没形成 `covered / partial / missed` 的稳定验收口径
 
 ### 核心内容
 
@@ -404,7 +532,8 @@
 
 - 来源：推荐
 - 优先级：`P1`
-- 建议状态：`proposed`
+- 实现状态：`基础已落地`
+- 推进状态：`proposed`
 
 ### 目标
 
@@ -414,6 +543,19 @@
 
 - 单个 Epic 目录天然是“局部沉淀”
 - 真正能持续提效的是可搜索、可复用、可校验的共享资产
+
+### 当前落地情况
+
+- 已有 `memory/pitfalls.md`
+- 已有 `memory/codemaps/*`
+- 已有 `codemap-init`、`codemap-probe`、`codemap-audit`
+- 已支持 stale / invalid CodeMap 的可信度降级
+
+### 仍需补强
+
+- 还缺更广义的 playbook、验证模板、常见改动路径资产
+- 资产还缺统一元数据治理和主动引用机制
+- “单次 Epic 产物”与“长期资产”之间的提升路径还可继续明确
 
 ### 核心内容
 
@@ -443,7 +585,8 @@
 
 - 来源：推荐
 - 优先级：`P2`
-- 建议状态：`proposed`
+- 实现状态：`部分实现`
+- 推进状态：`proposed`
 
 ### 目标
 
@@ -453,6 +596,20 @@
 
 - 没有度量，就很难知道哪些机制值得继续投入
 - 可以帮助判断并行、自学习、文档沉淀是否真正有效
+
+### 当前落地情况
+
+- 已有 `metrics check`
+- 已有 `metrics derive`
+- 已有 `metrics show`
+- 已有 `.harness/features/<epic-id>/scan-metrics.json`
+- 已有 `.harness/metrics/scan-roi.jsonl`
+
+### 仍需补强
+
+- 当前指标仍偏向扫描 / 路由 / codemap ROI
+- 还缺更广义的 Epic 完成率、FIX 回流率、focus point 命中率、candidate-skill 成功率
+- 还缺更明确的 dashboard / 周期性复盘视图
 
 ### 核心内容
 

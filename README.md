@@ -6,6 +6,25 @@
 
 ---
 
+## 当前已具备的核心能力
+
+- **阶段化开发闭环**：已具备 `IDEA -> CLARIFY -> SPEC -> PLAN -> EXECUTE -> VERIFY -> DONE` 主链，以及 `FIX -> VERIFY` 回路。
+- **结构化分析产物**：CLARIFY / PLAN / VERIFY / DONE 会落 `domain-frame.json`、`impact-scan.md`、`scenario-coverage.json`、`decision-bundle.json`、`verification.json`、`delivery-summary.md`、`release-notes.md` 等产物，而不是只停留在对话里。
+- **阶段门禁与自检**：已支持 `stage-gate check`、`clarify-selfcheck`、`verify-artifacts.sh`，可以在推进阶段前做结构校验与阻断。
+- **多仓基础能力**：已支持 `workspace_mode`、`repo-catalog`、`cross-repo-impact-index.json`、`surface-routing.json`，具备 multi-repo 工作区的影响扫描与路由基础。
+- **复用资产基础**：已支持 `memory/pitfalls.md`、`memory/codemaps/*`、`codemap-audit`，可以沉淀热点模块认知并检查 CodeMap 是否 stale。
+- **验证与交付闭环**：已支持 `verification.json`、验收议会、返工回路，以及 `delivery-summary.md` / `release-notes.md` 交付产物。
+
+## 当前正在补强
+
+- **执行证据链**：已有 `execution-trace.jsonl` 和 trace 事件基础，但完整 session archive / audit 视图仍在继续完善。
+- **用户关注点闭环**：已支持 `Focus Points` / `focus-points.json` 校验，但从 CLARIFY 贯穿到 TASK / TEST / VERIFY 的完整闭环仍在增强。
+- **候选技能与度量**：已具备 `skill-miner`、candidate-skills、`scan-metrics.json`、`scan-roi.jsonl` 基础，但完整自学习闭环与更宽的成功率指标仍在 roadmap 中。
+
+完整演进方向见 [docs/roadmap.md](docs/roadmap.md)。
+
+---
+
 ## 安装与环境
 
 1. **加载本插件**：将整个仓库作为 Claude Code 插件根目录（含 `.claude-plugin/plugin.json`）。使用 Claude CLI 时通过 **`--plugin-dir`** 指向本仓库根目录即可，例如：
