@@ -6,7 +6,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-HARNESSCTL="${CLAUDE_PLUGIN_ROOT}/scripts/harnessctl"
+HARNESSCTL="${CLAUDE_PLUGIN_ROOT:-}/scripts/harnessctl"
 
 # 读取输入
 INPUT=$(cat 2>/dev/null || true)
@@ -103,6 +103,12 @@ try:
 except:
     print(sys.stdin.read())
 " 2>/dev/null || echo "$INPUT")
+fi
+
+# `/harness:start` / `/stage-harness:harness-start` 需要独立完成 bootstrap，
+# 避免把现有 active epic 的阶段提醒注入进去，导致模型误判为应继续推进。
+if [[ "$PROMPT_TEXT" =~ ^[[:space:]]*/(harness:start|stage-harness:harness-start)([[:space:]]|$) ]]; then
+  exit 0
 fi
 
 REMINDER="[Stage-Harness 阶段提醒]\n"

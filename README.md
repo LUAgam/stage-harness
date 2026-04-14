@@ -1,0 +1,112 @@
+# Stage-Harness
+
+阶段化 AI 开发 Harness：在 Claude Code 中把模糊需求走成 **IDEA → CLARIFY → SPEC → PLAN → EXECUTE → VERIFY → DONE**（含 **FIX** 回路）的端到端流水线，配合 `harnessctl` 门禁、产物校验与 slash 命令编排。
+
+更完整的概念与目录说明见 [docs/README.md](docs/README.md)；命令与流程细节见 [docs/usage.md](docs/usage.md)。
+
+---
+
+## 安装与环境
+
+1. 将整个仓库放到 Claude Code 可识别的 **插件路径** 下（本仓库含 `.claude-plugin/plugin.json`，可作为 Claude Code 插件加载）。
+2. 为脚本加上执行权限：
+   ```bash
+   chmod +x scripts/harnessctl.py scripts/*.sh
+   ```
+3. 若未把 `harnessctl` 装进系统 `PATH`，在**被开发项目的根目录**指向本仓库里的 CLI（按你的目录二选一）：
+   ```bash
+   # 本仓库就是插件根目录（常见）
+   export HARNESSCTL="${HARNESSCTL:-./scripts/harnessctl}"
+
+   # 或插件放在子目录 stage-harness/ 下
+   # export HARNESSCTL="${HARNESSCTL:-./stage-harness/scripts/harnessctl}"
+   ```
+4. 首次使用 `/harness:start` 时会初始化项目下的 `.harness/`（也可手动执行 `$HARNESSCTL init`）。
+
+---
+
+## Slash 命令一览
+
+在对话中使用以下命令（阶段为流水线中的位置；具体行为以各 `commands/harness-*.md` 为准）：
+
+| 命令 | 阶段 | 说明 |
+|------|------|------|
+| `/harness:start` | IDEA→CLARIFY | 启动 Epic：初始化、画像、创建 Epic、进入 CLARIFY |
+| `/harness:clarify` | CLARIFY | 需求澄清、影响扫描、决策包、门禁 |
+| `/harness:spec` | SPEC | Decision Bundle → ShipSpec → 轻量议会 |
+| `/harness:plan` | PLAN | Bridge、表面研究、任务 DAG、覆盖矩阵、Plan 议会 |
+| `/harness:work` | EXECUTE | 按任务执行：锚定→预检→TDD→冒烟→提交与回执 |
+| `/harness:review` | VERIFY | 并行审查、对抗性审查、验收议会 |
+| `/harness:fix` | FIX | 按 `verification.json` 修复后回到 VERIFY |
+| `/harness:done` | DONE | Release 议会、交付包、经验沉淀、技能挖掘 |
+| `/harness:patch` | 任意 | 即时纠偏：诊断偏差、规则补丁草稿与热加载 |
+| `/harness:auto` | 全阶段 | 自治循环推进直至 DONE |
+| `/harness:status` | 任意 | 只读：Epic、阶段、预算、任务进度 |
+| `/harness:bridge` | PLAN | ShipSpec → 深度计划的 Bridge 脚本 |
+
+---
+
+## 典型使用方式
+
+### 手动逐阶段
+
+1. `/harness:start <需求描述>` — 创建 Epic 并停在 CLARIFY。
+2. 按需执行 `/harness:clarify` → `/harness:spec` → `/harness:plan` → `/harness:work` → `/harness:review`。
+3. 审查不通过时用 `/harness:fix`，再 `/harness:review`。
+4. 通过后 `/harness:done` 收尾。
+
+### 自治模式
+
+```text
+/harness:start 我想给系统加一个通知模块
+/harness:auto
+```
+
+`/harness:auto` 会按当前阶段循环执行对应推进逻辑，并在 EXECUTE / VERIFY / FIX 间自动处理，直到 DONE。
+
+### 运行受阻时（JIT 纠偏）
+
+中断会话后可用 `/harness:patch <epic-id>` 生成规则补丁草稿，再配合 `/harness:auto <epic-id>` 热加载后继续。
+
+---
+
+## CLI 速查（`harnessctl`）
+
+在项目根设置好 `HARNESSCTL` 后：
+
+```bash
+$HARNESSCTL status
+$HARNESSCTL state get <epic-id>
+$HARNESSCTL task list <epic-id>
+$HARNESSCTL stage-gate check CLARIFY   # 各阶段名：SPEC、PLAN、VERIFY 等
+$HARNESSCTL clarify-selfcheck --epic-id <epic-id>
+$HARNESSCTL profile detect
+```
+
+多仓、`codemap`、`metrics`、门禁跳过等进阶用法见 [docs/usage.md](docs/usage.md) 的「状态查看」与「常见问题」。
+
+---
+
+## 仓库布局（与使用相关）
+
+| 路径 | 作用 |
+|------|------|
+| `commands/` | 各 `/harness:*` 命令的编排说明 |
+| `agents/` | 专业 Agent 角色定义 |
+| `skills/` | 可复用技能（如 clarify、plan、council） |
+| `hooks/` | SessionStart、PreToolUse 等钩子 |
+| `scripts/` | `harnessctl`、`verify-artifacts.sh`、`decision-bundle.sh` 等 |
+| `templates/` | `project-profile.yaml`、`repo-catalog.yaml` 等模板 |
+| `docs/` | 使用指南、架构与人类协作说明 |
+| `tests/` | 测试（若有变更脚本行为，可在此补充用例） |
+
+运行时产物落在**被开发仓库**的 `.harness/` 下（配置、Epic、`features/<epic-id>/` 等），不在本插件目录内。
+
+---
+
+## 延伸阅读
+
+- [docs/README.md](docs/README.md) — 架构分层、七阶段表、Decision Bundle / 预算 / 议会、`.harness` 目录树  
+- [docs/usage.md](docs/usage.md) — 安装细节、各命令流程与产物、FAQ  
+- [docs/architecture.md](docs/architecture.md) — 实现与模块关系  
+- [docs/human-workflow-and-orchestration.md](docs/human-workflow-and-orchestration.md) — 人类协作与编排注意点  

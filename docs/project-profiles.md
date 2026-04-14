@@ -57,17 +57,23 @@ Stage-Harness detects your project type and adjusts its behavior accordingly. Un
 If auto-detection is wrong, override in `.harness/project-profile.yaml`:
 
 ```yaml
-profile_type: library     # Override detected type
-risk_default: high        # Override default risk
+type: library             # Override detected type
+risk_level: high          # Override default risk
+workspace_mode: single-repo
 intensity:
   agent_parallelism: 4
   council_size: 5
   harness_strength: strict
+scan:
+  max_repos_deep_scan: 3
+  max_files_deep_read_per_scout: 20
+  max_subagents_wave: 3
 ```
 
-Or use harnessctl:
+Or re-run detection and then edit the YAML fields you want to keep:
 ```bash
-harnessctl profile set type=library risk=high
+harnessctl profile detect --json
+harnessctl profile show
 ```
 
 ## Risk Level Impact
@@ -93,10 +99,18 @@ harnessctl profile set type=library risk=high
 
 ## Workspace mode and scan budgets
 
-For large or multi-repo workspaces, set in `.harness/project-profile.yaml` (see `templates/project-profile.yaml`):
+For large or multi-repo workspaces, set in `.harness/project-profile.yaml` (see `templates/project-profile.yaml`). `harnessctl profile detect` now auto-inferrs a first pass for both fields:
 
 - **`workspace_mode`**: `single-repo` | `monorepo` | `multi-repo` | `docs-heavy` | `infra-heavy` — steers CLARIFY impact analysis and PLAN scout scope.
 - **`scan`**: `max_repos_deep_scan`, `max_files_deep_read_per_scout`, `max_subagents_wave` — hard caps for deep reads and parallel fan-out.
+
+Current detection heuristics:
+
+- `docs` type ⇒ `workspace_mode: docs-heavy`
+- `infra` type ⇒ `workspace_mode: infra-heavy`
+- top-level markers like `apps/`, `packages/`, `libs/`, `services/` in combination ⇒ `monorepo`
+- 3+ child repositories with their own `package.json` / `go.mod` / `pyproject.toml` / `Cargo.toml` / `pom.xml` ⇒ `multi-repo`
+- otherwise ⇒ `single-repo`
 
 When `workspace_mode: multi-repo`, add `.harness/repo-catalog.yaml` from `stage-harness/templates/repo-catalog.yaml`. CLARIFY produces `cross-repo-impact-index.json` and (with `project-surface`) `surface-routing.json`. Hotspot notes may live under `.harness/memory/codemaps/` (see `skills/memory/SKILL.md`).
 

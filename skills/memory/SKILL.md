@@ -27,7 +27,9 @@ The memory system enables stage-harness to improve over time: patterns from comp
 ### CodeMap (codemaps/)
 
 - After deep reads of recurring or cross-cutting modules, scouts may write short structured notes under `codemaps/<repo_id>/<module_slug>.md` (see template). **Not a source of truth** — re-read source if `confidence` is low or `verified_commit` is stale.
+- CLI: `harnessctl memory codemap-init <repo_id> <module_slug> --source-path <path> [--source-path ...]` scaffolds a standard CodeMap file from the template with consistent frontmatter.
 - CLI: `harnessctl memory codemap-probe <path-to-codemap.md> [--write] [--json]` compares `source_paths` between `verified_commit` and `HEAD` (project-root git); stale → exit 1; `--write` updates frontmatter (`codemap_probe_at`, `codemap_stale`, may downgrade `confidence`).
+- CLI: `harnessctl memory codemap-audit [path] [--write] [--epic-id <id>] [--json]` batch-audits one CodeMap file or a whole codemap directory tree; summary includes `fresh` / `stale` / `missing_verified_commit` / `invalid`.
 - Prefer hotspots only; do not mirror the whole tree.
 
 ## Memory Operations

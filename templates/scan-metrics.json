@@ -1,0 +1,42 @@
+{
+  "version": "4.6",
+  "epic_id": "<epic-id>",
+  "roi_metrics": {
+    "cache_hit_rate": {
+      "value": 0.0,
+      "stage": "PLAN",
+      "notes": "",
+      "known_metric": true,
+      "updated_at": ""
+    },
+    "source_reread_rate": {
+      "value": 0.0,
+      "stage": "PLAN",
+      "notes": "",
+      "known_metric": true,
+      "updated_at": ""
+    },
+    "avg_latency_clarify_plan": {
+      "value": 0.0,
+      "stage": "PLAN",
+      "notes": "minutes",
+      "known_metric": true,
+      "updated_at": ""
+    }
+  },
+  "acceptance_checks": {
+    "mvp_no_blind_scan": {
+      "status": "met",
+      "notes": "",
+      "known_criterion": true,
+      "updated_at": ""
+    },
+    "routing_auditable": {
+      "status": "met",
+      "notes": "",
+      "known_criterion": true,
+      "updated_at": ""
+    }
+  },
+  "updated_at": ""
+}

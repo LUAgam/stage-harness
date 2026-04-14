@@ -38,6 +38,10 @@ test -n "${HARNESSCTL:-}" && test -x "$HARNESSCTL" || {
 > 2. **must_confirm 必须打断用户**：Decision Bundle 中所有 `must_confirm` 类决策，**必须呈现给用户并等待回复**，不得自行假设答案。用户回复前，流程处于暂停状态。
 > 3. **每个产物必须通过指定脚本生成**：不得手动写入格式不兼容的产物文件。各产物的生成命令见下方各步骤。
 > 4. **通过 stage-gate check 才算完成**：未通过 `$HARNESSCTL stage-gate check CLARIFY` 的 CLARIFY 阶段**不算完成**，禁止推进到 SPEC。若 `.harness/config.json` 中 `clarify_closure_mode` 为 `notes_only`，门禁仅校验 `clarification-notes.md` 的六轴/极简绕行与闭环结构（见 `docs/usage.md`）。
+> 5. **Step 0 前禁止盲扫代码仓**：在 `domain-frame.json` 生成前，禁止做仓库级 `ls`/`find`/宽泛 grep、禁止根目录枚举、禁止为了“理解项目”而反复浏览目录。Step 0 只能使用 Epic 描述、`project-profile.yaml`、可选领域标签。
+> 6. **禁止无关编排动作**：本命令内禁止使用 `TodoWrite`、禁止重复执行 `status` / `budget check` / `config list` 超过一次；拿到 `epic-id`、预算与闭环模式后，下一步必须进入 Step 0 产出，不得继续空转。若运行时已注入 profile/state 上下文，不得再为了“确认一下”反复读取同一信息。
+> 7. **Step 0 必须真的派发 `domain-scout`**：Lead 不得自己“模拟 domain-scout”。前置检查完成后，第一条产出动作必须是调用 `stage-harness:domain-scout` agent（或等价 agent 调度），由该 agent 写出 `domain-frame.json`。若只是 `mkdir`、重复读取画像、口头声明“现在创建”但未落文件，视为失败。
+> 8. **CLARIFY 内禁止跨阶段 Bash**：`PreToolUse` 会在 Bash 命令**明确针对仍处于 CLARIFY 的 epic** 时，拦截 `/harness:spec|plan|work|review|done|patch|auto|bridge|fix`（及 `harness:` / `stage-harness:harness-*` 等价写法）。普通文本输出或其它 epic 的推进不应被误拦；澄清完成后再由主流程推进。
 
 ---
 
@@ -96,8 +100,11 @@ $HARNESSCTL budget check --epic-id <epic-id>
 在结合代码库做影响扫描之前执行：
 
 - 调度 **`domain-scout`**：仅基于 Epic 描述、`project-profile.yaml`、可选领域标签；**不读代码仓库**。
-- 产出 **`.harness/features/<epic-id>/domain-frame.json`**（轻量 JSON，字段见 `agents/domain-scout.md`）。
+- **执行要求**：这里必须显式调用 `stage-harness:domain-scout` agent；不要由 Lead 自己拼 JSON、不要只创建目录、不要重复读取同一份 profile 代替 agent 调度。
+- 产出 **`.harness/features/<epic-id>/domain-frame.json`**（轻量 JSON；完整 schema 以 `agents/domain-scout.md` 为准）。
+- **Step 0 与 `stage-gate check CLARIFY` 对齐的顶层必填键**：`business_goals`、`domain_constraints`、`semantic_signals`、`candidate_edge_cases`、`candidate_open_questions`（与 `scripts/clarify_gate_shared.py` 中 `DOMAIN_FRAME_REQUIRED_KEYS` 一致）。不得用旧 schema 顶层字段（如 `domain`、`subdomain`、`domain_signals` 等）替代上述键。
 - Lead 将摘要写入 `clarification-notes.md` 的 **`## Domain Frame`** 或 **`## 领域框架`** 小节（可与后续 Q&A 合并编辑，但门禁要求该标题存在）。
+- **硬检查**：若 `domain-frame.json` 尚不存在，禁止进入 Step 1/2/2.5，也禁止执行任何代码库扫描命令；优先完成该文件产出。
 
 ### Step 1 — 需求澄清（Q&A）
 
@@ -120,7 +127,11 @@ clarification-notes.md 必须包含：
 - 初始代码调查结论（如适用）
 - 初始假设列表（将在后续步骤细化）
 - **`## 六轴澄清覆盖`**（每轴 `covered` | `not_applicable` | `unknown` + 简短说明）**或** 已判定的 **`## 极简澄清绕行`**（全局 `not_applicable` + 总理由）
+- 若使用 `## 六轴澄清覆盖`，六轴名称必须与 gate canonical 标签完全一致：`StateAndTime / 行为与流程`、`ConstraintsAndConflict / 规则与边界`、`CostAndCapacity / 规模与代价`、`CrossSurfaceConsistency / 多入口`、`OperationsAndRecovery / 运行与维护`、`SecurityAndIsolation / 权限与隔离`
 - **`## Unknowns 与待确认决策`**（编号列出 UNK / DEC / must_confirm，或明确写「本轮无待确认」）
+- **（可选）用户点名关注点闭环**：若用户在对话中明确列出「必须覆盖」的非泛化要点，须在 **`## Focus Points` / `## 用户关注点` / `## 用户点名关注`** 中为每条关注点写出可追溯映射（行内包含 `REQ-` / `CHK-` / `SCN-` / `DEC-` / `UNK-` 之一），**或** 写入同目录可选文件 **`focus-points.json`**（`items[]` 中每项含 `maps_to` / `closure_ref` / `mapped_to` 指向上述编号）。未声明关注点时无需增加该小节；一旦声明，`stage-gate check CLARIFY` 会校验闭环。
+- **`clarify_closure_mode=full` 时的场景驱动 Focus（通用）**：对 `generated-scenarios.json` 中 **high** 置信度、在 `scenario-coverage.json` 中有记录且 **非** `dropped_invalid` 的 `SCN-xxx`，若场景文本命中 harness 内置的 **行为/流程（StateAndTime）** 或 **规则/约束冲突（ConstraintsAndConflict）** 信号规则，Lead 仍须将该 **`SCN-xxx` 显式写回** 上述 Focus 小节或 `focus-points.json`（`maps_to` / `closure_ref` / `mapped_to` / `trace`），不能仅靠 coverage JSON 间接存在。`notes_only` 下不启用此条。
+- 若出现 conflict / retry / rewrite / amplification / performance / capacity 等语义，必须将对应代价或放大风险显式沉淀到 `CostAndCapacity / 规模与代价` 轴，并进一步落到 `SCN` / `DEC` / `UNK` / `REQ` 之一，不能只留在自然语言说明中。
 
 ### Step 2 — 影响扫描（代码库扫描）与并行需求/挑战/场景展开
 
@@ -133,6 +144,7 @@ clarification-notes.md 必须包含：
 
 - **多仓**（`workspace_mode: multi-repo`）：先对照 `.harness/repo-catalog.yaml` 做契约优先的 **Phase A**，写出 **`cross-repo-impact-index.json`**；深扫仓数不得超过 `max_repos_deep_scan`，超出须在 `impact-scan.md` 的 Risk Flags 中要求 Lead/用户收敛后再深扫。
 - **单仓 / monorepo**：沿用 map → scatter → gather；若首轮 map 命中 **3+ 主要模块/目录**、或 `risk_level=high`、或 broad/systemic，可在**自身内部**使用并行 subagents，且受上述 `scan.*` 预算约束。
+- **承载面 hint 失效**：若 `primary_surfaces` 指向的路径不存在，只能进入**有界重定向**（顶层浅扫 + 预算内缩圈）；**禁止**直接退化为根目录 `**/*` 或等价全仓宽扫。若预算内仍无法定位，必须在 `impact-scan.md` 的 Risk Flags 中显式写出 evidence gap / retarget required。
 
 对外仍只产出 **一份** 汇总后的 `impact-scan.md`（multi-repo 时另有一份 **`cross-repo-impact-index.json`**），不改变 CLARIFY 顶层的四角色并行契约。
 
@@ -163,7 +175,8 @@ impact-scan.md 必须包含：
 
 - 识别高/中置信度 `SCN-xxx` 中尚未落到 REQ/CHK 或决策的语义缝隙与组合冲突。
 - 每个高/中置信度场景须映射到 REQ/CHK，或写入 **DEC/UNK**；不得仅留在 JSON。
-- 产出 `.harness/features/<epic-id>/scenario-coverage.json`，记录 `SCN-xxx` 的 `covered | needs_decision | deferred | dropped_invalid` 状态和映射去向。
+- `generated-scenarios.json` 必须使用 canonical `scenarios[]` 结构，且高/中置信度场景应带 `scenario_id`、`pattern`、`source_signals`、`scenario`、`why_it_matters`、`expected_followup`。
+- 产出 `.harness/features/<epic-id>/scenario-coverage.json`，使用 canonical 结构 `{ epic_id, version, scenarios, signals? }`，记录 `SCN-xxx` 的 `covered | needs_decision | deferred | dropped_invalid` 状态和映射去向；若 `domain-frame.json` 的高/中置信度信号未被 `source_signals` 闭合，须补写 `signals[]` 结构化闭环。
 - 在 `clarification-notes.md` 增加 **语义归并** 或 **Semantic Reconciliation** 小节（可与 Traceability 合并），便于 `harnessctl stage-gate check CLARIFY` 在开启 `spec_semantic_hints_strict` 时识别闭合证据。
 
 ### Step 3 — 补盲（识别未知项）
@@ -210,7 +223,7 @@ HARNESS_DIR=.harness ${CLAUDE_PLUGIN_ROOT}/scripts/unknowns-ledger-update.sh res
 - 明确哪些功能在范围内（in-scope）
 - 明确哪些功能在范围外（out-of-scope）
 - 更新 `clarification-notes.md` 末尾追加「范围边界」章节
-- 按 `skills/project-surface/SKILL.md` 生成或更新 **`surface-routing.json`**（`repo_id`、`dive_strategy`、`scan_budget`、`evidence_level`），供 PLAN / VERIFY 约束扫描与审查范围
+- 按 `skills/project-surface/SKILL.md` 生成或更新 **`surface-routing.json`**（`type`、`path`、`repo_id`、`dive_strategy`、`scan_budget`、`evidence_level`），供 PLAN / VERIFY 约束扫描与审查范围；`surfaces[]` 中每项都必须显式带 `type` 与 `path`
 
 ```bash
 # 更新 clarification-notes.md（追加章节，不覆盖前文）
@@ -346,8 +359,12 @@ $HARNESSCTL stage-gate check CLARIFY --epic-id <epic-id>
 
 检查项（以 `$HARNESSCTL stage-gate check CLARIFY` 为准）：
 
-- **`clarify_closure_mode=full`（默认）**：`domain-frame.json`、`generated-scenarios.json`、`challenge-report.md`（含 `## Summary`）、`clarification-notes.md`（含 **Domain Frame / 领域框架 / 需求上下文** 标题，且含六轴或极简绕行 + Unknowns 闭环）、`impact-scan.md`、`scenario-coverage.json`、`surface-routing.json`、`unknowns-ledger.json`、`decision-bundle.json`、`decision-packet.json`；多仓时尚需 `cross-repo-impact-index.json`。
+- **`clarify_closure_mode=full`（默认）**：`domain-frame.json`、`generated-scenarios.json`、`requirements-draft.md`、`challenge-report.md`（含 `## Summary`）、`clarification-notes.md`（含 **Domain Frame / 领域框架 / 需求上下文** 标题，且含六轴或极简绕行 + Unknowns 闭环）、`impact-scan.md`、`scenario-coverage.json`、`surface-routing.json`、`unknowns-ledger.json`、`decision-bundle.json`、`decision-packet.json`；多仓时尚需 `cross-repo-impact-index.json`。
 - **`clarify_closure_mode=notes_only`**：仅 **`clarification-notes.md`** 须存在且通过 CLI 内置结构校验（六轴表或极简绕行、闭环小节）。
+- **`clarify_signal_gate_enabled=true`（默认）**：若 `domain-frame.json` / `generated-scenarios.json` 命中高/中置信度语义信号，则对应轴不得以 `not_applicable` 跳过；命中轴需显式写成 `covered` 或 `unknown`。简单需求若无命中信号，不会额外加重。
+- **`clarify_deep_dive_enabled=true`**：若高风险信号与 `requirements-draft.md` 中的 `UNCLEAR` / `AMBIGUOUS` 同时存在，CLI 会给出 deep-dive 提示；若启用 **`clarify_deep_dive_gate_strict=true`**，且仍缺少 `deep-dive-*.md`，则 CLARIFY 直接阻断。
+- **`clarify_deep_dive_enabled=true`**：若存在高风险信号且 `requirements-draft.md` 中出现 `UNCLEAR` / `AMBIGUOUS`，CLI 会提示触发 `deep-dive-specialist`；若再启用 **`clarify_deep_dive_gate_strict=true`**，则缺少 `deep-dive-*.md` 备忘录会成为阻断项。
+- **用户关注点**：若存在 **`## Focus Points` / `## 用户关注点` / `## 用户点名关注`** 小节（且含列表项）或 **`focus-points.json`** 含 `items`，则每项必须映射到 `REQ-` / `CHK-` / `SCN-` / `DEC-` / `UNK-`（见 `scripts/clarify_gate_shared.py`）。
 
 **若任意检查项失败，报告缺失文件或校验错误并停止，不得推进到 SPEC。**
 

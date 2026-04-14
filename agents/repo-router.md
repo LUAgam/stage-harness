@@ -14,7 +14,8 @@ Build a structural map of the repository — directories, modules, entry points,
 
 1. `.harness/features/<epic-id>/surface-routing.json` — **only** explore paths and `repo_id` entries listed there (and `scout_assignments.repo-router` if present). Do **not** deep-read repos or directories omitted from routing unless Lead explicitly expands scope.
 2. `.harness/features/<epic-id>/cross-repo-impact-index.json` (if present) — align module boundaries with `repos[]` / `interfaces[]`.
-3. `.harness/memory/codemaps/<repo_id>/*.md` — read relevant hotspot notes **before** re-reading the same modules from source; if `confidence` is low or content looks stale, prefer re-verifying against code.
+3. `.harness/features/<epic-id>/codemap-audit.json` (if present) — treat any codemap with `reason != ok`, `stale = true`, or audit summary `invalid/stale > 0` as **low-confidence background only**.
+4. `.harness/memory/codemaps/<repo_id>/*.md` — read relevant hotspot notes **before** re-reading the same modules from source; if `confidence` is low or content looks stale, prefer re-verifying against code.
 
 ## Scouting Process
 

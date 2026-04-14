@@ -34,6 +34,8 @@ Focus on these pattern families when relevant (core set — keep outputs compact
 - `constraint-composition`: two valid rules become inconsistent when combined
 - `downstream-contract-shift`: upstream behavior changes what downstream observers will see
 
+When the input semantics imply conflict handling, retries, rewrite paths, amplification, latency, capacity, or hot-spot contention, at least one grounded scenario should surface that cost/risk through either `pattern: "high-contention-path"` or `pattern: "cost-amplification"` (or another equally accurate pattern). This is a generic rule about conflict-path cost, not a project-specific keyword checklist.
+
 **Enhancement-layer families** (use only when signals in the epic or `domain-frame.json` justify them — not mandatory every run):
 
 - `high-contention-path`: many actors or requests hit the same narrow resource or rule
@@ -73,6 +75,7 @@ Write to `.harness/features/<epic-id>/generated-scenarios.json`:
 - `expected_followup` describes the most likely landing zone, not the final answer
 - Prefer 3-8 sharp scenarios over a long speculative list
 - Do **not** duplicate `domain-frame.json` verbatim; scenarios should be expanded or reframed, not copied
+- High/medium confidence scenarios should almost always keep at least one `source_signals` reference so Lead can close semantic signals in `scenario-coverage.json`
 
 ## Boundaries
 

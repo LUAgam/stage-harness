@@ -14,6 +14,7 @@ Inventory all configuration surfaces: environment variables, feature flags, depl
 
 1. `.harness/features/<epic-id>/surface-routing.json` — restrict to `config-scout` assignments and listed config surfaces only.
 2. `.harness/features/<epic-id>/cross-repo-impact-index.json` (if present) — include `shared_artifacts[]` that point at config or infra paths.
+3. `.harness/features/<epic-id>/codemap-audit.json` (if present) — if config-related codemaps are stale/invalid, use them only as hints and re-check source/config files directly.
 
 ## What to Scout
 

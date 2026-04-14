@@ -14,7 +14,8 @@ Find specific functions, classes, types, and constants that the epic will extend
 
 1. `.harness/features/<epic-id>/surface-routing.json` — run Grep only under assigned paths / repos.
 2. `.harness/features/<epic-id>/cross-repo-impact-index.json` (if present) — align symbol search with `repos[]` in scope.
-3. `.harness/memory/codemaps/<repo_id>/*.md` — check for listed entry points before wide search.
+3. `.harness/features/<epic-id>/codemap-audit.json` (if present) — if a target codemap is stale/invalid, do not trust it as the primary locator.
+4. `.harness/memory/codemaps/<repo_id>/*.md` — check for listed entry points before wide search.
 
 ## What to Find
 

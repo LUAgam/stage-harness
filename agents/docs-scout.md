@@ -20,7 +20,8 @@ In order of priority:
 4. `.shipspec/planning/<epic>/TASKS.md` — human-readable task descriptions
 5. `.harness/features/<epic-id>/decision-bundle.json` — resolved decisions
 6. `.harness/features/<epic-id>/unknowns-ledger.json` — known unknowns
-7. `.harness/memory/codemaps/<repo_id>/*.md`（如有）— 与文档中的模块描述交叉核对；与 codemap 冲突时以契约/源码为准并在报告中标注
+7. `.harness/features/<epic-id>/codemap-audit.json`（如有）— 若某些 codemap 已 stale/invalid，则仅作背景信息，不得覆盖文档/契约/源码结论
+8. `.harness/memory/codemaps/<repo_id>/*.md`（如有）— 与文档中的模块描述交叉核对；与 codemap 冲突时以契约/源码为准并在报告中标注
 
 ## Output Format
 

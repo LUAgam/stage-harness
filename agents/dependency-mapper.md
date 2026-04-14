@@ -14,7 +14,8 @@ Map the external and internal dependencies relevant to the epic. Identify potent
 
 1. `.harness/features/<epic-id>/surface-routing.json` — follow `scout_assignments.dependency-mapper` and in-scope `repo_id` paths only.
 2. `.harness/repo-catalog.yaml` (multi-repo) — use `package_aliases` / `import_prefixes` to map dependency names to repos.
-3. `.harness/memory/codemaps/<repo_id>/*.md` — reuse import/dependency notes when applicable.
+3. `.harness/features/<epic-id>/codemap-audit.json` (if present) — stale/invalid codemaps may still provide hints, but import chains must be re-verified from source.
+4. `.harness/memory/codemaps/<repo_id>/*.md` — reuse import/dependency notes when applicable.
 
 ## What to Map
 

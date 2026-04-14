@@ -27,11 +27,11 @@ Stage-Harness 把人类开发里「先想清楚再动手」的习惯，外显成
 | 立项、建档、接住原始描述 | IDEA → CLARIFY | `/harness:start` | `.harness/` 初始化、`project-profile.yaml`、Epic 元数据、`state.json` |
 | 把需求说清楚、圈范围、列未知与决策 | CLARIFY | `/harness:clarify` | **默认（full）**：`clarification-notes.md`（含 [六轴澄清覆盖](usage.md) 或极简绕行）、`domain-frame.json`、`requirements-draft.md`、`impact-scan.md`、`surface-routing.json`、`challenge-report.md`、`generated-scenarios.json`、`scenario-coverage.json`、multi-repo 时 `cross-repo-impact-index.json`、`unknowns-ledger.json`、`decision-bundle.json`、`decision-packet.json` 等。**`clarify_closure_mode=notes_only`** 时门禁可仅校验 `clarification-notes.md` 结构，未知与决策写入同文件即可（见 [usage.md](usage.md)） |
 | 把澄清结果写成正式规格 | SPEC | `/harness:spec` | `.harness/specs/{epic-id}.md`、`spec-council-notes.md` |
-| 把规格落成可执行任务与覆盖 | PLAN | `/harness:plan` | `bridge-spec.md`、`coverage-matrix.json`、`surface-routing.json`（与 CLARIFY 一致，门禁复验）、`.harness/tasks/` |
+| 把规格落成可执行任务与覆盖 | PLAN | `/harness:plan` | `bridge-spec.md`、`coverage-matrix.json`、`surface-routing.json`（与 CLARIFY 一致，门禁复验）、`.harness/tasks/`；可选先做 `codemap-audit.json` 以降级 stale 缓存 |
 | 按任务实现、测试、留痕 | EXECUTE | `/harness:work` | `receipts/`、代码变更 |
 | 多维度验收 | VERIFY | `/harness:review` | `verification.json` 等 |
 | 按审查意见返工 | FIX | `/harness:fix` | 修复后再 `/harness:review` |
-| 结案与经验沉淀 | DONE | `/harness:done` | `delivery-summary.md`、`release-notes.md`、`memory/` 等 |
+| 结案与经验沉淀 | DONE | `/harness:done` | `delivery-summary.md`、`release-notes.md`、`memory/`、`scan-metrics.json`（如记录 ROI/验收）等 |
 
 ---
 
@@ -79,6 +79,7 @@ Lead intake → domain-scout
 #### PLAN
 
 - **Bridge / 路由复核**：串行主干。
+- **CodeMap 可信度检查**：可在并行 scout 前先运行 `harnessctl memory codemap-audit`，将 stale / invalid 缓存降为背景信息。
 - **表面研究**（多 scout）：可**并行**，再汇总为计划与 DAG。
 - **任务 DAG / 覆盖矩阵**：依赖研究结果，**串行生成**。
 
@@ -98,7 +99,7 @@ Lead intake → domain-scout
 
 #### DONE
 
-- 交付主线**串行**；Release Council、经验沉淀、技能挖掘等收尾动作可部分**并行**。
+- 交付主线**串行**；Release Council、经验沉淀、技能挖掘、ROI 指标回填等收尾动作可部分**并行**。
 
 ---
 

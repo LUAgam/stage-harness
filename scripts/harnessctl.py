@@ -6,6 +6,7 @@ Manages .harness/ directory structure, epics, tasks, and state machine.
 """
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -13,6 +14,17 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+_HARNESSCTL_DIR = Path(__file__).resolve().parent
+if str(_HARNESSCTL_DIR) not in sys.path:
+    sys.path.insert(0, str(_HARNESSCTL_DIR))
+from clarify_gate_shared import (
+    clarify_focus_point_closure_errors,
+    clarify_state_constraint_signal_scn_focus_errors,
+    domain_frame_missing_required_keys,
+    generated_scenarios_strict_errors,
+    scenario_coverage_strict_errors,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -22,7 +34,7 @@ HARNESS_DIR = ".harness"
 CONFIG_FILE = "config.json"
 PROFILE_FILE = "project-profile.yaml"
 REPO_CATALOG_FILE = "repo-catalog.yaml"
-VERSION = "4.5"
+VERSION = "4.6"
 
 STAGES = ["IDEA", "CLARIFY", "SPEC", "PLAN", "EXECUTE", "VERIFY", "FIX", "DONE"]
 
@@ -38,8 +50,75 @@ TRANSITIONS = {
 }
 
 TASK_STATUSES = ["pending", "in_progress", "done", "failed", "blocked"]
+PROFILE_UNKNOWN = "unknown"
+PROFILE_NEUTRAL_DEFAULTS = {
+    "type": PROFILE_UNKNOWN,
+    "primary_language": PROFILE_UNKNOWN,
+    "build_tool": PROFILE_UNKNOWN,
+    "test_framework": PROFILE_UNKNOWN,
+    "has_database": None,
+    "has_auth": None,
+    "has_docker": None,
+    "has_ci": None,
+    "estimated_size": PROFILE_UNKNOWN,
+    "workspace_mode": PROFILE_UNKNOWN,
+    "primary_surfaces": [],
+    "check_focus": [],
+}
+LEGACY_PROFILE_TEMPLATE_DEFAULTS = {
+    "type": "backend-service",
+    "primary_language": "typescript",
+    "build_tool": "npm",
+    "test_framework": "jest",
+    "has_database": True,
+    "has_auth": False,
+    "has_docker": True,
+    "has_ci": True,
+    "estimated_size": "medium",
+    "workspace_mode": "single-repo",
+    "primary_surfaces": ["src/"],
+    "check_focus": ["api_contract", "state_idempotency"],
+}
+PROFILE_REPO_MARKERS = (
+    ".git",
+    "package.json",
+    "go.mod",
+    "pyproject.toml",
+    "Cargo.toml",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "CMakeLists.txt",
+    "Makefile",
+)
+PROFILE_SCAN_IGNORE_DIRS = {
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+    "target",
+    "coverage",
+    "__pycache__",
+    ".venv",
+    "venv",
+}
 
 RISK_LEVELS = ["low", "medium", "high"]
+ACCEPTANCE_STATUSES = ["met", "partial", "not_met"]
+KNOWN_ROI_METRICS = [
+    "cache_hit_rate",
+    "source_reread_rate",
+    "avg_tokens_clarify_plan",
+    "avg_latency_clarify_plan",
+    "routing_correction_rate",
+]
+KNOWN_ACCEPTANCE_CRITERIA = [
+    "mvp_no_blind_scan",
+    "routing_auditable",
+    "codemap_reuse_visible",
+]
 
 TASK_STATUS_ALIASES = {
     "completed": "done",
@@ -65,6 +144,7 @@ SUBDIRS = [
     "specs",
     "tasks",
     "memory",
+    "metrics",
     "logs",
     "rules",
 ]
@@ -87,7 +167,61 @@ DEFAULT_CONFIG = {
     "patch_shadow_min_observations": 2,
     # CLARIFY: "full" = ledger + JSON artifacts (default); "notes_only" = closure only in clarification-notes.md
     "clarify_closure_mode": "full",
+    # Enhancement layer: when True, use domain/scenario signals to require stronger coverage on selected axes.
+    "clarify_signal_gate_enabled": True,
+    # Enhancement layer: suggest / enforce deep-dive when high-risk signals coexist with ambiguous requirements.
+    "clarify_deep_dive_enabled": True,
+    # When True, missing deep-dive memo becomes a blocking CLARIFY gate error instead of a warning.
+    "clarify_deep_dive_gate_strict": False,
 }
+
+CLARIFY_AXES: list[tuple[str, str, str]] = [
+    ("StateAndTime", r"StateAndTime|行为与流程", "StateAndTime / 行为与流程"),
+    ("ConstraintsAndConflict", r"ConstraintsAndConflict|规则与边界", "ConstraintsAndConflict / 规则与边界"),
+    ("CostAndCapacity", r"CostAndCapacity|规模与代价", "CostAndCapacity / 规模与代价"),
+    ("CrossSurfaceConsistency", r"CrossSurfaceConsistency|多入口|多阶段一致性", "CrossSurfaceConsistency / 多入口"),
+    ("OperationsAndRecovery", r"OperationsAndRecovery|运行与维护", "OperationsAndRecovery / 运行与维护"),
+    ("SecurityAndIsolation", r"SecurityAndIsolation|权限与隔离", "SecurityAndIsolation / 权限与隔离"),
+]
+
+CLARIFY_SIGNAL_RULES: list[dict] = [
+    {
+        "id": "state-flow",
+        "regex": r"(?i)state\s*transition|workflow|phase|stage|order|sequence|retry|replay|reinsert|re-entry|reentry|idempot|delete-to-update|行为|流程|顺序|状态|重试|重复|阶段",
+        "axes": ["StateAndTime"],
+        "summary": "state / workflow / replay semantics",
+    },
+    {
+        "id": "constraints-identity",
+        "regex": r"(?i)primary\s*key|no-primary-key|no primary key|unique|uniqueness|locator|predicate|multi-match|ambiguous|constraint|conflict|identity reconstruction|唯一|主键|约束|冲突|匹配多个|匹配零个",
+        "axes": ["ConstraintsAndConflict"],
+        "summary": "identity / uniqueness / constraint conflict",
+    },
+    {
+        "id": "cost-capacity",
+        "regex": r"(?i)scale|capacity|performance|fan-?out|amplification|billable|resource|latency|吞吐|性能|容量|成本|放大",
+        "axes": ["CostAndCapacity"],
+        "summary": "scale / cost / amplification",
+    },
+    {
+        "id": "cross-surface-contract",
+        "regex": r"(?i)cross-stage|cross stage|cross-surface|ui|backend|api|schema|migration|downstream|contract|interface|entry|coherence|shared|同步|多入口|跨阶段|契约|接口|下游|一致性",
+        "axes": ["CrossSurfaceConsistency"],
+        "summary": "cross-surface / contract coherence",
+    },
+    {
+        "id": "ops-recovery",
+        "regex": r"(?i)recovery|rollback|repair|partial\s*failure|runtime|operat|degrade|restore|ops|恢复|回滚|补偿|失败|运维|恢复 active",
+        "axes": ["OperationsAndRecovery"],
+        "summary": "failure / recovery / runtime operations",
+    },
+    {
+        "id": "security-isolation",
+        "regex": r"(?i)auth|authorization|permission|tenant|credential|secret|sensitive|security|isolation|权限|鉴权|认证|隔离|敏感",
+        "axes": ["SecurityAndIsolation"],
+        "summary": "auth / isolation / security boundary",
+    },
+]
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +267,10 @@ def append_trace_event(h: Path, event: dict) -> None:
     line = json.dumps(event, ensure_ascii=False)
     with trace_path.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
+    try:
+        _write_execution_summary(h, epic_id)
+    except SystemExit:
+        pass
 
 
 def _make_trace_event(
@@ -165,6 +303,248 @@ def _make_trace_event(
         "payload": payload or {},
         "artifact_paths": artifact_paths or [],
     }
+
+
+def _load_trace_events(h: Path, epic_id: str) -> list[dict]:
+    """Load trace events for an epic, skipping malformed lines."""
+    trace_path = _trace_dir_for_epic(h, epic_id) / "execution-trace.jsonl"
+    if not trace_path.exists():
+        return []
+    events: list[dict] = []
+    for line in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _load_bundle_optional(h: Path, epic_id: str) -> dict | None:
+    """Load decision-bundle.json if present."""
+    bundle_path = h / "features" / epic_id / "decision-bundle.json"
+    if not bundle_path.exists():
+        return None
+    try:
+        return load_json(bundle_path)
+    except SystemExit:
+        return None
+
+
+def _normalize_pending_decision(decision: dict, fallback_id: str) -> dict:
+    """Normalize a pending decision into the state.json shape."""
+    risk_if_wrong = str(decision.get("risk_if_wrong") or decision.get("severity") or "high").lower()
+    if risk_if_wrong not in ("critical", "high", "medium", "low"):
+        risk_if_wrong = "high"
+    severity = str(decision.get("severity") or risk_if_wrong).lower()
+    if severity not in ("critical", "high", "medium", "low"):
+        severity = risk_if_wrong
+    return {
+        "id": str(decision.get("id") or fallback_id),
+        "question": str(decision.get("question", "")).strip(),
+        "category": str(decision.get("category", "must_confirm")).strip() or "must_confirm",
+        "severity": severity,
+        "risk_if_wrong": risk_if_wrong,
+        "status": str(decision.get("status", "pending")).strip() or "pending",
+        "source_ref": str(decision.get("source_ref", "")).strip(),
+        "source_artifact": str(decision.get("source_artifact", "decision-bundle.json")).strip(),
+        "why_now": str(decision.get("why_now", "")).strip(),
+        "options": decision.get("options", []) if isinstance(decision.get("options", []), list) else [],
+        "default_action": str(decision.get("proposed_default", "")).strip(),
+    }
+
+
+def _pending_decisions_from_bundle(bundle: dict | None) -> list[dict]:
+    """Return normalized pending must_confirm items from a decision bundle."""
+    if not isinstance(bundle, dict):
+        return []
+    decisions = bundle.get("decisions")
+    if not isinstance(decisions, list):
+        return []
+    pending: list[dict] = []
+    for idx, decision in enumerate(decisions, start=1):
+        if not isinstance(decision, dict):
+            continue
+        if str(decision.get("category", "")).strip() != "must_confirm":
+            continue
+        if str(decision.get("status", "pending")).strip() != "pending":
+            continue
+        pending.append(_normalize_pending_decision(decision, f"DEC-{idx:03d}"))
+    return pending
+
+
+def _effective_pending_decisions(h: Path, state: dict) -> list[dict]:
+    """Use state pending_decisions first, then fall back to decision-bundle.json."""
+    pending = state.get("pending_decisions", [])
+    if isinstance(pending, list) and pending:
+        return pending
+    epic_id = str(state.get("epic_id", "")).strip()
+    if not epic_id:
+        return []
+    return _pending_decisions_from_bundle(_load_bundle_optional(h, epic_id))
+
+
+def _write_execution_summary(h: Path, epic_id: str) -> dict:
+    """Derive a concise execution summary from trace + state."""
+    trace_dir = _trace_dir_for_epic(h, epic_id)
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    events = _load_trace_events(h, epic_id)
+    latest_run_id = ""
+    latest_run_start = -1
+    for idx, event in enumerate(events):
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        run_id = str(payload.get("run_id", "")).strip()
+        if str(event.get("event_type", "")).strip() == "clarify_run_started" and run_id:
+            latest_run_id = run_id
+            latest_run_start = idx
+    if latest_run_start >= 0:
+        relevant_events = events[latest_run_start:]
+    else:
+        relevant_events = events
+
+    latest_run_id = ""
+    steps_completed: list[str] = []
+    steps_seen: set[str] = set()
+    parallel_waves_completed = 0
+    fanout_used = False
+    fanout_children_count = 0
+    decision_packet_generated = False
+    pending_decisions_synced = False
+    latest_pause_reason = ""
+
+    for event in relevant_events:
+        payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+        run_id = str(payload.get("run_id", "")).strip()
+        if latest_run_id and run_id and run_id != latest_run_id:
+            continue
+        if run_id:
+            latest_run_id = run_id
+        event_type = str(event.get("event_type", "")).strip()
+        if event_type == "step_completed":
+            step_name = (
+                str(payload.get("step", "")).strip()
+                or str(payload.get("agent_role", "")).strip()
+                or str(event.get("actor", "")).strip()
+            )
+            if step_name and step_name not in steps_seen:
+                steps_seen.add(step_name)
+                steps_completed.append(step_name)
+            if payload.get("fanout_used") or str(payload.get("execution_mode", "")).strip() == "fan_out_team":
+                fanout_used = True
+            try:
+                fanout_children_count = max(
+                    fanout_children_count,
+                    int(payload.get("fanout_children_count", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                pass
+        elif event_type == "parallel_wave_completed":
+            parallel_waves_completed += 1
+        elif event_type == "decision_packet_generated":
+            decision_packet_generated = True
+        elif event_type == "pending_decisions_synced":
+            pending_decisions_synced = True
+        elif event_type == "guard_failed":
+            issues = payload.get("issues", [])
+            if isinstance(issues, list) and issues:
+                latest_pause_reason = "; ".join(str(issue) for issue in issues[:3])
+        elif event_type == "next_action_evaluated":
+            if str(payload.get("next_action", "")).strip() == "wait_user" and payload.get("has_pending_confirms"):
+                latest_pause_reason = "waiting_on_pending_decisions"
+
+    try:
+        state = load_state(h, epic_id)
+    except SystemExit:
+        state = {}
+    pending_decisions = _effective_pending_decisions(h, state)
+    bundle = _load_bundle_optional(h, epic_id)
+    bundle_pending = _pending_decisions_from_bundle(bundle)
+    packet_path = h / "features" / epic_id / "decision-packet.json"
+    budget = state.get("interrupt_budget", {}) if isinstance(state, dict) else {}
+    remaining = budget.get("remaining", budget.get("total", 0) - budget.get("consumed", 0))
+    if packet_path.exists():
+        decision_packet_generated = True
+    if bundle is not None and isinstance(state.get("pending_decisions", []), list) and state.get("pending_decisions", []) == bundle_pending:
+        pending_decisions_synced = True
+    if pending_decisions and int(remaining or 0) > 0 and not latest_pause_reason:
+        latest_pause_reason = "waiting_on_pending_decisions"
+
+    if not latest_run_id:
+        features_dir = h / "features" / epic_id
+        artifact_step_hints = (
+            ("domain-frame.json", "domain-scout"),
+            ("requirements-draft.md", "requirement-analyst"),
+            ("impact-scan.md", "impact-analyst"),
+            ("challenge-report.md", "challenger"),
+            ("generated-scenarios.json", "scenario-expander"),
+            ("scenario-coverage.json", "semantic-reconciliation"),
+            ("surface-routing.json", "surface-routing"),
+            ("clarification-notes.md", "clarification-notes"),
+        )
+        for artifact_name, step_name in artifact_step_hints:
+            if _artifact_step_is_observable(features_dir / artifact_name) and step_name not in steps_seen:
+                steps_seen.add(step_name)
+                steps_completed.append(step_name)
+
+    summary = {
+        "epic_id": epic_id,
+        "current_stage": state.get("current_stage", "") if isinstance(state, dict) else "",
+        "latest_run_id": latest_run_id,
+        "steps_completed": steps_completed,
+        "parallel_waves_completed": parallel_waves_completed,
+        "fanout_used": fanout_used,
+        "fanout_children_count": fanout_children_count,
+        "decision_packet_generated": decision_packet_generated,
+        "pending_decisions_synced": pending_decisions_synced,
+        "pending_decisions_count": len(pending_decisions),
+        "latest_pause_reason": latest_pause_reason,
+        "updated_at": now_iso(),
+    }
+    atomic_write_json(trace_dir / "execution-summary.json", summary)
+    return summary
+
+
+def _sync_pending_decisions_from_bundle(
+    h: Path,
+    epic_id: str,
+    *,
+    emit_trace: bool = False,
+    run_id: str = "",
+) -> list[dict]:
+    """Synchronize pending must_confirm decisions into state.json."""
+    try:
+        state = load_state(h, epic_id)
+    except SystemExit:
+        return []
+    pending = _pending_decisions_from_bundle(_load_bundle_optional(h, epic_id))
+    updated_state = dict(state)
+    updated_state["pending_decisions"] = pending
+    updated_state["updated_at"] = now_iso()
+    save_state(h, updated_state)
+    if emit_trace:
+        append_trace_event(
+            h,
+            _make_trace_event(
+                epic_id,
+                "pending_decisions_synced",
+                stage=updated_state.get("current_stage", ""),
+                source="decision-bundle",
+                actor="decision-bundle",
+                summary=f"Synced {len(pending)} pending decision(s) into state",
+                payload={"run_id": run_id, "pending_count": len(pending)},
+                artifact_paths=[
+                    str(h / "features" / epic_id / "state.json"),
+                    str(h / "features" / epic_id / "decision-bundle.json"),
+                ],
+            ),
+        )
+    else:
+        _write_execution_summary(h, epic_id)
+    return pending
 
 
 def _load_active_rules(h: Path, epic_id: str = "", stage: str = "") -> list[dict]:
@@ -318,20 +698,155 @@ def _git(project_root: Path, *git_args: str, timeout: int = 60) -> tuple[int, st
 
 
 def find_harness_root(start: Path = None) -> Path:
-    """Walk up from start (default cwd) to find a directory containing .harness/."""
+    """Find .harness in the current directory, or within the current git root."""
     current = (start or Path.cwd()).resolve()
-    for directory in [current] + list(current.parents):
+    git_root = _find_git_toplevel(current)
+    search_roots = [current]
+    if git_root is not None:
+        for parent in current.parents:
+            search_roots.append(parent)
+            if parent == git_root:
+                break
+
+    for directory in search_roots:
         if (directory / HARNESS_DIR).is_dir():
             return directory
-    err(
-        f"No .harness/ directory found. Run 'harnessctl init' in your project root."
-    )
+    if git_root is not None:
+        return git_root
+    return current
+
+
+def _find_git_toplevel(start: Path = None) -> Path | None:
+    """Return git toplevel for start, or None when outside a git worktree."""
+    current = (start or Path.cwd()).resolve()
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(current),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    root = proc.stdout.strip()
+    if proc.returncode != 0 or not root:
+        return None
+    return Path(root).resolve()
+
+
+def _dir_is_writable(path: Path) -> bool:
+    """Best-effort writability check for a directory."""
+    try:
+        return path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+    except OSError:
+        return False
+
+
+def _is_permission_like_os_error(exc: OSError) -> bool:
+    """Return True only for permission or read-only filesystem failures."""
+    return getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM, errno.EROFS}
+
+
+def find_bootstrap_root(start: Path = None) -> Path:
+    """Return current .harness root, else git root, else cwd for bootstrapping."""
+    current = (start or Path.cwd()).resolve()
+    git_root = _find_git_toplevel(current)
+    search_roots = [current]
+    if git_root is not None:
+        for parent in current.parents:
+            search_roots.append(parent)
+            if parent == git_root:
+                break
+
+    for directory in search_roots:
+        if (directory / HARNESS_DIR).is_dir():
+            return directory
+    if git_root is not None:
+        return git_root
+    return current
 
 
 def harness_path(project_root: Path = None) -> Path:
     """Return the .harness/ path for the given (or found) project root."""
     root = project_root or find_harness_root()
     return root / HARNESS_DIR
+
+
+def _metrics_dir(h: Path) -> Path:
+    return h / "metrics"
+
+
+def _metrics_event_log_path(h: Path) -> Path:
+    return _metrics_dir(h) / "scan-roi.jsonl"
+
+
+def _epic_metrics_path(h: Path, epic_id: str) -> Path:
+    return h / "features" / epic_id / "scan-metrics.json"
+
+
+def _default_epic_metrics(epic_id: str) -> dict:
+    return {
+        "version": VERSION,
+        "epic_id": epic_id,
+        "roi_metrics": {},
+        "acceptance_checks": {},
+        "updated_at": now_iso(),
+    }
+
+
+def load_epic_metrics(h: Path, epic_id: str) -> dict:
+    path = _epic_metrics_path(h, epic_id)
+    if not path.exists():
+        return _default_epic_metrics(epic_id)
+    data = load_json(path)
+    if not isinstance(data, dict):
+        err(f"Invalid metrics file: {path}")
+    return data
+
+
+def save_epic_metrics(h: Path, epic_id: str, data: dict) -> None:
+    payload = dict(data)
+    payload["version"] = VERSION
+    payload["epic_id"] = epic_id
+    payload["updated_at"] = now_iso()
+    atomic_write_json(_epic_metrics_path(h, epic_id), payload)
+
+
+def append_metrics_event(h: Path, event: dict) -> None:
+    path = _metrics_event_log_path(h)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def _parse_metric_value(raw: str):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    low = raw.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    try:
+        if "." in raw:
+            return float(raw)
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def _repo_worktrees_from_epic(epic: dict) -> dict:
+    repo_worktrees = epic.get("repo_worktrees", {})
+    return repo_worktrees if isinstance(repo_worktrees, dict) else {}
+
+
+def _codemap_template_path() -> Path:
+    return Path(__file__).parent.parent / "templates" / "codemap-module.md"
 
 
 # ---------------------------------------------------------------------------
@@ -649,13 +1164,383 @@ def _clarify_notes_only_closure_errors(features_dir: Path) -> list[str]:
         r"(?i)无待确认|无\s*must_confirm|无\s*unknown\s*项|closure:\s*none|本轮\s*无\s*待确认",
         text,
     )
-    if not closure_heading and not closure_inline and not (minimal_ok and closure_none):
+    if not closure_heading and not closure_inline and not closure_none:
         errors.append(
             f"{cn.name}: add «## Unknowns 与待确认决策» (or UNK-/DEC-/must_confirm list) "
-            "or state «无待确认» under minimal bypass"
+            "or state «无待确认»"
         )
 
     return errors
+
+
+def _clarify_minimal_mode_and_axis_states(text: str) -> tuple[bool, bool, dict[str, str]]:
+    """Return (minimal_ok, axis_section_present, axis_states)."""
+    minimal_heading = re.search(
+        r"(?im)^#{1,4}\s*(?:极简澄清绕行|极简澄清模式|minimal\s*clarify)\b",
+        text,
+    )
+    minimal_signal = re.search(r"(?i)极简澄清绕行|minimal\s*clarify\s*bypass", text) and re.search(
+        r"(?i)not_applicable|全局[^\n]{0,40}不适用|不适用[^\n]{0,40}全局",
+        text,
+    )
+    minimal_ok = bool(minimal_heading or minimal_signal)
+    axis_section = bool(
+        re.search(
+            r"(?im)^#{1,4}\s*(?:六轴澄清覆盖|six[- ]axis\s*clarification|澄清必答覆盖)\b",
+            text,
+        )
+    )
+    axis_states: dict[str, str] = {}
+    not_applicable_re = re.compile(r"(?i)\b(not_applicable|not\s+applicable|不适用)\b")
+    unknown_re = re.compile(r"(?i)\b(unknown|尚不清楚)\b")
+    covered_re = re.compile(r"(?i)\b(covered|已覆盖)\b")
+    for axis_id, axis_pattern, _label in CLARIFY_AXES:
+        m = re.search(axis_pattern, text)
+        if not m:
+            axis_states[axis_id] = ""
+            continue
+        chunk = text[max(0, m.start() - 120): m.end() + 500]
+        state = ""
+        if not_applicable_re.search(chunk):
+            state = "not_applicable"
+        elif unknown_re.search(chunk):
+            state = "unknown"
+        elif covered_re.search(chunk):
+            state = "covered"
+        axis_states[axis_id] = state
+    return minimal_ok, axis_section, axis_states
+
+
+def _iter_high_medium_signal_texts(features_dir: Path) -> list[dict]:
+    """Collect high/medium confidence signal texts from domain-frame and generated scenarios."""
+    rows: list[dict] = []
+    df_path = features_dir / "domain-frame.json"
+    if df_path.exists():
+        try:
+            data = json.loads(df_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {}
+        if isinstance(data, dict):
+            key_specs = [
+                ("semantic_signals", ("signal", "rationale")),
+                ("candidate_edge_cases", ("scenario", "rationale")),
+                ("candidate_open_questions", ("question", "why_it_matters")),
+                ("state_transition_scenarios", ("transition", "rationale")),
+                ("constraint_conflicts", ("conflict", "rationale")),
+            ]
+            for key, fields in key_specs:
+                items = data.get(key)
+                if not isinstance(items, list):
+                    continue
+                for idx, item in enumerate(items):
+                    if not isinstance(item, dict):
+                        continue
+                    confidence = str(item.get("confidence", "")).lower()
+                    if confidence not in ("high", "medium"):
+                        continue
+                    parts = [str(item.get(f, "")).strip() for f in fields if str(item.get(f, "")).strip()]
+                    if not parts:
+                        continue
+                    rows.append(
+                        {
+                            "source": f"{key}[{idx}]",
+                            "kind": key,
+                            "confidence": confidence,
+                            "text": " | ".join(parts),
+                            "item": item,
+                        }
+                    )
+    gen_path = features_dir / "generated-scenarios.json"
+    if gen_path.exists():
+        try:
+            data = json.loads(gen_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {}
+        scenarios = data.get("scenarios") if isinstance(data, dict) else None
+        if isinstance(scenarios, list):
+            for idx, item in enumerate(scenarios):
+                if not isinstance(item, dict):
+                    continue
+                confidence = str(item.get("confidence", "")).lower()
+                if confidence not in ("high", "medium"):
+                    continue
+                parts = [
+                    str(item.get("pattern", "")).strip(),
+                    str(item.get("scenario", "")).strip(),
+                    str(item.get("why_it_matters", "")).strip(),
+                    str(item.get("expected_followup", "")).strip(),
+                ]
+                parts = [p for p in parts if p]
+                if not parts:
+                    continue
+                rows.append(
+                    {
+                        "source": str(item.get("scenario_id", "")).strip() or f"generated_scenarios[{idx}]",
+                        "kind": "generated_scenarios",
+                        "confidence": confidence,
+                        "text": " | ".join(parts),
+                        "item": item,
+                    }
+                )
+    return rows
+
+
+def _clarify_signal_gate_summary(features_dir: Path) -> dict:
+    """Map semantic signals to axes that require explicit non-N/A treatment."""
+    required_axes: dict[str, list[str]] = {}
+    hits: list[dict] = []
+    deep_dive_candidates: list[str] = []
+    for row in _iter_high_medium_signal_texts(features_dir):
+        txt = row["text"]
+        row_axes: list[str] = []
+        row_summaries: list[str] = []
+        for rule in CLARIFY_SIGNAL_RULES:
+            if re.search(rule["regex"], txt):
+                row_axes.extend(rule["axes"])
+                row_summaries.append(str(rule["summary"]))
+        row_axes = sorted({x for x in row_axes})
+        row_summaries = sorted({x for x in row_summaries})
+        if not row_axes:
+            continue
+        for axis in row_axes:
+            reasons = required_axes.setdefault(axis, [])
+            reasons.extend(row_summaries)
+        hits.append(
+            {
+                "source": row["source"],
+                "kind": row["kind"],
+                "confidence": row["confidence"],
+                "axes": row_axes,
+                "summaries": row_summaries,
+            }
+        )
+        item = row.get("item", {})
+        expected_followup = str(item.get("expected_followup", "")).upper()
+        if (
+            row["confidence"] == "high"
+            and row["kind"] in ("candidate_open_questions", "constraint_conflicts", "generated_scenarios")
+            and (expected_followup in ("DEC", "UNK", "REQ") or row["kind"] != "generated_scenarios")
+        ):
+            desc = str(item.get("question") or item.get("conflict") or item.get("scenario") or txt).strip()
+            if desc:
+                deep_dive_candidates.append(desc)
+    for axis, reasons in required_axes.items():
+        required_axes[axis] = sorted({r for r in reasons})
+    deep_dive_candidates = sorted({x for x in deep_dive_candidates})[:8]
+    return {
+        "required_axes": required_axes,
+        "hits": hits,
+        "deep_dive_candidates": deep_dive_candidates,
+    }
+
+
+def _clarify_signal_gate_errors(features_dir: Path) -> list[str]:
+    """Signal-driven CLARIFY gate: only strengthen axes when high/medium signals justify it."""
+    summary = _clarify_signal_gate_summary(features_dir)
+    required_axes = summary["required_axes"]
+    if not required_axes:
+        return []
+    cn = features_dir / "clarification-notes.md"
+    if not cn.exists() or (cn.is_file() and cn.stat().st_size == 0):
+        return []
+    text = cn.read_text(encoding="utf-8", errors="replace")
+    minimal_ok, axis_section, axis_states = _clarify_minimal_mode_and_axis_states(text)
+    labels = {axis_id: label for axis_id, _pat, label in CLARIFY_AXES}
+    errors: list[str] = []
+    if minimal_ok:
+        needed = ", ".join(labels.get(axis, axis) for axis in required_axes)
+        errors.append(
+            "CLARIFY signal gate: 命中高/中置信度语义信号时不可使用全局极简绕行；"
+            f"请显式覆盖以下轴：{needed}"
+        )
+        return errors
+    if not axis_section:
+        return []
+    for axis, reasons in sorted(required_axes.items()):
+        state = axis_states.get(axis, "")
+        if state == "not_applicable":
+            errors.append(
+                "CLARIFY signal gate: "
+                f"«{labels.get(axis, axis)}» 命中语义信号（{', '.join(reasons)}），"
+                "不应标记为 not_applicable；请改为 covered 或 unknown。"
+            )
+    return errors
+
+
+def _clarify_signal_closure_errors(features_dir: Path) -> list[str]:
+    """Require high/medium semantic signals to close via scenario or signal mapping."""
+    df_path = features_dir / "domain-frame.json"
+    if not df_path.exists():
+        return []
+    try:
+        domain_frame = json.loads(df_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(domain_frame, dict):
+        return []
+
+    relevant_refs: list[str] = []
+    for key in ("semantic_signals", "state_transition_scenarios", "constraint_conflicts"):
+        items = domain_frame.get(key)
+        if not isinstance(items, list):
+            continue
+        for idx, item in enumerate(items):
+            if (
+                isinstance(item, dict)
+                and str(item.get("confidence", "")).lower() in ("high", "medium")
+            ):
+                relevant_refs.append(f"{key}[{idx}]")
+    if not relevant_refs:
+        return []
+
+    coverage_path = features_dir / "scenario-coverage.json"
+    gen_path = features_dir / "generated-scenarios.json"
+    if not coverage_path.exists():
+        return [
+            "存在高/中置信度语义信号，但缺少 `scenario-coverage.json`："
+            "须显式记录信号或场景的闭环去向。"
+        ]
+
+    try:
+        coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return ["scenario-coverage.json is invalid JSON."]
+    if not isinstance(coverage, dict):
+        return ["scenario-coverage.json root must be a JSON object."]
+
+    generated = {}
+    if gen_path.exists():
+        try:
+            generated = json.loads(gen_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            generated = {}
+
+    scenario_sources: dict[str, set[str]] = {}
+    scenarios = generated.get("scenarios") if isinstance(generated, dict) else None
+    if isinstance(scenarios, list):
+        for item in scenarios:
+            if not isinstance(item, dict):
+                continue
+            scenario_id = str(item.get("scenario_id", "")).strip().upper()
+            source_signals = item.get("source_signals")
+            if not scenario_id or not isinstance(source_signals, list):
+                continue
+            scenario_sources[scenario_id] = {
+                str(source).strip()
+                for source in source_signals
+                if str(source).strip()
+            }
+
+    def _entry_is_closed(entry: dict) -> bool:
+        status = str(entry.get("status", "")).strip()
+        mapped_to = entry.get("mapped_to")
+        if status not in ("covered", "needs_decision", "deferred", "dropped_invalid"):
+            return False
+        if status == "dropped_invalid":
+            return True
+        return isinstance(mapped_to, list) and len(mapped_to) > 0
+
+    closed_refs: set[str] = set()
+    covered_scenarios = coverage.get("scenarios")
+    if isinstance(covered_scenarios, list):
+        for item in covered_scenarios:
+            if not isinstance(item, dict) or not _entry_is_closed(item):
+                continue
+            scenario_id = str(item.get("scenario_id", "")).strip().upper()
+            for source_ref in scenario_sources.get(scenario_id, set()):
+                closed_refs.add(source_ref)
+
+    coverage_signals = coverage.get("signals")
+    if coverage_signals is not None and not isinstance(coverage_signals, list):
+        return ["scenario-coverage.json field `signals` must be a JSON array when present."]
+    if isinstance(coverage_signals, list):
+        for item in coverage_signals:
+            if not isinstance(item, dict):
+                continue
+            source_ref = str(item.get("signal_ref", "")).strip()
+            if source_ref and _entry_is_closed(item):
+                closed_refs.add(source_ref)
+
+    unresolved = [source_ref for source_ref in relevant_refs if source_ref not in closed_refs]
+    if unresolved:
+        return [
+            "以下高/中置信度语义信号尚未在 `scenario-coverage.json` 中完成闭环："
+            + ", ".join(unresolved)
+        ]
+    return []
+
+
+def _clarify_deep_dive_hints(features_dir: Path) -> list[str]:
+    """Suggest deep-dive when high-risk signals coexist with ambiguous requirements."""
+    summary = _clarify_deep_dive_summary(features_dir)
+    if not summary.get("should_escalate"):
+        return []
+    sample = "; ".join(summary.get("candidates", [])[:3])
+    reqs = ", ".join(summary.get("ambiguous_requirements", [])[:4]) or "REQ-?"
+    return [
+        "CLARIFY deep-dive hint: requirements-draft 中存在 UNCLEAR/AMBIGUOUS，且命中高风险语义信号，"
+        f"建议触发 `deep-dive-specialist` 调查这些主题：{sample}（相关需求：{reqs}）"
+    ]
+
+
+def _clarify_ambiguous_requirement_ids(req_text: str) -> list[str]:
+    """Extract REQ ids whose status is UNCLEAR / AMBIGUOUS."""
+    req_ids: list[str] = []
+    current_req = ""
+    for line in req_text.splitlines():
+        m = re.match(r"(?im)^###\s+(REQ-\d+)\b", line.strip())
+        if m:
+            current_req = m.group(1)
+            continue
+        if current_req and re.match(r"(?im)^\*\*Status:\*\*\s*(?:UNCLEAR|AMBIGUOUS)\b", line.strip()):
+            req_ids.append(current_req)
+            current_req = ""
+    return sorted({x for x in req_ids})
+
+
+def _clarify_deep_dive_summary(features_dir: Path) -> dict:
+    """Return deep-dive escalation state derived from signals + ambiguous requirements."""
+    summary = _clarify_signal_gate_summary(features_dir)
+    candidates = summary.get("deep_dive_candidates", [])
+    if not candidates:
+        return {
+            "should_escalate": False,
+            "candidates": [],
+            "ambiguous_requirements": [],
+            "existing_memos": [],
+        }
+    req_path = features_dir / "requirements-draft.md"
+    if not req_path.exists():
+        return {
+            "should_escalate": False,
+            "candidates": candidates,
+            "ambiguous_requirements": [],
+            "existing_memos": [],
+        }
+    req_text = req_path.read_text(encoding="utf-8", errors="replace")
+    ambiguous_requirements = _clarify_ambiguous_requirement_ids(req_text)
+    existing_memos = sorted(p.name for p in features_dir.glob("deep-dive-*.md"))
+    should_escalate = bool(candidates and ambiguous_requirements and not existing_memos)
+    return {
+        "should_escalate": should_escalate,
+        "candidates": candidates,
+        "ambiguous_requirements": ambiguous_requirements,
+        "existing_memos": existing_memos,
+    }
+
+
+def _clarify_deep_dive_gate_errors(features_dir: Path) -> list[str]:
+    """Blocking deep-dive gate for teams that opt into strict escalation."""
+    summary = _clarify_deep_dive_summary(features_dir)
+    if not summary.get("should_escalate"):
+        return []
+    reqs = ", ".join(summary.get("ambiguous_requirements", [])[:4]) or "REQ-?"
+    sample = "; ".join(summary.get("candidates", [])[:3])
+    return [
+        "CLARIFY deep-dive gate: 命中高风险语义信号且 requirements-draft 存在 "
+        f"UNCLEAR/AMBIGUOUS（{reqs}），但尚无 `deep-dive-*.md` 备忘录；"
+        f"请触发 `deep-dive-specialist` 调查：{sample}"
+    ]
 
 
 def _domain_frame_has_notable_state_or_constraint(df_path: Path) -> bool:
@@ -793,9 +1678,9 @@ def _verification_passed(verification: dict) -> bool:
 # init command
 # ---------------------------------------------------------------------------
 
-def cmd_init(args, project_root: Path) -> None:
+def _initialize_harness(project_root: Path, *, force: bool = False) -> Path:
     h = project_root / HARNESS_DIR
-    if h.exists() and not args.force:
+    if h.exists() and not force:
         err(f".harness/ already exists at {h}. Use --force to reinitialize.")
 
     # Create subdirectories
@@ -804,18 +1689,23 @@ def cmd_init(args, project_root: Path) -> None:
 
     # Write default config
     config_path = h / CONFIG_FILE
-    if not config_path.exists() or args.force:
+    if not config_path.exists() or force:
         atomic_write_json(config_path, DEFAULT_CONFIG)
 
     # Write project-profile placeholder
     profile_path = h / PROFILE_FILE
-    if not profile_path.exists() or args.force:
+    if not profile_path.exists() or force:
         template_path = Path(__file__).parent.parent / "templates" / "project-profile.yaml"
         if template_path.exists():
             content = template_path.read_text(encoding="utf-8")
         else:
             content = _default_profile_yaml()
         atomic_write(profile_path, content)
+    return h
+
+
+def cmd_init(args, project_root: Path) -> None:
+    h = _initialize_harness(project_root, force=args.force)
 
     if args.json:
         out_json({"status": "ok", "harness_dir": str(h)})
@@ -874,6 +1764,19 @@ def _default_profile_yaml() -> str:
     return (
         "type: unknown\n"
         "risk_level: medium\n"
+        "primary_language: unknown\n"
+        "framework: \"\"\n"
+        "build_tool: unknown\n"
+        "test_framework: unknown\n"
+        "has_database: null\n"
+        "has_auth: null\n"
+        "has_docker: null\n"
+        "has_ci: null\n"
+        "estimated_size: unknown\n"
+        "intensity: {}\n"
+        "notes: \"\"\n"
+        "workspace_mode: unknown\n"
+        "scan: {}\n"
         "primary_surfaces: []\n"
         "check_focus: []\n"
         "detected_at: \"\"\n"
@@ -882,53 +1785,124 @@ def _default_profile_yaml() -> str:
     )
 
 
+def _parse_simple_yaml_scalar(val: str):
+    """Parse one scalar / inline-list token from the lightweight YAML subset."""
+    text = val.strip()
+    if text == "":
+        return ""
+    if text.lower() in ("null", "~", "none"):
+        return None
+    if text.startswith("{") and text.endswith("}") and len(text) >= 2:
+        inner = text[1:-1].strip()
+        if not inner:
+            return {}
+        result = {}
+        for part in inner.split(","):
+            if ":" not in part:
+                return text
+            sub_key, _, sub_val = part.partition(":")
+            result[sub_key.strip()] = _parse_simple_yaml_scalar(sub_val.strip())
+        return result
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1]
+        return [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
+    if text.startswith("\"") and text.endswith("\"") and len(text) >= 2:
+        return text[1:-1]
+    if text.startswith("'") and text.endswith("'") and len(text) >= 2:
+        return text[1:-1]
+    if text == "{}":
+        return {}
+    if text == "[]":
+        return []
+    if text in ("true", "false"):
+        return text == "true"
+    try:
+        return float(text) if "." in text else int(text)
+    except ValueError:
+        return text
+
+
+def _strip_yaml_comment_preserving_quotes(line: str) -> str:
+    in_single = False
+    in_double = False
+    prev = ""
+    for idx, ch in enumerate(line):
+        if ch == "'" and not in_double and prev != "\\":
+            in_single = not in_single
+        elif ch == '"' and not in_single and prev != "\\":
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double and idx > 0 and line[idx - 1].isspace():
+            return line[:idx].rstrip()
+        prev = ch
+    return line.rstrip()
+
+
 def _parse_simple_yaml(text: str) -> dict:
     """Parse a small YAML subset used by stage-harness without extra deps."""
-    result = {}
-    current_key = None
-
+    lines = []
     for raw_line in text.splitlines():
         if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
+        line = _strip_yaml_comment_preserving_quotes(raw_line)
+        if line.strip():
+            lines.append(line)
 
-        line = raw_line
-        if " #" in line:
-            line = line.split(" #", 1)[0]
-        line = line.rstrip()
-        if not line.strip():
+    result = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if ":" not in line:
+            i += 1
             continue
-
+        indent = len(line) - len(line.lstrip(" "))
         stripped = line.strip()
-        if stripped.startswith("- ") and current_key:
-            item = stripped[2:].strip().strip("'\"")
-            result.setdefault(current_key, []).append(item)
-            continue
-
-        current_key = None
-        if ":" not in stripped:
-            continue
-
         key, _, val = stripped.partition(":")
         key = key.strip()
         val = val.strip()
+        if val != "":
+            result[key] = _parse_simple_yaml_scalar(val)
+            i += 1
+            continue
 
-        if val == "":
+        nested = []
+        j = i + 1
+        while j < len(lines):
+            next_line = lines[j]
+            next_indent = len(next_line) - len(next_line.lstrip(" "))
+            if next_indent <= indent:
+                break
+            nested.append(next_line)
+            j += 1
+
+        if not nested:
             result[key] = []
-            current_key = key
-        elif val.startswith("[") and val.endswith("]"):
-            inner = val[1:-1]
-            result[key] = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
-        elif val.startswith("\"") and val.endswith("\""):
-            result[key] = val[1:-1]
-        elif val == "{}":
-            result[key] = {}
-        elif val in ("true", "false"):
-            result[key] = val == "true"
+            i = j
+            continue
+
+        first_nested = nested[0].strip()
+        if first_nested.startswith("- "):
+            items = []
+            for item_line in nested:
+                item_indent = len(item_line) - len(item_line.lstrip(" "))
+                if item_indent <= indent:
+                    continue
+                item_stripped = item_line.strip()
+                if item_stripped.startswith("- "):
+                    items.append(_parse_simple_yaml_scalar(item_stripped[2:].strip()))
+            result[key] = items
         else:
-            try:
-                result[key] = float(val) if "." in val else int(val)
-            except ValueError:
-                result[key] = val
+            sub = {}
+            for sub_line in nested:
+                sub_indent = len(sub_line) - len(sub_line.lstrip(" "))
+                if sub_indent <= indent:
+                    continue
+                sub_stripped = sub_line.strip()
+                if ":" not in sub_stripped:
+                    continue
+                sub_key, _, sub_val = sub_stripped.partition(":")
+                sub[sub_key.strip()] = _parse_simple_yaml_scalar(sub_val.strip())
+            result[key] = sub
+        i = j
     return result
 
 
@@ -947,36 +1921,313 @@ def _workspace_mode(h: Path) -> str:
 
 def _write_profile_yaml(h: Path, data: dict) -> None:
     """Write profile data back to YAML text without yaml library."""
+    def _yaml_scalar_text(value):
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        return json.dumps(str(value), ensure_ascii=False)
+
     lines = []
     for key, val in data.items():
         if isinstance(val, list):
             if val:
                 lines.append(f"{key}:")
                 for item in val:
-                    lines.append(f"  - {item}")
+                    lines.append(f"  - {_yaml_scalar_text(item)}")
             else:
                 lines.append(f"{key}: []")
         elif isinstance(val, dict):
             if val:
                 lines.append(f"{key}:")
                 for k2, v2 in val.items():
-                    lines.append(f"  {k2}: {v2}")
+                    lines.append(f"  {k2}: {_yaml_scalar_text(v2)}")
             else:
                 lines.append(f"{key}: {{}}")
-        elif isinstance(val, float):
-            lines.append(f"{key}: {val}")
-        elif isinstance(val, bool):
-            lines.append(f"{key}: {'true' if val else 'false'}")
-        elif isinstance(val, int):
-            lines.append(f"{key}: {val}")
-        elif val == "":
-            lines.append(f'{key}: ""')
         else:
-            lines.append(f"{key}: {val}")
+            lines.append(f"{key}: {_yaml_scalar_text(val)}")
     atomic_write(h / PROFILE_FILE, "\n".join(lines) + "\n")
 
 
-def cmd_profile_detect(args, h: Path, project_root: Path) -> None:
+def _detect_workspace_mode(project_root: Path, profile_type: str) -> str:
+    """Infer workspace layout so scanning can choose the right narrowing strategy."""
+    top_dirs = [
+        p.name
+        for p in project_root.iterdir()
+        if p.is_dir() and not p.name.startswith(".") and p.name not in PROFILE_SCAN_IGNORE_DIRS
+    ]
+    if profile_type == "docs":
+        return "docs-heavy"
+    if profile_type == "infra":
+        return "infra-heavy"
+    monorepo_markers = {"apps", "packages", "libs", "services"}
+    if len(monorepo_markers.intersection(set(top_dirs))) >= 2:
+        return "monorepo"
+    repo_like_children = 0
+    nested_git_children = 0
+    for dirname in top_dirs:
+        child = project_root / dirname
+        has_git = (child / ".git").exists()
+        has_marker = any((child / marker).exists() for marker in PROFILE_REPO_MARKERS if marker != ".git")
+        if has_git:
+            nested_git_children += 1
+        if has_git or has_marker:
+            repo_like_children += 1
+    if nested_git_children >= 2:
+        return "multi-repo"
+    if repo_like_children >= 2:
+        return "monorepo"
+    return "single-repo"
+
+
+def _detect_primary_surfaces(project_root: Path, workspace_mode: str) -> list[str]:
+    """Derive conservative surface hints without binding to a specific tech stack."""
+    top_dirs = [
+        p
+        for p in project_root.iterdir()
+        if p.is_dir() and not p.name.startswith(".") and p.name not in PROFILE_SCAN_IGNORE_DIRS
+    ]
+    if workspace_mode == "multi-repo":
+        surfaces = []
+        for child in top_dirs:
+            if (child / ".git").exists() or any(
+                (child / marker).exists() for marker in PROFILE_REPO_MARKERS if marker != ".git"
+            ):
+                surfaces.append(f"{child.name}/")
+        return sorted(surfaces)
+    if workspace_mode == "monorepo":
+        monorepo_markers = ["apps", "packages", "libs", "services"]
+        marker_surfaces = [f"{name}/" for name in monorepo_markers if (project_root / name).is_dir()]
+        if marker_surfaces:
+            return marker_surfaces
+        return sorted(
+            f"{child.name}/"
+            for child in top_dirs
+            if any((child / marker).exists() for marker in PROFILE_REPO_MARKERS if marker != ".git")
+        )
+
+    common_single_repo_surfaces = [
+        "src",
+        "app",
+        "lib",
+        "cmd",
+        "pkg",
+        "internal",
+        "server",
+        "client",
+        "backend",
+        "frontend",
+        "web",
+        "api",
+    ]
+    surfaces = [f"{name}/" for name in common_single_repo_surfaces if (project_root / name).is_dir()]
+    return surfaces[:4]
+
+
+def _profile_override_keys(existing: dict) -> set[str]:
+    overrides = existing.get("overrides", {})
+    if not isinstance(overrides, dict):
+        return set()
+    keys: set[str] = set()
+    for key, value in overrides.items():
+        if value not in ("", None, False, [], {}):
+            keys.add(str(key).strip())
+    return keys
+
+
+def _looks_like_legacy_profile_template(existing: dict) -> bool:
+    confidence = existing.get("confidence", 0.0)
+    try:
+        low_confidence = float(confidence or 0.0) <= 0.05
+    except (TypeError, ValueError):
+        low_confidence = True
+    if not low_confidence:
+        return False
+
+    matched = 0
+    for key, legacy_value in LEGACY_PROFILE_TEMPLATE_DEFAULTS.items():
+        if existing.get(key) == legacy_value:
+            matched += 1
+    return matched >= 5
+
+
+def _neutralize_legacy_profile_defaults(existing: dict, project_root: Path, detected_workspace_mode: str) -> dict:
+    """Clear legacy biased template values so fresh detection can replace them."""
+    sanitized = dict(existing)
+    override_keys = _profile_override_keys(existing)
+    if not _looks_like_legacy_profile_template(existing):
+        for key, neutral_value in PROFILE_NEUTRAL_DEFAULTS.items():
+            sanitized.setdefault(key, neutral_value if not isinstance(neutral_value, list) else list(neutral_value))
+        return sanitized
+
+    primary_surfaces = sanitized.get("primary_surfaces")
+    invalid_surfaces = (
+        isinstance(primary_surfaces, list)
+        and primary_surfaces
+        and all(not (project_root / str(surface).rstrip("/")).exists() for surface in primary_surfaces)
+    )
+    has_template_sentinel = (
+        str(sanitized.get("detected_at") or "").strip() == ""
+        and str(sanitized.get("notes") or "").strip() == ""
+        and str(sanitized.get("framework") or "").strip() == ""
+        and sanitized.get("overrides") in ({}, None)
+    )
+    if not invalid_surfaces and not has_template_sentinel:
+        for key, neutral_value in PROFILE_NEUTRAL_DEFAULTS.items():
+            sanitized.setdefault(key, neutral_value if not isinstance(neutral_value, list) else list(neutral_value))
+        return sanitized
+
+    for key, legacy_value in LEGACY_PROFILE_TEMPLATE_DEFAULTS.items():
+        if key in override_keys:
+            continue
+        if sanitized.get(key) == legacy_value:
+            neutral_value = PROFILE_NEUTRAL_DEFAULTS.get(key)
+            if isinstance(neutral_value, list):
+                sanitized[key] = list(neutral_value)
+            else:
+                sanitized[key] = neutral_value
+
+    sanitized["_legacy_defaults_cleared"] = True
+
+    for key, neutral_value in PROFILE_NEUTRAL_DEFAULTS.items():
+        sanitized.setdefault(key, neutral_value if not isinstance(neutral_value, list) else list(neutral_value))
+
+    return sanitized
+
+
+def _artifact_step_is_observable(path: Path) -> bool:
+    """Treat an artifact as observable progress only when it exists and is minimally valid."""
+    if not path.exists() or not path.is_file() or path.stat().st_size == 0:
+        return False
+    if path.suffix == ".json":
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        def _has_non_empty_surface_route(data: dict) -> bool:
+            surfaces = data.get("surfaces")
+            if not isinstance(surfaces, list) or len(surfaces) == 0:
+                return False
+            return any(
+                isinstance(item, dict)
+                and str(item.get("type", "")).strip()
+                and str(item.get("path", "")).strip()
+                for item in surfaces
+            )
+
+        def _has_minimal_generated_scenario(data: dict) -> bool:
+            scenarios = data.get("scenarios")
+            if not isinstance(scenarios, list) or len(scenarios) == 0:
+                return False
+            return any(
+                isinstance(item, dict)
+                and str(item.get("confidence", "")).strip().lower() in ("high", "medium")
+                and re.fullmatch(r"(?i)SCN-\d+", str(item.get("scenario_id", "")).strip()) is not None
+                and str(item.get("scenario", "")).strip()
+                for item in scenarios
+            )
+
+        def _has_minimal_scenario_coverage(data: dict) -> bool:
+            if not data.get("epic_id") or not data.get("version"):
+                return False
+            scenarios = data.get("scenarios")
+            if not isinstance(scenarios, list) or len(scenarios) == 0:
+                return False
+            return any(
+                isinstance(item, dict)
+                and re.fullmatch(r"(?i)SCN-\d+", str(item.get("scenario_id", "")).strip()) is not None
+                and str(item.get("status", "")).strip() in {
+                    "covered",
+                    "needs_decision",
+                    "deferred",
+                    "dropped_invalid",
+                }
+                for item in scenarios
+            )
+
+        validators = {
+            "domain-frame.json": lambda data: bool(data.get("epic_id")) and bool(data.get("version")),
+            "generated-scenarios.json": _has_minimal_generated_scenario,
+            "scenario-coverage.json": _has_minimal_scenario_coverage,
+            "surface-routing.json": _has_non_empty_surface_route,
+        }
+        validator = validators.get(path.name)
+        return validator(payload) if validator else bool(payload)
+    try:
+        return bool(path.read_text(encoding="utf-8", errors="replace").strip())
+    except OSError:
+        return False
+
+
+def _default_scan_budget_for_workspace_mode(workspace_mode: str) -> dict:
+    """Provide conservative scan caps by workspace shape."""
+    if workspace_mode == "multi-repo":
+        return {
+            "max_repos_deep_scan": 5,
+            "max_files_deep_read_per_scout": 15,
+            "max_subagents_wave": 4,
+        }
+    if workspace_mode == "monorepo":
+        return {
+            "max_repos_deep_scan": 3,
+            "max_files_deep_read_per_scout": 18,
+            "max_subagents_wave": 4,
+        }
+    if workspace_mode in ("docs-heavy", "infra-heavy"):
+        return {
+            "max_repos_deep_scan": 2,
+            "max_files_deep_read_per_scout": 12,
+            "max_subagents_wave": 2,
+        }
+    return {
+        "max_repos_deep_scan": 3,
+        "max_files_deep_read_per_scout": 20,
+        "max_subagents_wave": 3,
+    }
+
+
+def _normalize_profile_data(data: dict) -> dict:
+    """Fold legacy flattened keys back into nested project-profile sections."""
+    normalized = dict(data)
+
+    intensity = normalized.get("intensity")
+    if not isinstance(intensity, dict):
+        intensity = {}
+    for key in ("agent_parallelism", "council_size", "harness_strength"):
+        if key in normalized:
+            if key not in intensity:
+                intensity[key] = normalized[key]
+            normalized.pop(key, None)
+    if intensity:
+        normalized["intensity"] = intensity
+    elif "intensity" in normalized and normalized["intensity"] == []:
+        normalized["intensity"] = {}
+
+    scan = normalized.get("scan")
+    if not isinstance(scan, dict):
+        scan = {}
+    for key in (
+        "max_repos_deep_scan",
+        "max_files_deep_read_per_scout",
+        "max_subagents_wave",
+    ):
+        if key in normalized:
+            if key not in scan:
+                scan[key] = normalized[key]
+            normalized.pop(key, None)
+    if scan:
+        normalized["scan"] = scan
+    elif "scan" in normalized and normalized["scan"] == []:
+        normalized["scan"] = {}
+
+    return normalized
+
+
+def _detect_profile_data(h: Path, project_root: Path) -> dict:
     detected_type = "unknown"
     confidence = 0.0
 
@@ -1014,6 +2265,8 @@ def cmd_profile_detect(args, h: Path, project_root: Path) -> None:
         "unknown":   "unknown",
     }
     profile_type = type_map.get(detected_type, "unknown")
+    workspace_mode = _detect_workspace_mode(project_root, profile_type)
+    scan_defaults = _default_scan_budget_for_workspace_mode(workspace_mode)
 
     # Build check_focus from type
     focus_map = {
@@ -1028,25 +2281,81 @@ def cmd_profile_detect(args, h: Path, project_root: Path) -> None:
     # Load existing profile
     profile_path = h / PROFILE_FILE
     if profile_path.exists():
-        existing = _parse_simple_yaml(profile_path.read_text(encoding="utf-8"))
+        existing = _normalize_profile_data(
+            _parse_simple_yaml(profile_path.read_text(encoding="utf-8"))
+        )
     else:
         existing = {}
+    had_workspace_mode = "workspace_mode" in existing
+    had_primary_surfaces = "primary_surfaces" in existing
+    had_type = "type" in existing
+    had_check_focus = "check_focus" in existing
+    had_scan = "scan" in existing
+    existing = _neutralize_legacy_profile_defaults(existing, project_root, workspace_mode)
+    override_keys = _profile_override_keys(existing)
+    legacy_cleared = bool(existing.pop("_legacy_defaults_cleared", False))
+    detected_primary_surfaces = _detect_primary_surfaces(project_root, workspace_mode)
+    initial_workspace_mode = existing.get("workspace_mode")
 
-    existing["type"] = profile_type
+    current_type = existing.get("type")
+    if "type" in override_keys and current_type:
+        existing["type"] = current_type
+    elif legacy_cleared or not had_type or current_type in (None, "", PROFILE_UNKNOWN):
+        existing["type"] = profile_type
     existing["risk_level"] = existing.get("risk_level", "medium")
-    existing["primary_surfaces"] = existing.get("primary_surfaces", [])
-    existing["check_focus"] = focus_map.get(profile_type, [])
+    if "workspace_mode" not in override_keys:
+        current_workspace_mode = existing.get("workspace_mode")
+        if legacy_cleared or not had_workspace_mode or current_workspace_mode in (None, "", PROFILE_UNKNOWN):
+            existing["workspace_mode"] = workspace_mode
+    else:
+        existing["workspace_mode"] = str(existing.get("workspace_mode") or workspace_mode).strip() or workspace_mode
+    if "scan" not in override_keys or not existing.get("scan"):
+        current_scan = existing.get("scan")
+        if legacy_cleared or not had_scan or not current_scan:
+            existing["scan"] = scan_defaults
+    if "primary_surfaces" not in override_keys:
+        current_surfaces = existing.get("primary_surfaces", [])
+        if (
+            legacy_cleared
+            or not had_primary_surfaces
+            or (
+                current_surfaces == []
+                and initial_workspace_mode in (None, "", PROFILE_UNKNOWN)
+            )
+        ):
+            existing["primary_surfaces"] = detected_primary_surfaces
+    else:
+        existing["primary_surfaces"] = existing.get("primary_surfaces", [])
+    if "check_focus" in override_keys:
+        existing["check_focus"] = existing.get("check_focus")
+    elif legacy_cleared or not had_check_focus or existing.get("check_focus") in (None, []):
+        existing["check_focus"] = focus_map.get(profile_type, [])
     existing["detected_at"] = now_iso()
     existing["confidence"] = confidence
     if "overrides" not in existing:
         existing["overrides"] = {}
+    for key, neutral_value in PROFILE_NEUTRAL_DEFAULTS.items():
+        if key not in existing:
+            existing[key] = neutral_value if not isinstance(neutral_value, list) else list(neutral_value)
 
     _write_profile_yaml(h, existing)
+    return {
+        "type": existing.get("type", profile_type),
+        "workspace_mode": existing.get("workspace_mode", workspace_mode),
+        "primary_surfaces": existing.get("primary_surfaces", []),
+        "scan": existing.get("scan", {}),
+        "confidence": confidence,
+        "detected_at": existing["detected_at"],
+    }
 
+
+def cmd_profile_detect(args, h: Path, project_root: Path) -> None:
+    profile = _detect_profile_data(h, project_root)
     if args.json:
-        out_json({"type": profile_type, "confidence": confidence, "detected_at": existing["detected_at"]})
+        out_json(profile)
     else:
-        print(f"Detected project type: {profile_type} (confidence: {confidence})")
+        print(f"Detected project type: {profile['type']} (confidence: {profile['confidence']})")
+        print(f"Workspace mode: {profile['workspace_mode']}")
         print(f"Written to: {h / PROFILE_FILE}")
 
 
@@ -1056,7 +2365,7 @@ def cmd_profile_show(args, h: Path) -> None:
         err(f"Profile not found. Run 'harnessctl profile detect' first.")
     content = profile_path.read_text(encoding="utf-8")
     if args.json:
-        out_json(_parse_simple_yaml(content))
+        out_json(_normalize_profile_data(_parse_simple_yaml(content)))
     else:
         print(content, end="")
 
@@ -1362,14 +2671,298 @@ def cmd_profile_discover_repo_aliases(args, h: Path, project_root: Path) -> None
             print("(dry-run; use --write to save)")
 
 
+def cmd_metrics_record(args, h: Path) -> None:
+    """Record a numeric/string ROI metric for an epic."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)  # validate
+    metric = args.metric.strip()
+    value = _parse_metric_value(args.value)
+
+    metrics = load_epic_metrics(h, epic_id)
+    roi_metrics = dict(metrics.get("roi_metrics", {}))
+    roi_metrics[metric] = {
+        "value": value,
+        "stage": getattr(args, "stage", "") or "",
+        "notes": getattr(args, "notes", "") or "",
+        "known_metric": metric in KNOWN_ROI_METRICS,
+        "updated_at": now_iso(),
+    }
+    metrics["roi_metrics"] = roi_metrics
+    save_epic_metrics(h, epic_id, metrics)
+
+    append_metrics_event(
+        h,
+        {
+            "timestamp": now_iso(),
+            "epic_id": epic_id,
+            "event_type": "roi_metric_recorded",
+            "metric": metric,
+            "value": value,
+            "stage": getattr(args, "stage", "") or "",
+        },
+    )
+
+    payload = {"status": "ok", "epic_id": epic_id, "metric": metric, "value": value}
+    if args.json:
+        out_json(payload)
+    else:
+        print(f"Recorded ROI metric for {epic_id}: {metric}={json.dumps(value, ensure_ascii=False)}")
+
+
+def cmd_metrics_check(args, h: Path) -> None:
+    """Record acceptance status for a scan-framework criterion."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)  # validate
+    criterion = args.criterion.strip()
+    status = args.status
+
+    metrics = load_epic_metrics(h, epic_id)
+    acceptance_checks = dict(metrics.get("acceptance_checks", {}))
+    acceptance_checks[criterion] = {
+        "status": status,
+        "notes": getattr(args, "notes", "") or "",
+        "known_criterion": criterion in KNOWN_ACCEPTANCE_CRITERIA,
+        "updated_at": now_iso(),
+    }
+    metrics["acceptance_checks"] = acceptance_checks
+    save_epic_metrics(h, epic_id, metrics)
+
+    append_metrics_event(
+        h,
+        {
+            "timestamp": now_iso(),
+            "epic_id": epic_id,
+            "event_type": "acceptance_check_recorded",
+            "criterion": criterion,
+            "status": status,
+        },
+    )
+
+    payload = {"status": "ok", "epic_id": epic_id, "criterion": criterion, "acceptance": status}
+    if args.json:
+        out_json(payload)
+    else:
+        print(f"Recorded acceptance check for {epic_id}: {criterion} -> {status}")
+
+
+def cmd_metrics_derive(args, h: Path) -> None:
+    """Derive a small set of acceptance checks from stage artifacts."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)
+    features_dir = h / "features" / epic_id
+    metrics = load_epic_metrics(h, epic_id)
+    acceptance_checks = dict(metrics.get("acceptance_checks", {}))
+
+    surface_status = "not_met"
+    surface_notes = "surface-routing.json missing or invalid"
+    sr_path = features_dir / "surface-routing.json"
+    sr_data = {}
+    if sr_path.exists():
+        try:
+            sr_data = load_json(sr_path)
+            surfaces = sr_data.get("surfaces")
+            if isinstance(surfaces, list) and surfaces:
+                surface_status = "met"
+                surface_notes = "surface-routing.json present with non-empty surfaces"
+            else:
+                surface_status = "partial"
+                surface_notes = "surface-routing.json present but surfaces missing/empty"
+        except SystemExit:
+            surface_status = "partial"
+            surface_notes = "surface-routing.json present but invalid"
+
+    mvp_status = surface_status
+    mvp_notes = surface_notes
+    if _workspace_mode(h) == "multi-repo":
+        cri_path = features_dir / "cross-repo-impact-index.json"
+        if cri_path.exists():
+            try:
+                cri_data = load_json(cri_path)
+                cri_errors = _cross_repo_impact_index_errors(cri_data)
+                if not cri_errors:
+                    if surface_status == "met":
+                        mvp_status = "met"
+                        mvp_notes = "routing + cross-repo-impact-index present"
+                    else:
+                        mvp_status = "partial"
+                        mvp_notes = "cross-repo-impact-index present but routing incomplete"
+                else:
+                    mvp_status = "partial"
+                    mvp_notes = f"cross-repo-impact-index present but {cri_errors[0]}"
+            except SystemExit:
+                mvp_status = "partial"
+                mvp_notes = "cross-repo-impact-index present but invalid"
+        else:
+            mvp_status = "partial"
+            mvp_notes = "multi-repo workspace without cross-repo-impact-index.json"
+
+    codemap_status = "not_met"
+    codemap_notes = "no codemap evidence recorded"
+    audit_path = features_dir / "codemap-audit.json"
+    codemap_root = h / "memory" / "codemaps"
+    if audit_path.exists():
+        try:
+            audit = load_json(audit_path)
+            summary = audit.get("summary", {}) if isinstance(audit, dict) else {}
+            total = int(summary.get("total", 0) or 0)
+            stale = int(summary.get("stale", 0) or 0)
+            invalid = int(summary.get("invalid", 0) or 0)
+            missing_verified = int(summary.get("missing_verified_commit", 0) or 0)
+            if total > 0 and stale == 0 and invalid == 0:
+                codemap_status = "met"
+                codemap_notes = "codemap-audit present and all audited CodeMaps are usable"
+            elif total > 0:
+                codemap_status = "partial"
+                codemap_notes = (
+                    f"codemap-audit present but stale={stale}, invalid={invalid}, "
+                    f"missing_verified_commit={missing_verified}"
+                )
+        except SystemExit:
+            codemap_status = "partial"
+            codemap_notes = "codemap-audit.json present but invalid"
+    elif codemap_root.exists() and any(codemap_root.rglob("*.md")):
+        codemap_status = "not_met"
+        codemap_notes = "codemap files exist but no codemap-audit.json was recorded for this epic"
+
+    derived = {
+        "routing_auditable": {"status": surface_status, "notes": surface_notes},
+        "mvp_no_blind_scan": {"status": mvp_status, "notes": mvp_notes},
+        "codemap_reuse_visible": {"status": codemap_status, "notes": codemap_notes},
+    }
+
+    for criterion, payload in derived.items():
+        acceptance_checks[criterion] = {
+            "status": payload["status"],
+            "notes": payload["notes"],
+            "known_criterion": criterion in KNOWN_ACCEPTANCE_CRITERIA,
+            "updated_at": now_iso(),
+            "derived": True,
+        }
+        append_metrics_event(
+            h,
+            {
+                "timestamp": now_iso(),
+                "epic_id": epic_id,
+                "event_type": "acceptance_check_derived",
+                "criterion": criterion,
+                "status": payload["status"],
+            },
+        )
+
+    metrics["acceptance_checks"] = acceptance_checks
+    save_epic_metrics(h, epic_id, metrics)
+
+    payload = {"status": "ok", "epic_id": epic_id, "derived": derived}
+    if args.json:
+        out_json(payload)
+    else:
+        print(f"Derived acceptance checks for {epic_id}:")
+        for criterion, data in derived.items():
+            print(f"  {criterion}: {data['status']} ({data['notes']})")
+
+
+def cmd_metrics_show(args, h: Path) -> None:
+    """Show ROI metrics / acceptance checks for one epic or all epics."""
+    epic_id = getattr(args, "epic_id", "") or ""
+    if epic_id:
+        load_epic(h, epic_id)  # validate
+        metrics = load_epic_metrics(h, epic_id)
+        if args.json:
+            out_json(metrics)
+        else:
+            print(json.dumps(metrics, indent=2, ensure_ascii=False))
+        return
+
+    summaries = []
+    features_dir = h / "features"
+    if features_dir.exists():
+        for path in sorted(features_dir.glob("*/scan-metrics.json")):
+            try:
+                summaries.append(load_json(path))
+            except SystemExit:
+                continue
+    aggregate_metrics = {}
+    aggregate_acceptance = {}
+    for entry in summaries:
+        roi_metrics = entry.get("roi_metrics", {})
+        if isinstance(roi_metrics, dict):
+            for metric_name, metric_payload in roi_metrics.items():
+                if not isinstance(metric_payload, dict):
+                    continue
+                bucket = aggregate_metrics.setdefault(metric_name, {"count": 0, "numeric_count": 0, "sum": 0.0})
+                bucket["count"] += 1
+                value = metric_payload.get("value")
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    bucket["numeric_count"] += 1
+                    bucket["sum"] += float(value)
+        acceptance_checks = entry.get("acceptance_checks", {})
+        if isinstance(acceptance_checks, dict):
+            for criterion, check_payload in acceptance_checks.items():
+                if not isinstance(check_payload, dict):
+                    continue
+                status = check_payload.get("status")
+                bucket = aggregate_acceptance.setdefault(criterion, {"met": 0, "partial": 0, "not_met": 0})
+                if status in bucket:
+                    bucket[status] += 1
+    aggregate_metrics_out = {}
+    for metric_name, bucket in aggregate_metrics.items():
+        payload = {"count": bucket["count"], "numeric_count": bucket["numeric_count"]}
+        if bucket["numeric_count"] > 0:
+            payload["avg"] = bucket["sum"] / bucket["numeric_count"]
+        aggregate_metrics_out[metric_name] = payload
+    payload = {
+        "epics": summaries,
+        "aggregate_metrics": aggregate_metrics_out,
+        "aggregate_acceptance": aggregate_acceptance,
+    }
+    if args.json:
+        out_json(payload)
+    else:
+        if not summaries:
+            print("No scan metrics recorded.")
+            return
+        for entry in summaries:
+            print(f"{entry.get('epic_id','?')}:")
+            print(f"  roi_metrics: {len(entry.get('roi_metrics', {}))}")
+            print(f"  acceptance_checks: {len(entry.get('acceptance_checks', {}))}")
+            print(f"  updated_at: {entry.get('updated_at','')}")
+        if aggregate_metrics_out:
+            print("\nAggregate ROI metrics:")
+            for metric_name, metric_payload in sorted(aggregate_metrics_out.items()):
+                avg = metric_payload.get("avg")
+                if avg is None:
+                    print(f"  {metric_name}: count={metric_payload['count']}")
+                else:
+                    print(
+                        f"  {metric_name}: count={metric_payload['count']} "
+                        f"avg={avg:.4f}"
+                    )
+        if aggregate_acceptance:
+            print("\nAggregate acceptance checks:")
+            for criterion, counts in sorted(aggregate_acceptance.items()):
+                print(
+                    f"  {criterion}: met={counts['met']} "
+                    f"partial={counts['partial']} not_met={counts['not_met']}"
+                )
+
+
 # ---------------------------------------------------------------------------
 # epic commands
 # ---------------------------------------------------------------------------
 
-def cmd_epic_create(args, h: Path) -> None:
-    title = args.title
+def _derive_start_title(requirements: str, explicit_title: str = "") -> str:
+    """Build a concise epic title from a fuzzy requirement."""
+    source = explicit_title if explicit_title.strip() else requirements
+    title = re.sub(r"\s+", " ", source).strip()
+    if not title:
+        err("Requirement text is empty. Provide a short problem statement or use --title.")
+    title = title[:60].rstrip(" ,.;:-")
+    return title or "untitled epic"
+
+
+def _create_epic(h: Path, title: str, risk_level: str, description: str = "") -> dict:
+    """Create epic metadata and initial state, then persist both."""
     config = load_json(h / CONFIG_FILE)
-    risk_level = getattr(args, "risk_level", None) or config.get("risk_level", "medium")
     if risk_level not in RISK_LEVELS:
         err(f"Invalid risk_level: {risk_level}. Must be one of {RISK_LEVELS}")
 
@@ -1387,6 +2980,7 @@ def cmd_epic_create(args, h: Path) -> None:
     epic = {
         "id": epic_id,
         "title": title,
+        "description": description,
         "state": "CLARIFY",
         "risk_level": risk_level,
         "profile_type": profile_type,
@@ -1396,6 +2990,7 @@ def cmd_epic_create(args, h: Path) -> None:
             "consumed": 0,
         },
         "tasks": [],
+        "repo_worktrees": {},
     }
 
     # Save epic
@@ -1430,12 +3025,141 @@ def cmd_epic_create(args, h: Path) -> None:
         "updated_at": now_iso(),
     }
     save_state(h, state)
+    return epic
+
+
+def _next_action_for_state(state: dict) -> str:
+    """Mirror auto-mode next action resolution for the current state."""
+    budget_remaining = state.get("interrupt_budget", {}).get("remaining", 0)
+    has_pending_confirms = len(state.get("pending_decisions", [])) > 0
+    if has_pending_confirms and budget_remaining > 0:
+        return "wait_user"
+    return _STAGE_NEXT_ACTION.get(state.get("current_stage", ""), "wait_user")
+
+
+def cmd_start(args, project_root: Path) -> None:
+    """Bootstrap stage-harness and create the first epic from a fuzzy requirement."""
+    project_root = project_root.resolve()
+    original_project_root = project_root
+    h = project_root / HARNESS_DIR
+    initialized = False
+    bootstrap_retry = None
+    if not h.is_dir():
+        try:
+            h = _initialize_harness(project_root, force=False)
+            initialized = True
+        except OSError as exc:
+            cwd_root = Path.cwd().resolve()
+            can_retry_in_cwd = (
+                not getattr(args, "project_root", None)
+                and _is_permission_like_os_error(exc)
+                and cwd_root != project_root
+                and _dir_is_writable(cwd_root)
+                and not (original_project_root / HARNESS_DIR).exists()
+            )
+            if not can_retry_in_cwd:
+                err(f"failed to initialize {project_root / HARNESS_DIR}: {exc}")
+            retry_reason = (
+                f"failed to initialize {project_root / HARNESS_DIR}: {exc}; "
+                f"retrying bootstrap in current directory {cwd_root}"
+            )
+            print(f"warning: {retry_reason}", file=sys.stderr)
+            try:
+                h = _initialize_harness(cwd_root, force=False)
+            except OSError as retry_exc:
+                err(
+                    f"failed to initialize {project_root / HARNESS_DIR}: {exc}; "
+                    f"retry at {cwd_root / HARNESS_DIR} also failed: {retry_exc}"
+                )
+            project_root = cwd_root
+            initialized = True
+            bootstrap_retry = {
+                "from": str(original_project_root),
+                "to": str(cwd_root),
+                "reason": str(exc),
+            }
+
+    profile = _detect_profile_data(h, project_root)
+
+    config = load_json(h / CONFIG_FILE)
+    risk_level = getattr(args, "risk_level", None) or config.get("risk_level", "medium")
+    title = _derive_start_title(args.requirements, getattr(args, "title", ""))
+    epic = _create_epic(h, title, risk_level, args.requirements.strip())
+    state = load_state(h, epic["id"])
+    next_action = _next_action_for_state(state)
+    next_command = f"/harness:auto {epic['id']}" if next_action == "run_clarify" else next_action
+    manual_next_command = f"/harness:clarify {epic['id']}" if next_action == "run_clarify" else next_action
+
+    append_trace_event(h, _make_trace_event(
+        epic["id"], "start_bootstrapped",
+        stage=state.get("current_stage", ""),
+        command_name="harnessctl start",
+        summary=f"Bootstrapped harness and created epic {epic['id']}",
+        payload={
+            "initialized": initialized,
+            "title": title,
+            "requirements_excerpt": re.sub(r"\s+", " ", args.requirements).strip()[:200],
+            "next_action": next_action,
+            "project_root": str(project_root),
+            **({"bootstrap_retry": bootstrap_retry} if bootstrap_retry else {}),
+        },
+        artifact_paths=[
+            str(h / PROFILE_FILE),
+            str(h / "epics" / f"{epic['id']}.json"),
+            str(h / "features" / epic["id"] / "state.json"),
+        ],
+    ))
+
+    payload = {
+        "status": "ok",
+        "project_root": str(project_root),
+        "harness_dir": str(h),
+        "initialized": initialized,
+        "epic_id": epic["id"],
+        "title": title,
+        "current_stage": state.get("current_stage", ""),
+        "next_action": next_action,
+        "next_command": next_command,
+        "manual_next_command": manual_next_command,
+        "profile": {
+            "type": profile.get("type", "unknown"),
+            "workspace_mode": profile.get("workspace_mode", "single-repo"),
+            "confidence": profile.get("confidence", 0.0),
+        },
+    }
+    if bootstrap_retry:
+        payload["bootstrap_retry"] = bootstrap_retry
+    if args.json:
+        out_json(payload)
+    else:
+        print("Stage-Harness bootstrap complete")
+        print(f"  project_root:   {project_root}")
+        print(f"  initialized:    {'yes' if initialized else 'no'}")
+        print(f"  profile:        {payload['profile']['type']} ({payload['profile']['workspace_mode']})")
+        print(f"  epic:           {epic['id']} | {title}")
+        print(f"  current_stage:  {payload['current_stage']}")
+        print(f"  next_action:    {next_action}")
+        print(f"  next_step:      {next_command}")
+        if manual_next_command != next_command:
+            print(f"  manual_step:    {manual_next_command}")
+
+
+def cmd_epic_create(args, h: Path) -> None:
+    title = (getattr(args, "title_flag", "") or getattr(args, "title", "")).strip()
+    if not title:
+        err("Epic title is required. Pass it positionally or via --title.")
+    description = getattr(args, "description", "").strip()
+    config = load_json(h / CONFIG_FILE)
+    risk_level = getattr(args, "risk_level", None) or config.get("risk_level", "medium")
+    epic = _create_epic(h, title, risk_level, description)
 
     if args.json:
         out_json(epic)
     else:
-        print(f"Created epic: {epic_id}")
+        print(f"Created epic: {epic['id']}")
         print(f"  title:      {title}")
+        if description:
+            print(f"  description:{' ' * 4}{description}")
         print(f"  state:      CLARIFY")
         print(f"  risk_level: {risk_level}")
 
@@ -1658,7 +3382,7 @@ def cmd_state_next(args, h: Path) -> None:
         action = _STAGE_NEXT_ACTION.get(current, "wait_user")
 
     budget_remaining = state.get("interrupt_budget", {}).get("remaining", 0)
-    has_pending_confirms = len(state.get("pending_decisions", [])) > 0
+    has_pending_confirms = len(_effective_pending_decisions(h, state)) > 0
 
     if has_pending_confirms and budget_remaining > 0:
         action = "wait_user"
@@ -1953,6 +3677,7 @@ STAGE_GATE_ARTIFACTS = {
         "{features_dir}/domain-frame.json",         # domain-scout（CLARIFY Step 0）
         "{features_dir}/generated-scenarios.json",  # scenario-expander
         "{features_dir}/scenario-coverage.json",    # Semantic Reconciliation coverage ledger
+        "{features_dir}/requirements-draft.md",     # requirement-analyst
         "{features_dir}/challenge-report.md",       # challenger 落盘
         "{features_dir}/clarification-notes.md",   # 澄清笔记（含 Domain Frame）
         "{features_dir}/impact-scan.md",            # 代码库影响扫描
@@ -1988,6 +3713,32 @@ CLARIFY_ARTIFACTS_NOTES_ONLY = [
 ]
 
 
+def _stage_gate_artifacts_spec(stage: str, h: Path) -> list[str] | None:
+    harness_cfg = merged_harness_config(h)
+    clarify_notes_only = (
+        stage == "CLARIFY"
+        and str(harness_cfg.get("clarify_closure_mode", "full")).lower() == "notes_only"
+    )
+    if clarify_notes_only:
+        return list(CLARIFY_ARTIFACTS_NOTES_ONLY)
+    artifacts_spec = STAGE_GATE_ARTIFACTS.get(stage)
+    return list(artifacts_spec) if artifacts_spec is not None else None
+
+
+def _cross_repo_impact_index_errors(data: object) -> list[str]:
+    if not isinstance(data, dict):
+        return ["root must be a JSON object"]
+    repos = data.get("repos")
+    if not isinstance(repos, list) or len(repos) == 0:
+        return ["repos must be a non-empty JSON array"]
+    if not any(
+        isinstance(item, dict) and str(item.get("repo_id", "")).strip()
+        for item in repos
+    ):
+        return ["repos must include at least one object with non-empty `repo_id`"]
+    return []
+
+
 def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
     stage = args.stage.upper()
     epic_id = args.epic_id
@@ -1997,9 +3748,7 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
         stage == "CLARIFY"
         and str(harness_cfg.get("clarify_closure_mode", "full")).lower() == "notes_only"
     )
-    artifacts_spec = STAGE_GATE_ARTIFACTS.get(stage)
-    if clarify_notes_only:
-        artifacts_spec = list(CLARIFY_ARTIFACTS_NOTES_ONLY)
+    artifacts_spec = _stage_gate_artifacts_spec(stage, h)
 
     if artifacts_spec is None:
         if args.json:
@@ -2010,6 +3759,7 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
 
     missing = []
     present = []
+    warnings = []
 
     spec_file = spec_path_for_epic(h, epic_id)
     strict_semantic = bool(harness_cfg.get("spec_semantic_hints_strict", False))
@@ -2048,21 +3798,32 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
     if stage == "CLARIFY":
         for msg in _clarify_notes_only_closure_errors(features_dir):
             missing.append(msg)
+        for msg in clarify_focus_point_closure_errors(features_dir):
+            missing.append(msg)
+        if not clarify_notes_only:
+            for msg in clarify_state_constraint_signal_scn_focus_errors(features_dir):
+                missing.append(msg)
+        if bool(harness_cfg.get("clarify_signal_gate_enabled", True)):
+            for msg in _clarify_signal_gate_errors(features_dir):
+                missing.append(msg)
+            if not clarify_notes_only:
+                for msg in _clarify_signal_closure_errors(features_dir):
+                    missing.append(msg)
+        if bool(harness_cfg.get("clarify_deep_dive_enabled", True)):
+            if (
+                not clarify_notes_only
+                and bool(harness_cfg.get("clarify_deep_dive_gate_strict", False))
+            ):
+                for msg in _clarify_deep_dive_gate_errors(features_dir):
+                    missing.append(msg)
 
     if stage == "CLARIFY" and not clarify_notes_only:
         df_path = features_dir / "domain-frame.json"
         if df_path.exists():
             try:
                 df_data = json.loads(df_path.read_text(encoding="utf-8"))
-                for key in (
-                    "business_goals",
-                    "domain_constraints",
-                    "semantic_signals",
-                    "candidate_edge_cases",
-                    "candidate_open_questions",
-                ):
-                    if key not in df_data:
-                        missing.append(f"{df_path} (missing key: {key})")
+                for key in domain_frame_missing_required_keys(df_data):
+                    missing.append(f"{df_path} (missing key: {key})")
                 for opt_key in ("state_transition_scenarios", "constraint_conflicts"):
                     if opt_key in df_data and not isinstance(df_data[opt_key], list):
                         missing.append(
@@ -2074,18 +3835,16 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
         if gen_path.exists():
             try:
                 gen_data = json.loads(gen_path.read_text(encoding="utf-8"))
-                scenarios = gen_data.get("scenarios") if isinstance(gen_data, dict) else None
-                if not isinstance(scenarios, list):
-                    missing.append(f"{gen_path} (missing scenarios array)")
+                for msg in generated_scenarios_strict_errors(gen_data):
+                    missing.append(f"{gen_path} ({msg})")
             except json.JSONDecodeError:
                 missing.append(f"{gen_path} (invalid JSON)")
         coverage_path = features_dir / "scenario-coverage.json"
         if coverage_path.exists():
             try:
                 coverage_data = json.loads(coverage_path.read_text(encoding="utf-8"))
-                scenarios = coverage_data.get("scenarios") if isinstance(coverage_data, dict) else None
-                if not isinstance(scenarios, list):
-                    missing.append(f"{coverage_path} (missing scenarios array)")
+                for msg in scenario_coverage_strict_errors(coverage_data):
+                    missing.append(f"{coverage_path} ({msg})")
             except json.JSONDecodeError:
                 missing.append(f"{coverage_path} (invalid JSON)")
         ch_path = features_dir / "challenge-report.md"
@@ -2146,10 +3905,8 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
             if cri_path.exists():
                 try:
                     cri = json.loads(cri_path.read_text(encoding="utf-8"))
-                    if not isinstance(cri, dict):
-                        missing.append(f"{cri_path} (root must be a JSON object)")
-                    elif not isinstance(cri.get("repos"), list):
-                        missing.append(f"{cri_path} (missing repos array)")
+                    for msg in _cross_repo_impact_index_errors(cri):
+                        missing.append(f"{cri_path} ({msg})")
                 except json.JSONDecodeError:
                     missing.append(f"{cri_path} (invalid JSON)")
             else:
@@ -2166,6 +3923,9 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
                 missing.append(f"CLARIFY (semantic gate: {hint})")
             else:
                 print(f"  ⚠️  CLARIFY semantic hint: {hint}")
+        if bool(harness_cfg.get("clarify_deep_dive_enabled", True)):
+            for hint in _clarify_deep_dive_hints(features_dir):
+                print(f"  ⚠️  CLARIFY deep-dive hint: {hint}")
 
     if stage == "PLAN":
         task_files = list(iter_task_files(h, epic_id) or [])
@@ -2181,6 +3941,25 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
                     missing.append(f"{matrix_path} (coverage below 80%: {coverage_pct:.1f}%)")
             except SystemExit:
                 missing.append(f"{matrix_path} (invalid JSON)")
+
+        codemap_audit_path = features_dir / "codemap-audit.json"
+        codemap_root = h / "memory" / "codemaps"
+        if codemap_audit_path.exists():
+            try:
+                audit = load_json(codemap_audit_path)
+                summary = audit.get("summary", {}) if isinstance(audit, dict) else {}
+                stale = int(summary.get("stale", 0) or 0)
+                invalid = int(summary.get("invalid", 0) or 0)
+                if stale > 0 or invalid > 0:
+                    warnings.append(
+                        f"{codemap_audit_path} (stale={stale}, invalid={invalid}; treat cached codemaps as low-confidence background)"
+                    )
+            except SystemExit:
+                warnings.append(f"{codemap_audit_path} (invalid JSON; ignore cached codemaps until re-audited)")
+        elif codemap_root.exists() and any(codemap_root.rglob("*.md")):
+            warnings.append(
+                f"{codemap_root} (codemaps exist but no {features_dir / 'codemap-audit.json'}; run memory codemap-audit before trusting cache)"
+            )
 
     if stage == "VERIFY":
         verification_path = features_dir / "verification.json"
@@ -2245,7 +4024,7 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
         stage=stage,
         command_name="harnessctl stage-gate check",
         summary=f"Gate {stage} checked",
-        payload={"present": present, "missing": missing},
+        payload={"present": present, "missing": missing, "warnings": warnings},
     ))
 
     passed = len(missing) == 0
@@ -2258,7 +4037,7 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
         status="ok" if passed else "blocked",
         command_name="harnessctl stage-gate check",
         summary=f"Gate {stage}: {'PASSED' if passed else f'BLOCKED ({len(missing)} missing)'}",
-        payload={"present": present, "missing": missing, "passed": passed},
+        payload={"present": present, "missing": missing, "warnings": warnings, "passed": passed},
     ))
 
     if args.json:
@@ -2268,6 +4047,7 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
             "passed": passed,
             "present": present,
             "missing": missing,
+            "warnings": warnings,
         })
     else:
         print(f"=== Stage Gate: {stage} for {epic_id} ===")
@@ -2275,6 +4055,8 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
             print(f"  ✅ {a}")
         for a in missing:
             print(f"  ❌ {a}")
+        for a in warnings:
+            print(f"  ⚠️  {a}")
         if passed:
             print(f"\nGate PASSED: {stage}")
         else:
@@ -2289,6 +4071,33 @@ def cmd_clarify_selfcheck(args, h: Path, project_root: Path) -> None:
     harness_cfg = merged_harness_config(h)
     mode = str(harness_cfg.get("clarify_closure_mode", "full")).lower()
     cn_errors = _clarify_notes_only_closure_errors(features_dir)
+    signal_summary = _clarify_signal_gate_summary(features_dir)
+    signal_gate_enabled = bool(harness_cfg.get("clarify_signal_gate_enabled", True))
+    signal_gate_errors = (
+        _clarify_signal_gate_errors(features_dir)
+        if signal_gate_enabled
+        else []
+    )
+    signal_closure_errors = (
+        _clarify_signal_closure_errors(features_dir)
+        if (signal_gate_enabled and mode != "notes_only")
+        else []
+    )
+    deep_dive_enabled = bool(harness_cfg.get("clarify_deep_dive_enabled", True))
+    deep_dive_hints = _clarify_deep_dive_hints(features_dir) if deep_dive_enabled else []
+    deep_dive_gate_errors = (
+        _clarify_deep_dive_gate_errors(features_dir)
+        if (deep_dive_enabled and bool(harness_cfg.get("clarify_deep_dive_gate_strict", False)))
+        else []
+    )
+    focus_point_errors = clarify_focus_point_closure_errors(features_dir)
+    state_constraint_signal_scn_focus_errors = (
+        clarify_state_constraint_signal_scn_focus_errors(features_dir)
+        if mode != "notes_only"
+        else []
+    )
+    notes_core_errors = cn_errors + focus_point_errors
+    clarify_closure_errors = notes_core_errors + state_constraint_signal_scn_focus_errors
 
     full_rows: list[dict] = []
     for tmpl in STAGE_GATE_ARTIFACTS["CLARIFY"]:
@@ -2303,11 +4112,28 @@ def cmd_clarify_selfcheck(args, h: Path, project_root: Path) -> None:
         out_json({
             "epic_id": epic_id,
             "clarify_closure_mode": mode,
-            "clarification_notes_errors": cn_errors,
-            "clarification_notes_ok": len(cn_errors) == 0,
-            # Back-compat for early consumers (same as clarification_notes_*).
-            "notes_only_errors": cn_errors,
-            "notes_only_ok": len(cn_errors) == 0,
+            "clarification_notes_structure_errors": cn_errors,
+            "clarification_notes_errors": clarify_closure_errors,
+            "clarification_notes_ok": len(clarify_closure_errors) == 0,
+            "clarify_signal_gate_enabled": bool(harness_cfg.get("clarify_signal_gate_enabled", True)),
+            "signal_gate_required_axes": signal_summary.get("required_axes", {}),
+            "signal_gate_hits": signal_summary.get("hits", []),
+            "signal_gate_errors": signal_gate_errors,
+            "signal_closure_errors": signal_closure_errors,
+            "clarify_deep_dive_enabled": deep_dive_enabled,
+            "clarify_deep_dive_gate_strict": bool(harness_cfg.get("clarify_deep_dive_gate_strict", False)),
+            "deep_dive_hints": deep_dive_hints,
+            "deep_dive_gate_errors": deep_dive_gate_errors,
+            "focus_point_errors": focus_point_errors,
+            "focus_points_ok": len(focus_point_errors) == 0,
+            "state_constraint_signal_scn_focus_errors": state_constraint_signal_scn_focus_errors,
+            "state_constraint_signal_scn_focus_ok": len(state_constraint_signal_scn_focus_errors) == 0,
+            # Back-compat: same keys as pre–State+Constraint gate (list was state-flow-only).
+            "state_flow_scn_focus_errors": state_constraint_signal_scn_focus_errors,
+            "state_flow_scn_focus_ok": len(state_constraint_signal_scn_focus_errors) == 0,
+            # Structural notes + explicit user focus only (excludes full-mode SCN signal→Focus gate).
+            "notes_only_errors": notes_core_errors,
+            "notes_only_ok": len(notes_core_errors) == 0,
             "full_gate_artifacts": full_rows,
         })
         return
@@ -2321,6 +4147,50 @@ def cmd_clarify_selfcheck(args, h: Path, project_root: Path) -> None:
             print(f"  ❌ {msg}")
     else:
         print("  ✅ clarification-notes 通过结构校验")
+    if signal_summary.get("required_axes"):
+        print("")
+        print("-- signal-driven gate（命中信号时定向加严）--")
+        for axis, reasons in sorted(signal_summary["required_axes"].items()):
+            print(f"  • {axis}: {', '.join(reasons)}")
+        if signal_gate_errors:
+            for msg in signal_gate_errors:
+                print(f"  ❌ {msg}")
+        else:
+            print("  ✅ 命中的强化轴未发现额外 gate 问题")
+    if deep_dive_hints:
+        print("")
+        print("-- deep-dive 提示 --")
+        for hint in deep_dive_hints:
+            print(f"  ⚠️  {hint}")
+    if deep_dive_gate_errors:
+        print("")
+        print("-- deep-dive 严格门禁 --")
+        for msg in deep_dive_gate_errors:
+            print(f"  ❌ {msg}")
+    cn_path = features_dir / "clarification-notes.md"
+    notes_for_focus = (
+        cn_path.read_text(encoding="utf-8", errors="replace") if cn_path.exists() else ""
+    )
+    has_focus_section = bool(
+        re.search(
+            r"(?im)^#{1,4}\s*(?:focus\s*points|用户关注点|用户点名关注)\b",
+            notes_for_focus,
+        )
+    )
+    if focus_point_errors:
+        print("")
+        print("-- 用户关注点闭环（Focus Points → REQ/CHK/SCN/DEC/UNK）--")
+        for msg in focus_point_errors:
+            print(f"  ❌ {msg}")
+    elif (features_dir / "focus-points.json").exists() or has_focus_section:
+        print("")
+        print("-- 用户关注点闭环 --")
+        print("  ✅ 已声明关注点且映射校验通过")
+    if mode != "notes_only" and state_constraint_signal_scn_focus_errors:
+        print("")
+        print("-- 高风险 State/Constraint 信号 SCN → Focus（full 模式）--")
+        for msg in state_constraint_signal_scn_focus_errors:
+            print(f"  ❌ {msg}")
     print("")
     if mode == "notes_only":
         print("-- full 清单（notes_only 门禁不强制；仅供对照）--")
@@ -2638,18 +4508,92 @@ def _render_codemap_frontmatter(meta: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def cmd_memory_codemap_probe(args, _h: Path, project_root: Path) -> None:
-    """Compare CodeMap source_paths between verified_commit and HEAD; optional frontmatter update."""
-    raw = args.path
-    p = Path(raw)
-    if not p.is_absolute():
-        p = (project_root / p).resolve()
+def cmd_memory_codemap_init(args, h: Path, project_root: Path) -> None:
+    """Create a CodeMap file from the template with standard metadata."""
+    del h
+    repo_id = args.repo_id.strip()
+    module_slug = slugify(args.module_slug.strip())
+    if not repo_id:
+        err("repo_id cannot be empty")
+    if not module_slug:
+        err("module_slug cannot be empty")
+    source_paths = [p.strip() for p in (args.source_path or []) if p.strip()]
+    if not source_paths:
+        err("Provide at least one --source-path")
+
+    codemap_dir = project_root / HARNESS_DIR / "memory" / "codemaps" / repo_id
+    codemap_path = codemap_dir / f"{module_slug}.md"
+    if codemap_path.exists() and not args.force:
+        err(f"CodeMap already exists: {codemap_path} (use --force to overwrite)")
+
+    template_path = _codemap_template_path()
+    if template_path.exists():
+        template = template_path.read_text(encoding="utf-8")
+    else:
+        template = (
+            "---\n"
+            "source_paths: []\n"
+            "verified_commit: \"\"\n"
+            "generated_at: \"\"\n"
+            "confidence: medium\n"
+            "---\n\n"
+            "# CodeMap: <repo_id> / <module_slug>\n"
+        )
+
+    meta = {
+        "source_paths": source_paths,
+        "verified_commit": getattr(args, "verified_commit", "") or "",
+        "generated_at": now_iso(),
+        "confidence": getattr(args, "confidence", "medium") or "medium",
+        "stale_note": "Regenerate or downgrade confidence if listed paths changed on main.",
+    }
+    _old_meta, body = _split_codemap_frontmatter(template)
+    if not body:
+        body = template
+    body = body.replace("<repo_id>", repo_id).replace("<module_slug>", module_slug)
+    if getattr(args, "purpose", ""):
+        body = body.replace(
+            "One-paragraph: what this module does in the product.",
+            args.purpose.strip(),
+        )
+    atomic_write(codemap_path, _render_codemap_frontmatter(meta) + body)
+
+    payload = {
+        "status": "ok",
+        "codemap_path": str(codemap_path),
+        "repo_id": repo_id,
+        "module_slug": module_slug,
+        "source_paths": source_paths,
+    }
+    if args.json:
+        out_json(payload)
+    else:
+        print(f"Initialized CodeMap: {codemap_path}")
+
+
+def _probe_codemap_file(project_root: Path, codemap_path: Path, write: bool = False) -> dict:
+    """Probe one CodeMap file for staleness against verified_commit..HEAD."""
+    p = codemap_path.resolve()
+    result = {
+        "codemap_path": str(p),
+        "source_paths": [],
+        "verified_commit": None,
+        "stale": None,
+        "reason": None,
+        "changed_paths": [],
+        "missing_paths": [],
+        "git_error": None,
+        "suggested_confidence": None,
+        "wrote": False,
+    }
     if not p.is_file():
-        err(f"CodeMap file not found: {p}")
+        result["reason"] = "file_not_found"
+        return result
     text = p.read_text(encoding="utf-8")
     meta, body = _split_codemap_frontmatter(text)
     if not meta:
-        err(f"No YAML frontmatter in {p} (expected leading --- block)")
+        result["reason"] = "invalid_frontmatter"
+        return result
 
     sp = meta.get("source_paths", [])
     if isinstance(sp, str):
@@ -2657,50 +4601,41 @@ def cmd_memory_codemap_probe(args, _h: Path, project_root: Path) -> None:
     if not isinstance(sp, list):
         sp = []
     paths = [str(x).strip() for x in sp if str(x).strip()]
+    if not paths:
+        result["reason"] = "missing_source_paths"
+        result["suggested_confidence"] = "low"
+        result["verified_commit"] = str(meta.get("verified_commit") or "").strip() or None
+        return result
 
     vc = str(meta.get("verified_commit") or "").strip()
     root = project_root.resolve()
 
-    result = {
-        "codemap_path": str(p),
-        "source_paths": paths,
-        "verified_commit": vc or None,
-        "stale": None,
-        "reason": None,
-        "changed_paths": [],
-        "missing_paths": [],
-        "git_error": None,
-        "suggested_confidence": meta.get("confidence"),
-    }
+    result["source_paths"] = paths
+    result["verified_commit"] = vc or None
+    result["suggested_confidence"] = meta.get("confidence")
 
     rc_git, _, ge = _git(root, "rev-parse", "--git-dir")
     if rc_git != 0:
         result["reason"] = "not_a_git_repository"
         result["git_error"] = ge
-        if args.json:
-            out_json(result)
-        else:
-            print(f"not a git repository: {ge}")
-        sys.exit(1)
+        return result
 
     if not vc:
         result["reason"] = "no_verified_commit"
         result["suggested_confidence"] = "low"
-        if args.json:
-            out_json(result)
-        else:
-            print("No verified_commit in frontmatter; set it after a verified baseline.")
-        return
+        if write:
+            meta["codemap_probe_at"] = now_iso()
+            meta["codemap_stale"] = False
+            new_text = _render_codemap_frontmatter(meta) + body
+            atomic_write(p, new_text)
+            result["wrote"] = True
+        return result
 
     rc_v, _, ve = _git(root, "rev-parse", "-q", "--verify", vc + "^{commit}")
     if rc_v != 0:
         result["reason"] = "invalid_verified_commit"
         result["git_error"] = ve
-        if args.json:
-            out_json(result)
-        else:
-            print(f"Invalid verified_commit {vc!r}: {ve}")
-        sys.exit(1)
+        return result
 
     for rel in paths:
         full = (root / rel).resolve()
@@ -2721,7 +4656,7 @@ def cmd_memory_codemap_probe(args, _h: Path, project_root: Path) -> None:
     result["reason"] = "ok" if not stale else "sources_changed_or_missing"
     result["suggested_confidence"] = "medium" if not stale else "low"
 
-    if args.write:
+    if write:
         meta["codemap_probe_at"] = now_iso()
         meta["codemap_stale"] = bool(stale)
         if stale:
@@ -2729,21 +4664,110 @@ def cmd_memory_codemap_probe(args, _h: Path, project_root: Path) -> None:
         new_text = _render_codemap_frontmatter(meta) + body
         atomic_write(p, new_text)
         result["wrote"] = True
-    else:
-        result["wrote"] = False
+    return result
+
+
+def cmd_memory_codemap_probe(args, _h: Path, project_root: Path) -> None:
+    """Compare CodeMap source_paths between verified_commit and HEAD; optional frontmatter update."""
+    raw = args.path
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (project_root / p).resolve()
+    result = _probe_codemap_file(project_root, p, write=bool(args.write))
 
     if args.json:
         out_json(result)
     else:
-        print(f"stale={stale} reason={result['reason']}")
+        print(f"stale={result['stale']} reason={result['reason']}")
         if result["changed_paths"]:
             print(f"  changed: {result['changed_paths']}")
         if result["missing_paths"]:
             print(f"  missing: {result['missing_paths']}")
+        if result["git_error"]:
+            print(f"  git_error: {result['git_error']}")
         if args.write:
             print(f"  updated frontmatter in {p}")
 
-    if stale:
+    if result["reason"] in (
+        "file_not_found",
+        "invalid_frontmatter",
+        "missing_source_paths",
+        "not_a_git_repository",
+        "invalid_verified_commit",
+    ):
+        sys.exit(1)
+    if result["stale"]:
+        sys.exit(1)
+
+
+def cmd_memory_codemap_audit(args, h: Path, project_root: Path) -> None:
+    """Audit one directory tree of CodeMaps and summarize stale / invalid entries."""
+    raw = getattr(args, "path", "") or str(h / "memory" / "codemaps")
+    base = Path(raw)
+    if not base.is_absolute():
+        base = (project_root / base).resolve()
+    if not base.exists():
+        err(f"CodeMap path not found: {base}")
+
+    files = [base] if base.is_file() else sorted(base.rglob("*.md"))
+    results = []
+    summary = {
+        "total": 0,
+        "stale": 0,
+        "fresh": 0,
+        "missing_verified_commit": 0,
+        "invalid": 0,
+        "written": 0,
+    }
+    for file_path in files:
+        result = _probe_codemap_file(project_root, file_path, write=bool(args.write))
+        results.append(result)
+        summary["total"] += 1
+        if result.get("wrote"):
+            summary["written"] += 1
+        reason = result.get("reason")
+        if reason == "ok":
+            summary["fresh"] += 1
+        elif reason == "no_verified_commit":
+            summary["missing_verified_commit"] += 1
+        elif reason in (
+            "file_not_found",
+            "invalid_frontmatter",
+            "missing_source_paths",
+            "invalid_verified_commit",
+            "not_a_git_repository",
+        ):
+            summary["invalid"] += 1
+        if result.get("stale"):
+            summary["stale"] += 1
+
+    payload = {
+        "status": "ok",
+        "base_path": str(base),
+        "summary": summary,
+        "results": results,
+    }
+    epic_id = getattr(args, "epic_id", "") or ""
+    if epic_id:
+        load_epic(h, epic_id)  # validate
+        artifact_path = h / "features" / epic_id / "codemap-audit.json"
+        atomic_write_json(artifact_path, payload)
+        payload["artifact_path"] = str(artifact_path)
+    if args.json:
+        out_json(payload)
+    else:
+        print(f"Audited CodeMaps under {base}")
+        print(
+            "  total={total} fresh={fresh} stale={stale} missing_verified_commit={missing_verified_commit} invalid={invalid}".format(
+                **summary
+            )
+        )
+        if args.write:
+            print(f"  frontmatter updated: {summary['written']}")
+        if epic_id:
+            print(f"  artifact: {payload['artifact_path']}")
+
+    if summary["stale"] > 0 or summary["invalid"] > 0:
         sys.exit(1)
 
 
@@ -2874,7 +4898,7 @@ def cmd_guard_check(args, h: Path, project_root: Path) -> None:
         issues.append(f"consecutive_failures >= 3 (currently {rh['consecutive_failures']})")
 
     # Check pending CRITICAL decisions
-    pending = state.get("pending_decisions", [])
+    pending = _effective_pending_decisions(h, state)
     critical = [d for d in pending if d.get("severity") == "critical"]
     if critical:
         issues.append(f"{len(critical)} unhandled CRITICAL decision(s)")
@@ -2893,7 +4917,7 @@ def cmd_guard_check(args, h: Path, project_root: Path) -> None:
         }
         prev_stage = prev_stage_map.get(stage)
         if prev_stage:
-            artifacts_spec = STAGE_GATE_ARTIFACTS.get(prev_stage, [])
+            artifacts_spec = _stage_gate_artifacts_spec(prev_stage, h) or []
             features_dir = h / "features" / epic_id
             for tmpl in artifacts_spec:
                 path_str = tmpl.format(features_dir=str(features_dir), epic_id=epic_id)
@@ -3086,6 +5110,31 @@ def cmd_bundle_check_confirmed(args, h: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# audit commands
+# ---------------------------------------------------------------------------
+
+def cmd_audit_show(args, h: Path) -> None:
+    """Show derived execution audit summary for an epic."""
+    epic_id = args.epic_id
+    summary = _write_execution_summary(h, epic_id)
+    if args.json:
+        out_json(summary)
+    else:
+        print(f"Execution Audit: {epic_id}")
+        print(f"  stage:                    {summary.get('current_stage', '?')}")
+        print(f"  latest_run_id:            {summary.get('latest_run_id', '') or 'N/A'}")
+        print(f"  steps_completed:          {', '.join(summary.get('steps_completed', [])) or 'N/A'}")
+        print(f"  parallel_waves_completed: {summary.get('parallel_waves_completed', 0)}")
+        print(f"  fanout_used:              {'yes' if summary.get('fanout_used') else 'no'}")
+        print(f"  fanout_children_count:    {summary.get('fanout_children_count', 0)}")
+        state = "generated" if summary.get("decision_packet_generated") else "not_generated"
+        print(f"  decision_packet:          {state}")
+        print(f"  pending_synced:           {'yes' if summary.get('pending_decisions_synced') else 'no'}")
+        print(f"  pending_decisions_count:  {summary.get('pending_decisions_count', 0)}")
+        print(f"  latest_pause_reason:      {summary.get('latest_pause_reason', '') or 'N/A'}")
+
+
+# ---------------------------------------------------------------------------
 # coverage commands
 # ---------------------------------------------------------------------------
 
@@ -3178,13 +5227,54 @@ def cmd_epic_set_worktree(args, h: Path) -> None:
     worktree_path = args.worktree_path
     epic = load_epic(h, epic_id)
     updated = dict(epic)
-    updated["worktree_path"] = worktree_path
-    updated["worktree_branch"] = getattr(args, "branch", "") or f"harness/{epic_id}"
+    repo_id = getattr(args, "repo_id", "") or ""
+    branch = getattr(args, "branch", "") or (
+        f"harness/{epic_id}/{slugify(repo_id)}" if repo_id else f"harness/{epic_id}"
+    )
+    if repo_id:
+        repo_worktrees = dict(_repo_worktrees_from_epic(epic))
+        repo_worktrees[repo_id] = {
+            "path": worktree_path,
+            "branch": branch,
+            "updated_at": now_iso(),
+        }
+        updated["repo_worktrees"] = repo_worktrees
+    else:
+        updated["worktree_path"] = worktree_path
+        updated["worktree_branch"] = branch
     save_epic(h, updated)
     if args.json:
-        out_json({"epic_id": epic_id, "worktree_path": worktree_path})
+        payload = {
+            "epic_id": epic_id,
+            "worktree_path": worktree_path,
+            "branch": branch,
+        }
+        if repo_id:
+            payload["repo_id"] = repo_id
+            payload["repo_worktrees"] = updated.get("repo_worktrees", {})
+        out_json(payload)
     else:
-        print(f"Set worktree for {epic_id}: {worktree_path}")
+        if repo_id:
+            print(f"Set repo worktree for {epic_id}/{repo_id}: {worktree_path}")
+        else:
+            print(f"Set worktree for {epic_id}: {worktree_path}")
+
+
+def cmd_epic_show_worktrees(args, h: Path) -> None:
+    """Show epic-level and repo-level worktree coordination metadata."""
+    epic = load_epic(h, args.epic_id)
+    payload = {
+        "epic_id": args.epic_id,
+        "default_worktree": {
+            "path": epic.get("worktree_path", ""),
+            "branch": epic.get("worktree_branch", ""),
+        },
+        "repo_worktrees": _repo_worktrees_from_epic(epic),
+    }
+    if args.json:
+        out_json(payload)
+    else:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
@@ -3746,6 +5836,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--force", action="store_true", help="Reinitialize even if .harness/ exists")
     p_init.add_argument("--json", action="store_true")
 
+    # ---- start ----
+    p_start = sub.add_parser("start", help="Bootstrap harness and create an epic from a fuzzy requirement")
+    p_start.add_argument("requirements", help="Fuzzy requirement or problem statement")
+    p_start.add_argument("--title", default="", help="Optional explicit epic title")
+    p_start.add_argument("--risk-level", dest="risk_level", choices=RISK_LEVELS)
+    p_start.add_argument("--json", action="store_true")
+
     # ---- config ----
     p_config = sub.add_parser("config", help="Read/write .harness/config.json")
     config_sub = p_config.add_subparsers(dest="config_action", metavar="ACTION")
@@ -3791,7 +5888,9 @@ def build_parser() -> argparse.ArgumentParser:
     epic_sub.required = True
 
     p_ecreate = epic_sub.add_parser("create", help="Create a new epic")
-    p_ecreate.add_argument("title", help="Epic title")
+    p_ecreate.add_argument("title", nargs="?", default="", help="Epic title")
+    p_ecreate.add_argument("--title", dest="title_flag", default="", help="Epic title")
+    p_ecreate.add_argument("--description", default="", help="Optional epic description")
     p_ecreate.add_argument("--risk-level", dest="risk_level", choices=RISK_LEVELS)
     p_ecreate.add_argument("--json", action="store_true")
 
@@ -3805,8 +5904,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_esetwt = epic_sub.add_parser("set-worktree", help="Record worktree path for an epic")
     p_esetwt.add_argument("epic_id")
     p_esetwt.add_argument("worktree_path")
+    p_esetwt.add_argument("--repo-id", default="", help="Optional repo_id for cross-repo epic coordination")
     p_esetwt.add_argument("--branch", default="")
     p_esetwt.add_argument("--json", action="store_true")
+
+    p_eshowwt = epic_sub.add_parser("show-worktrees", help="Show epic and repo-level worktree mappings")
+    p_eshowwt.add_argument("epic_id")
+    p_eshowwt.add_argument("--json", action="store_true")
 
     # ---- task ----
     p_task = sub.add_parser("task", help="Manage tasks")
@@ -3901,6 +6005,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_cagg.add_argument("--epic-id", dest="epic_id", required=True)
     p_cagg.add_argument("--json", action="store_true")
 
+    # ---- metrics ----
+    p_metrics = sub.add_parser("metrics", help="Record scan ROI metrics and acceptance checks")
+    metrics_sub = p_metrics.add_subparsers(dest="metrics_action", metavar="ACTION")
+    metrics_sub.required = True
+
+    p_mrecord = metrics_sub.add_parser("record", help="Record one ROI metric value for an epic")
+    p_mrecord.add_argument("--epic-id", dest="epic_id", required=True)
+    p_mrecord.add_argument("metric", help="Metric name (e.g. cache_hit_rate)")
+    p_mrecord.add_argument("value", help="Metric value; JSON/number/bool/string accepted")
+    p_mrecord.add_argument("--stage", default="", help="Optional stage label (CLARIFY/PLAN/etc.)")
+    p_mrecord.add_argument("--notes", default="", help="Optional context / evidence note")
+    p_mrecord.add_argument("--json", action="store_true")
+
+    p_mcheck = metrics_sub.add_parser("check", help="Record an acceptance check status for an epic")
+    p_mcheck.add_argument("--epic-id", dest="epic_id", required=True)
+    p_mcheck.add_argument("criterion", help="Criterion key (e.g. mvp_no_blind_scan)")
+    p_mcheck.add_argument("status", choices=ACCEPTANCE_STATUSES)
+    p_mcheck.add_argument("--notes", default="", help="Optional context / evidence note")
+    p_mcheck.add_argument("--json", action="store_true")
+
+    p_mderive = metrics_sub.add_parser("derive", help="Derive acceptance checks from stage artifacts")
+    p_mderive.add_argument("--epic-id", dest="epic_id", required=True)
+    p_mderive.add_argument("--json", action="store_true")
+
+    p_mshow = metrics_sub.add_parser("show", help="Show metrics for one epic or all epics")
+    p_mshow.add_argument("--epic-id", dest="epic_id", default="")
+    p_mshow.add_argument("--json", action="store_true")
+
     # ---- memory ----
     p_memory = sub.add_parser("memory", help="Memory management")
     memory_sub = p_memory.add_subparsers(dest="memory_action", metavar="ACTION")
@@ -3909,6 +6041,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_map = memory_sub.add_parser("append-pitfalls", help="Append pitfalls from unknowns-ledger to memory")
     p_map.add_argument("--epic-id", dest="epic_id", required=True)
     p_map.add_argument("--json", action="store_true")
+
+    p_minit = memory_sub.add_parser("codemap-init", help="Create a CodeMap file from the standard template")
+    p_minit.add_argument("repo_id")
+    p_minit.add_argument("module_slug")
+    p_minit.add_argument("--source-path", action="append", required=True, help="Source path covered by the CodeMap; may repeat")
+    p_minit.add_argument("--verified-commit", default="", help="Optional verified commit SHA")
+    p_minit.add_argument("--confidence", default="medium", choices=["high", "medium", "low"])
+    p_minit.add_argument("--purpose", default="", help="Optional one-paragraph purpose to replace template placeholder")
+    p_minit.add_argument("--force", action="store_true", help="Overwrite existing CodeMap file")
+    p_minit.add_argument("--json", action="store_true")
 
     p_mprobe = memory_sub.add_parser(
         "codemap-probe",
@@ -3924,6 +6066,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set codemap_probe_at / codemap_stale and downgrade confidence when stale",
     )
     p_mprobe.add_argument("--json", action="store_true")
+
+    p_maudit = memory_sub.add_parser(
+        "codemap-audit",
+        help="Batch-audit CodeMaps under a directory (defaults to .harness/memory/codemaps)",
+    )
+    p_maudit.add_argument(
+        "path",
+        nargs="?",
+        default="",
+        help="Optional CodeMap file or directory to audit",
+    )
+    p_maudit.add_argument(
+        "--write",
+        action="store_true",
+        help="Write codemap_probe_at / codemap_stale updates back into probed CodeMaps",
+    )
+    p_maudit.add_argument(
+        "--epic-id",
+        dest="epic_id",
+        default="",
+        help="Optional epic_id; when set, also write .harness/features/<epic-id>/codemap-audit.json",
+    )
+    p_maudit.add_argument("--json", action="store_true")
 
     # ---- triage ----
     p_triage = sub.add_parser("triage", help="Create triage report for a failed task")
@@ -3996,6 +6161,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_bcc = bundle_sub.add_parser("check-confirmed", help="Check all must_confirm decisions are resolved")
     p_bcc.add_argument("--epic-id", dest="epic_id", required=True)
     p_bcc.add_argument("--json", action="store_true")
+
+    # ---- audit ----
+    p_audit = sub.add_parser("audit", help="Execution audit views")
+    audit_sub = p_audit.add_subparsers(dest="audit_action", metavar="ACTION")
+    audit_sub.required = True
+
+    p_ashow = audit_sub.add_parser("show", help="Show CLARIFY execution summary for an epic")
+    p_ashow.add_argument("--epic-id", dest="epic_id", required=True)
+    p_ashow.add_argument("--json", action="store_true")
 
     # ---- coverage ----
     p_cov = sub.add_parser("coverage", help="Coverage matrix management")
@@ -4116,6 +6290,8 @@ def main() -> None:
     else:
         if args.command == "init":
             project_root = Path.cwd().resolve()
+        elif args.command == "start":
+            project_root = find_bootstrap_root()
         else:
             project_root = find_harness_root()
 
@@ -4124,6 +6300,9 @@ def main() -> None:
     # For init we don't require .harness/ to exist yet
     if args.command == "init":
         cmd_init(args, project_root)
+        return
+    if args.command == "start":
+        cmd_start(args, project_root)
         return
 
     # All other commands require .harness/ to exist
@@ -4156,6 +6335,8 @@ def main() -> None:
             cmd_epic_list(args, h)
         elif args.epic_action == "set-worktree":
             cmd_epic_set_worktree(args, h)
+        elif args.epic_action == "show-worktrees":
+            cmd_epic_show_worktrees(args, h)
 
     elif args.command == "task":
         if args.task_action == "create":
@@ -4196,11 +6377,25 @@ def main() -> None:
         elif args.council_action == "aggregate":
             cmd_council_aggregate(args, h)
 
+    elif args.command == "metrics":
+        if args.metrics_action == "record":
+            cmd_metrics_record(args, h)
+        elif args.metrics_action == "check":
+            cmd_metrics_check(args, h)
+        elif args.metrics_action == "derive":
+            cmd_metrics_derive(args, h)
+        elif args.metrics_action == "show":
+            cmd_metrics_show(args, h)
+
     elif args.command == "memory":
         if args.memory_action == "append-pitfalls":
             cmd_memory_append_pitfalls(args, h)
+        elif args.memory_action == "codemap-init":
+            cmd_memory_codemap_init(args, h, project_root)
         elif args.memory_action == "codemap-probe":
             cmd_memory_codemap_probe(args, h, project_root)
+        elif args.memory_action == "codemap-audit":
+            cmd_memory_codemap_audit(args, h, project_root)
 
     elif args.command == "triage":
         cmd_triage(args, h)
@@ -4232,6 +6427,10 @@ def main() -> None:
             cmd_bundle_pending_confirms(args, h)
         elif args.bundle_action == "check-confirmed":
             cmd_bundle_check_confirmed(args, h)
+
+    elif args.command == "audit":
+        if args.audit_action == "show":
+            cmd_audit_show(args, h)
 
     elif args.command == "coverage":
         if args.cov_action == "map":

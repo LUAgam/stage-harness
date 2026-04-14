@@ -148,7 +148,29 @@ $HARNESSCTL patch list --json
 
 ### Step 4c（可选）：CodeMap 异步补全
 
-若本轮 CLARIFY/PLAN 曾对热点模块做深读且尚未写入长文摘要，可在交付后（不阻塞 DONE）由 Lead 或 `skill-miner` 协同将 **短摘要** 合并为 `.harness/memory/codemaps/<repo_id>/<module_slug>.md`（模板见 `stage-harness/templates/codemap-module.md`）。主链路以同步短记为主；本步为 **可选补全**，用于后续 Epic 复用。若元数据显示与当前分支不一致，应降低 `confidence` 或触发回源核对后再写。
+若本轮 CLARIFY/PLAN 曾对热点模块做深读且尚未写入长文摘要，可在交付后（不阻塞 DONE）由 Lead 或 `skill-miner` 协同将 **短摘要** 合并为 `.harness/memory/codemaps/<repo_id>/<module_slug>.md`（模板见 `stage-harness/templates/codemap-module.md`）。主链路以同步短记为主；本步为 **可选补全**，用于后续 Epic 复用。若元数据显示与当前分支不一致，应降低 `confidence` 或触发回源核对后再写。也可先执行 `$HARNESSCTL memory codemap-init <repo_id> <module_slug> --source-path <path>` 初始化标准模板，再补正文内容。
+
+补全后可选执行：
+
+```bash
+$HARNESSCTL memory codemap-audit .harness/memory/codemaps [--write] [--json]
+```
+
+用于批量检查 stale / invalid CodeMap，避免把过期摘要当作后续 Epic 的高置信事实源。
+
+### Step 4d（可选）：回填 ROI 指标与阶段验收
+
+若本轮用于验证多仓缩圈 / CodeMap 复用 / 路由收敛效果，可在交付后补记：
+
+```bash
+$HARNESSCTL metrics record --epic-id <epic-id> cache_hit_rate 0.67 --stage PLAN
+$HARNESSCTL metrics record --epic-id <epic-id> avg_latency_clarify_plan 18.2 --notes "minutes"
+$HARNESSCTL metrics check --epic-id <epic-id> mvp_no_blind_scan met
+$HARNESSCTL metrics check --epic-id <epic-id> routing_auditable met
+$HARNESSCTL metrics derive --epic-id <epic-id> [--json]
+```
+
+这些记录不会阻塞 DONE，但建议在试点 Epic 中持续回填，便于后续复盘多仓扫描优化是否真的生效。`metrics derive` 可根据路由、跨仓索引和 CodeMap 审计结果自动回填一组基础验收项；字段示例见 `stage-harness/templates/scan-metrics.json`。
 
 ### Step 5：标记 Epic 为 DONE
 
@@ -165,6 +187,7 @@ $HARNESSCTL state transition <epic-id> DONE
 | 问题模式 | `.harness/memory/pitfalls.md`（追加） |
 | 候选 Skill | `.harness/memory/candidate-skills/<epic-id>-candidates.json` |
 | 发布议会裁决 | `.harness/features/<epic-id>/councils/verdict-release_council.json` |
+| ROI / 验收记录（可选） | `.harness/features/<epic-id>/scan-metrics.json`、`.harness/metrics/scan-roi.jsonl` |
 
 ## 出口条件（门禁规则）
 

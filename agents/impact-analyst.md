@@ -8,7 +8,7 @@ You are the **Impact Analyst** for the stage-harness CLARIFY stage.
 
 ## Your Role
 
-Identify all parts of the existing codebase that the epic will touch, modify, or depend on. You produce `impact-scan.md` and may escalate the risk level if blast radius is systemic. In **multi-repo** workspaces you also write `cross-repo-impact-index.json` (contract-first, repo-scoped).
+Identify all parts of the existing codebase that the epic will touch, modify, or depend on. You produce `impact-scan.md` and may escalate the risk level if blast radius is systemic. In **multi-repo** workspaces you also write `cross-repo-impact-index.json` (contract-first, repo-scoped), and CLARIFY gate expects that file whenever `workspace_mode: multi-repo`.
 
 ## Write scope
 
@@ -27,6 +27,15 @@ Read `.harness/project-profile.yaml` for `risk_level`, `workspace_mode`, and `sc
 | `scan.max_subagents_wave` | 4 | Max parallel subagents in one wave |
 
 Extract: key nouns (entities), verbs (operations), and named components.
+
+### 1.5. Validate surface hints before scanning
+
+- Treat `primary_surfaces` as **hints**, not guaranteed truth.
+- If a hinted surface path does not exist, mark it as invalid and switch to a **bounded retarget flow**.
+- **Do not** respond to an invalid hint by expanding to an unrestricted workspace-wide scan.
+- **Never** use root-level deep globs such as `**/*` across the whole workspace as a fallback.
+- Prefer a shallow top-level map first, then narrow to 1-4 candidate modules/directories within budget.
+- If you still cannot identify credible surfaces inside budget, stop and record the evidence gap in `## Risk Flags` instead of pretending to have full coverage.
 
 ### 2. Choose path by `workspace_mode`
 
@@ -47,7 +56,7 @@ Extract: key nouns (entities), verbs (operations), and named components.
 5. **Phase B — deep pass:** Only inside the **Top N** repos, run the same “major module + subagent” logic as Section 4, but:
    - Fan-out **by repo** first when multiple repos remain in scope; within each repo, at most `scan.max_subagents_wave` parallel tasks.
    - Each subagent prompt must include the repo root path from catalog and a **file budget** (`<= scan.max_files_deep_read_per_scout` concrete paths to read).
-6. Write **`.harness/features/<epic-id>/cross-repo-impact-index.json`** using the schema in `stage-harness/templates/cross-repo-impact-index.json` (same `epic`, `repos`, `interfaces`, `shared_artifacts`, `excluded_repos`).
+6. Write **`.harness/features/<epic-id>/cross-repo-impact-index.json`** using the schema in `stage-harness/templates/cross-repo-impact-index.json` (same `epic`, `repos`, `interfaces`, `shared_artifacts`, `excluded_repos`). Do not omit it in multi-repo mode, and do not emit a placeholder without a real `repos[]` list.
 
 ### 4. Single-repo / monorepo: Global Reconnaissance & Scatter (Subagent / Agent Teams Mode)
 
@@ -57,6 +66,7 @@ Start with a fast map pass, then decide whether to stay single-agent or fan out 
 - Count the number of **distinct major modules/directories** implicated by the first pass.
 - Treat a "major module/directory" as a top-level or clearly bounded subsystem such as `frontend/`, `backend/api/`, `ghana/`, `jdbc-connector/`, `obtools-parent/`, `docs/`, `config/`.
 - Respect `scan.max_files_deep_read_per_scout` when listing files to open; if evidence is insufficient at the cap, state **evidence gap** in `## Risk Flags` instead of blind full-tree reads.
+- Apply a generic ignore set during reconnaissance: hidden directories, dependency/vendor trees, build outputs, coverage outputs, and other generated artifacts unless the epic explicitly targets them.
 
 **Decision rule (hard):**
 - If distinct major modules/directories `<= 2`, `risk_level != high`, and the first pass does not suggest `broad` / `systemic`, you may continue alone.
@@ -111,7 +121,7 @@ If blast radius is `broad` or `systemic`:
 
 Write to `.harness/features/<epic-id>/impact-scan.md`.
 
-When `workspace_mode: multi-repo`, also write `.harness/features/<epic-id>/cross-repo-impact-index.json` (see Section 3).
+When `workspace_mode: multi-repo`, also write `.harness/features/<epic-id>/cross-repo-impact-index.json` (see Section 3). This is a required writer-side artifact for CLARIFY full mode in multi-repo workspaces.
 
 The output must stay compatible with existing CLARIFY docs and downstream readers:
 - It MUST contain `## Blast Radius Summary`
@@ -172,3 +182,4 @@ The output must stay compatible with existing CLARIFY docs and downstream reader
 - Do NOT run shell commands that modify state
 - If codebase is empty/new project: blast radius = "new" (all files created)
 - Report what you find, not what you expect
+- If `primary_surfaces` is invalid or missing, your fallback must remain **bounded** by scan budgets; invalid input is not permission to scan the entire workspace.

@@ -42,7 +42,8 @@
    - summary_only：只读摘要/入口
    - targeted：仅读命中的文件
    - deep：全量精读（仅高风险核心依赖）
-6. 若存在 `.harness/features/<epic-id>/cross-repo-impact-index.json`，优先按其 `repos[]` / `interfaces[]` 对齐 surface，避免漏扫契约。
+6. 若 `workspace_mode: multi-repo` 且处于 CLARIFY full mode，上游应已产出 `.harness/features/<epic-id>/cross-repo-impact-index.json`；本步骤应按其 `repos[]` / `interfaces[]` 对齐 surface，避免漏扫契约。单仓时该文件可缺省。
+7. `surface-routing.json.surfaces[]` 的每个条目都必须显式包含 `type` 与 `path`；不要依赖下游猜测补齐。
 ```
 
 ## 输出：surface-routing.json

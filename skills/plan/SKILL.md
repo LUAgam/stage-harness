@@ -63,11 +63,17 @@ cat .harness/features/<epic-id>/surface-routing.json
 - 跨承载面边界是否已在 spec 中明确
 - `repo_id` / `scan_budget` / `evidence_level` 是否与 `cross-repo-impact-index.json`（如有）一致
 
-可选：列出 `.harness/memory/codemaps/<repo_id>/`，便于 Step 2 提示各 scout 先读缓存再回源。
+建议先对相关缓存运行，并将结果落盘为本轮 PLAN 产物：
+
+```bash
+harnessctl memory codemap-audit .harness/memory/codemaps/<repo_id> --epic-id <epic-id> --json
+```
+
+若结果显示 `stale > 0`、`invalid > 0` 或目标条目 `reason != ok`，在调度 scout 时明确要求**以源码/契约为准，仅将 codemap 作为低置信背景**。若提供了 `--epic-id`，CLI 会额外写出 `.harness/features/<epic-id>/codemap-audit.json`，应将该文件作为 scouts 的辅助输入。
 
 ### Step 2 — 并行 scouts 调研
 
-通过 Task 工具**并行**调度 scout agents（**仅**以 `surface-routing.json` 的 `scout_assignments` / `assigned_to` 与 `surfaces[]` 为准；禁止因“路由不全”自行扩大到未登记路径）。**每个 scout 须先**查看 `.harness/memory/codemaps/` 下与本次路径相关的模块笔记，再对源码做定点阅读。
+通过 Task 工具**并行**调度 scout agents（**仅**以 `surface-routing.json` 的 `scout_assignments` / `assigned_to` 与 `surfaces[]` 为准；禁止因“路由不全”自行扩大到未登记路径）。**每个 scout 须先**查看 `.harness/features/<epic-id>/codemap-audit.json`（如有）与 `.harness/memory/codemaps/` 下相关模块笔记，再对源码做定点阅读。
 
 | Scout | 职责 |
 |-------|------|

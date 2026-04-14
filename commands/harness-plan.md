@@ -75,7 +75,7 @@ bridge 脚本负责：
 skill 内部并行执行：
 
 **承载面调研（并行 scouts）：**
-- 先读 `.harness/features/<epic-id>/surface-routing.json`（及 `cross-repo-impact-index.json` 如有），再读 `.harness/memory/codemaps/` 下相关笔记，**后**定点读源码；不得在未登记路径上盲扫全仓。
+- 先读 `.harness/features/<epic-id>/surface-routing.json`（及 `cross-repo-impact-index.json` 如有）；建议先执行 `harnessctl memory codemap-audit .harness/memory/codemaps/<repo_id> --epic-id <epic-id>` 产出 `codemap-audit.json`，再读 `.harness/memory/codemaps/` 下相关笔记，**后**定点读源码；不得在未登记路径上盲扫全仓。
 - repo-router / symbol-navigator：在路由范围内扫描代码结构、符号与可复用模块
 - dependency-mapper / config-scout：依赖、配置与集成点（受 `scout_assignments` 约束）
 - docs-scout / design-scout：文档与设计约束，与路由及契约 `interfaces[]` 对齐
@@ -110,6 +110,7 @@ skill 内部并行执行：
 |------|------|
 | 任务 JSON 文件 | `.harness/tasks/<epic-id>.*.json` |
 | 覆盖矩阵 | `.harness/features/<epic-id>/coverage-matrix.json` |
+| CodeMap 审计（可选） | `.harness/features/<epic-id>/codemap-audit.json` |
 | 计划议会结论 | `.harness/features/<epic-id>/councils/verdict-plan_council.json` |
 
 `verdict-plan_council.json` 必须包含字段：

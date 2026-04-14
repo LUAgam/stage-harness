@@ -135,22 +135,29 @@ IDEA → CLARIFY → SPEC → PLAN → EXECUTE → VERIFY → DONE
 
 ## 快速上手
 
+仓库根目录 [README.md](../README.md) 汇总了**安装、命令表、手动/自治/JIT 流程与 CLI 速查**。下面是最小闭环示例。
+
 ```bash
-# 1. 安装插件（将 stage-harness 目录放入 Claude Code 插件路径）
+# 1. 安装插件（将整个仓库放入 Claude Code 可识别的插件路径；需 chmod +x scripts/harnessctl.py scripts/*.sh）
 
-# 2. 若未安装到 PATH，先指定本地 CLI
-export HARNESSCTL="${HARNESSCTL:-./stage-harness/scripts/harnessctl}"
+# 2. 若未安装到 PATH，在被开发项目根目录指定 CLI（二选一）
+#    插件根就是本仓库时：
+export HARNESSCTL="${HARNESSCTL:-./scripts/harnessctl}"
+#    插件在子目录 stage-harness/ 时：
+# export HARNESSCTL="${HARNESSCTL:-./stage-harness/scripts/harnessctl}"
 
-# 3. 启动新 Epic
+# 3. 启动新 Epic（会初始化 .harness/ 并进入 CLARIFY）
 /harness:start 我想给系统加一个 RBAC 权限管理模块
 
 # 4. 查看状态
 /harness:status
 
-# 5. 自治模式（自动推进所有阶段）
+# 5a. 手动推进：按阶段依次执行 /harness:clarify → spec → plan → work → review →（fix）→ done
+
+# 5b. 自治模式（自动推进所有阶段直到 DONE）
 /harness:auto
 ```
 
-详细使用说明参见 [usage.md](./usage.md)。
+详细使用说明（各命令产物、CLARIFY 六轴、多仓、CodeMap、metrics、FAQ）参见 [usage.md](./usage.md)。
 架构与实现细节参见 [architecture.md](./architecture.md)。
 人类开发流程、阶段并串行与「通用性优先」关注点参见 [human-workflow-and-orchestration.md](./human-workflow-and-orchestration.md)。

@@ -95,13 +95,14 @@ harnessctl [--project-root PATH] <command> [options]
 | `init` | — | 初始化 `.harness/` 目录 |
 | `config` | `get`, `set`, `list` | 管理 config.json |
 | `profile` | `detect`, `show`, `discover-repo-aliases` | 项目画像检测、查看与多仓别名启发式补全 |
-| `epic` | `create`, `show`, `list`, `set-worktree` | Epic 管理 |
+| `epic` | `create`, `show`, `list`, `set-worktree`, `show-worktrees` | Epic 管理与 worktree 协同 |
 | `task` | `create`, `start`, `done`, `fail`, `block`, `show`, `list`, `next` | 任务管理 |
 | `state` | `get`, `transition`, `patch`, `next` | 状态机操作 |
 | `stage-gate` | `check` | 阶段门禁检查 |
 | `receipt` | `write`, `show`, `list` | 执行回执管理 |
 | `council` | `run`, `aggregate` | 议会运行与投票聚合 |
-| `memory` | `append-pitfalls`, `codemap-probe` | 经验沉淀与 CodeMap 陈旧度探针 |
+| `metrics` | `record`, `check`, `derive`, `show` | ROI 指标与阶段验收记录 |
+| `memory` | `append-pitfalls`, `codemap-init`, `codemap-probe`, `codemap-audit` | 经验沉淀与 CodeMap 陈旧度探针 |
 | `triage` | — | 问题分诊 |
 | `budget` | `check`, `consume` | 中断预算管理 |
 | `guard` | `check` | 守卫检查（门禁+预算+确认） |
@@ -152,7 +153,7 @@ harnessctl profile show [--json]
 harnessctl profile discover-repo-aliases [--write] [--json]
 ```
 
-`detect` 根据标志文件自动检测项目类型：
+`detect` 根据标志文件自动检测项目类型，并推断 `workspace_mode` 与基础 `scan` 预算：
 
 | 标志文件 | 类型 |
 |---------|------|
@@ -162,17 +163,26 @@ harnessctl profile discover-repo-aliases [--write] [--json]
 | `Dockerfile` | backend |
 | `*.tf` | infra |
 
+额外推断：
+
+- `workspace_mode`：`single-repo` / `monorepo` / `multi-repo` / `docs-heavy` / `infra-heavy`
+- `scan`：按工作区形态给出默认的 `max_repos_deep_scan`、`max_files_deep_read_per_scout`、`max_subagents_wave`
+
 `discover-repo-aliases`：读取 `.harness/repo-catalog.yaml`，按各 `repos[].path` 扫描根目录下的 `package.json` / `go.mod` / `Cargo.toml` / `pyproject.toml` / `pom.xml`，将发现的包名与模块前缀**合并**进 `package_aliases`、`import_prefixes`；默认仅打印/输出 JSON，加 `--write` 写回目录。
 
 #### memory
 
 ```bash
 harnessctl memory append-pitfalls --epic-id <id> [--json]
+harnessctl memory codemap-init <repo_id> <module_slug> --source-path <path> [--source-path <path> ...] [--verified-commit <sha>] [--confidence <high|medium|low>] [--purpose <text>] [--force] [--json]
 harnessctl memory codemap-probe <path-to-codemap.md> [--write] [--json]
+harnessctl memory codemap-audit [path] [--write] [--epic-id <id>] [--json]
 ```
 
 - `append-pitfalls`：把 `unknowns-ledger.json` 中高影响 CLARIFY 条目追加到 `memory/pitfalls.md`。
+- `codemap-init`：按标准模板初始化一个 CodeMap 文件，统一 frontmatter 与目录结构，适合 CLARIFY/DONE 后补热点摘要。
 - `codemap-probe`：解析 CodeMap 前置 YAML（须含 `source_paths`），在**项目根**的 Git 仓库内比较 `verified_commit` 与 `HEAD` 之间列出的路径是否变化；`stale` 时进程退出码为 1。`--write` 会写入 `codemap_probe_at`、`codemap_stale`，并在陈旧时将 `confidence` 降为 `low`。未设置 `verified_commit` 时不判陈旧（退出码 0），仅提示需设定基线。
+- `codemap-audit`：对单个 CodeMap 或整个 `codemaps/` 目录批量执行 stale 探针，汇总 `fresh` / `stale` / `missing_verified_commit` / `invalid`；若存在 stale/invalid，则退出码为 1。适合 PLAN 前批量检查缓存可信度。提供 `--epic-id` 时，会额外落盘 `.harness/features/<epic-id>/codemap-audit.json` 供 scouts/编排消费。
 
 #### epic
 
@@ -180,11 +190,30 @@ harnessctl memory codemap-probe <path-to-codemap.md> [--write] [--json]
 harnessctl epic create <title> [--json]
 harnessctl epic show <id> [--json]
 harnessctl epic list [--json]
-harnessctl epic set-worktree <id> <path> [--branch <branch>] [--json]
+harnessctl epic set-worktree <id> <path> [--repo-id <repo_id>] [--branch <branch>] [--json]
+harnessctl epic show-worktrees <id> [--json]
 ```
 
 Epic ID 格式：`sh-<N>-<slug>`（如 `sh-1-rbac-permission`）。
 创建时自动在 `features/<epic-id>/` 下初始化 `state.json`。
+
+`set-worktree` 默认记录 epic 级 worktree；若加 `--repo-id`，则写入 `repo_worktrees.<repo_id>`，用于跨仓 epic 的 `repo_id -> branch/path` 协同。`show-worktrees` 同时展示默认 worktree 与 repo 级映射。
+
+#### metrics
+
+```bash
+harnessctl metrics record --epic-id <id> <metric> <value> [--stage <stage>] [--notes <text>] [--json]
+harnessctl metrics check --epic-id <id> <criterion> <met|partial|not_met> [--notes <text>] [--json]
+harnessctl metrics derive --epic-id <id> [--json]
+harnessctl metrics show [--epic-id <id>] [--json]
+```
+
+- `record`：记录一条 ROI 指标（如 `cache_hit_rate`、`source_reread_rate`、`avg_latency_clarify_plan`）。
+- `check`：记录阶段验收项状态（如 `mvp_no_blind_scan`、`routing_auditable`、`codemap_reuse_visible`）。
+- `derive`：根据 `surface-routing.json`、`cross-repo-impact-index.json`、`codemap-audit.json` 等产物自动回填一组基础验收项。
+- `show`：读取单个 epic 或全部 epic 的 `scan-metrics.json` 汇总；未指定 `--epic-id` 时额外输出跨 epic 的指标均值/计数与验收项状态分布。
+
+指标落盘到 `.harness/features/<epic-id>/scan-metrics.json`，并追加事件到 `.harness/metrics/scan-roi.jsonl`，便于后续人工复盘或脚本聚合。示例结构见 `templates/scan-metrics.json`。
 
 #### task
 
@@ -267,6 +296,19 @@ STAGE_GATE_ARTIFACTS = {
 其中 `{features_dir}` = `.harness/features/<epic-id>`。
 
 **CLARIFY** 另校验：`clarification-notes.md` 须含 `Domain Frame` / `领域框架` 标题；`challenge-report.md` 须含 `## Summary`；`domain-frame.json` 须含约定键名；`generated-scenarios.json` 与 `scenario-coverage.json` 须为有效 JSON 且包含 `scenarios` 数组；`impact-scan.md` 须含 `## Blast Radius Summary` / `## High Impact Surfaces` / `## Medium Impact Surfaces`；`surface-routing.json` 须为有效 JSON 且 `surfaces` 为非空数组、每项含 `type` 与 `path`。若 `.harness/project-profile.yaml` 中 `workspace_mode: multi-repo`，还须存在有效的 `cross-repo-impact-index.json`（含 `repos` 数组）。
+
+当 `.harness/config.json` 中 `clarify_signal_gate_enabled=true`（默认）时，`stage-gate check CLARIFY` 还会基于 `domain-frame.json` 与 `generated-scenarios.json` 的高/中置信度信号做**定向加严**：
+
+- 命中状态/重放/顺序类信号：强化 `StateAndTime`
+- 命中主键/唯一性/定位冲突类信号：强化 `ConstraintsAndConflict`
+- 命中放大/性能/容量类信号：强化 `CostAndCapacity`
+- 命中跨阶段/契约一致性类信号：强化 `CrossSurfaceConsistency`
+- 命中恢复/部分失败/运维类信号：强化 `OperationsAndRecovery`
+- 命中权限/隔离/敏感边界类信号：强化 `SecurityAndIsolation`
+
+被命中的轴**不得**在 `clarification-notes.md` 中写为 `not_applicable`；若使用全局极简绕行，也会被 gate 阻断。这样简单需求不被默认加重，复杂需求则被按信号定向约束。
+
+当 `.harness/config.json` 中 `clarify_deep_dive_enabled=true` 时，`clarify-selfcheck` 会在“高风险信号 + `requirements-draft.md` 中存在 `UNCLEAR` / `AMBIGUOUS` + 尚无 `deep-dive-*.md`”时给出 deep-dive 提示；若进一步设置 `clarify_deep_dive_gate_strict=true`，则 `stage-gate check CLARIFY` 与 `verify-artifacts.sh` 会把缺少 `deep-dive-*.md` 视为阻断项。该升级链依赖 `requirements-draft.md`，因此在默认 `full` 模式下它也属于 CLARIFY 必需产物。
 
 **PLAN**：除表内文件外，`surface-routing.json` 须仍存在（与 CLARIFY 一致），供 scouts 强约束。
 
@@ -562,6 +604,7 @@ verify-artifacts.sh <epic-id> [STAGE]
 | | `features/<epic>/clarification-notes.md` | 需求澄清备忘录 |
 | | `features/<epic>/impact-scan.md` | 影响扫描报告 |
 | | `features/<epic>/surface-routing.json` | 承载面路由与扫描预算（project-surface / Lead；**门禁必备**） |
+| | `features/<epic>/codemap-audit.json` | 可选：PLAN 前对 CodeMap 批量 stale 审计，供 scouts 降级缓存可信度 |
 | | `features/<epic>/unknowns-ledger.json` | 未知问题台账 |
 | | `features/<epic>/decision-bundle.json` | 决策包 |
 | | `features/<epic>/decision-packet.json` | 待确认决策包 |
@@ -571,6 +614,7 @@ verify-artifacts.sh <epic-id> [STAGE]
 | **PLAN** | `features/<epic>/bridge-spec.md` | Bridge 规格→计划 |
 | | `features/<epic>/coverage-matrix.json` | 需求覆盖矩阵 |
 | | `features/<epic>/surface-routing.json` | 与 CLARIFY 一致，PLAN 门禁复验 |
+| | `features/<epic>/codemap-audit.json` | 可选：若执行 `memory codemap-audit --epic-id`，则作为 PLAN 辅助输入保留 |
 | **EXECUTE** | `features/<epic>/receipts/` | 任务执行回执目录 |
 | **VERIFY** | `features/<epic>/verification.json` | 审查验证结果 |
 | **DONE** | `features/<epic>/delivery-summary.md` | 交付摘要 |

@@ -14,7 +14,8 @@ Read the existing codebase to extract architectural patterns, interface contract
 
 1. `.harness/features/<epic-id>/surface-routing.json` — only deepen paths assigned to `design-scout` (or code surfaces with `dive_strategy` ≥ `summary_only` as allowed by Lead). Do not broad-scan outside routing.
 2. `.harness/features/<epic-id>/cross-repo-impact-index.json` (if present) — use `interfaces[]` for contract-first reads.
-3. `.harness/memory/codemaps/<repo_id>/*.md` — prefer existing hotspot notes when paths overlap; re-verify source if stale or low confidence.
+3. `.harness/features/<epic-id>/codemap-audit.json` (if present) — downgrade any stale/invalid codemap to low-confidence background; prioritize contract/source verification.
+4. `.harness/memory/codemaps/<repo_id>/*.md` — prefer existing hotspot notes when paths overlap; re-verify source if stale or low confidence.
 
 ## What to Scout
 
