@@ -99,7 +99,7 @@ export HARNESSCTL=/opt/agent-delivery-claude/stage-harness/scripts/harnessctl.py
 python3 "$HARNESSCTL" status
 ```
 
-若还没有 `.harness/`，先通过真实会话执行 `/harness:start`。
+若还没有 `.harness/`，先通过真实会话执行 **`/stage-harness:harness-start`**（编排见 `commands/harness-start.md`）。
 
 ## 真实测试启动方式
 
@@ -165,7 +165,7 @@ wc -c /opt/agent-delivery-claude/test_oms_2/harness-start-run.jsonl
 在需要演示“显式关注点闭环”机制时，可使用以下模板：
 
 ```text
-/harness:start 我们要评估一条数据库变更链路的语义正确性。
+/stage-harness:harness-start 我们要评估一条数据库变更链路的语义正确性。
 
 请务必覆盖以下两个关注点：
 1. delete 后再 insert 同一主键行的行为是否正确
@@ -179,7 +179,7 @@ wc -c /opt/agent-delivery-claude/test_oms_2/harness-start-run.jsonl
 如 Epic 已存在，也可继续执行：
 
 ```text
-/harness:clarify <epic-id>
+/stage-harness:harness-clarify <epic-id>
 ```
 
 ## 执行步骤

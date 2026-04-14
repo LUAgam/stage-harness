@@ -14,9 +14,9 @@ Stage-Harness 把人类开发里「先想清楚再动手」的习惯，外显成
 
 对应命令主链：
 
-`/harness:start` → `/harness:clarify` → `/harness:spec` → `/harness:plan` → `/harness:work` → `/harness:review` →（`/harness:fix`）→ `/harness:done`
+`/stage-harness:harness-start` → `/stage-harness:harness-clarify` → `/stage-harness:harness-spec` → `/stage-harness:harness-plan` → `/stage-harness:harness-work` → `/stage-harness:harness-review` →（`/stage-harness:harness-fix`）→ `/stage-harness:harness-done`
 
-自治模式可用 `/harness:auto` 按当前阶段循环推进；纠偏可用 `/harness:patch`。详见 [usage.md](./usage.md)。
+自治模式可用 `/stage-harness:harness-auto` 按当前阶段循环推进；纠偏可用 `/stage-harness:harness-patch`。详见 [usage.md](./usage.md)。
 
 ---
 
@@ -24,14 +24,14 @@ Stage-Harness 把人类开发里「先想清楚再动手」的习惯，外显成
 
 | 人类在做什么 | 插件阶段 | 主要命令 | 典型产物（Epic 目录下，节选） |
 |--------------|----------|----------|-------------------------------|
-| 立项、建档、接住原始描述 | IDEA → CLARIFY | `/harness:start` | `.harness/` 初始化、`project-profile.yaml`、Epic 元数据、`state.json` |
-| 把需求说清楚、圈范围、列未知与决策 | CLARIFY | `/harness:clarify` | **默认（full）**：`clarification-notes.md`（含 [六轴澄清覆盖](usage.md) 或极简绕行）、`domain-frame.json`、`requirements-draft.md`、`impact-scan.md`、`surface-routing.json`、`challenge-report.md`、`generated-scenarios.json`、`scenario-coverage.json`、multi-repo 时 `cross-repo-impact-index.json`、`unknowns-ledger.json`、`decision-bundle.json`、`decision-packet.json` 等。**`clarify_closure_mode=notes_only`** 时门禁可仅校验 `clarification-notes.md` 结构，未知与决策写入同文件即可（见 [usage.md](usage.md)） |
-| 把澄清结果写成正式规格 | SPEC | `/harness:spec` | `.harness/specs/{epic-id}.md`、`spec-council-notes.md` |
-| 把规格落成可执行任务与覆盖 | PLAN | `/harness:plan` | `bridge-spec.md`、`coverage-matrix.json`、`surface-routing.json`（与 CLARIFY 一致，门禁复验）、`.harness/tasks/`；可选先做 `codemap-audit.json` 以降级 stale 缓存 |
-| 按任务实现、测试、留痕 | EXECUTE | `/harness:work` | `receipts/`、代码变更 |
-| 多维度验收 | VERIFY | `/harness:review` | `verification.json` 等 |
-| 按审查意见返工 | FIX | `/harness:fix` | 修复后再 `/harness:review` |
-| 结案与经验沉淀 | DONE | `/harness:done` | `delivery-summary.md`、`release-notes.md`、`memory/`、`scan-metrics.json`（如记录 ROI/验收）等 |
+| 立项、建档、接住原始描述 | IDEA → CLARIFY | `/stage-harness:harness-start` | `.harness/` 初始化、`project-profile.yaml`、Epic 元数据、`state.json` |
+| 把需求说清楚、圈范围、列未知与决策 | CLARIFY | `/stage-harness:harness-clarify` | **默认（full）**：`clarification-notes.md`（含 [六轴澄清覆盖](usage.md) 或极简绕行）、`domain-frame.json`、`requirements-draft.md`、`impact-scan.md`、`surface-routing.json`、`challenge-report.md`、`generated-scenarios.json`、`scenario-coverage.json`、multi-repo 时 `cross-repo-impact-index.json`、`unknowns-ledger.json`、`decision-bundle.json`、`decision-packet.json` 等。**`clarify_closure_mode=notes_only`** 时门禁可仅校验 `clarification-notes.md` 结构，未知与决策写入同文件即可（见 [usage.md](usage.md)） |
+| 把澄清结果写成正式规格 | SPEC | `/stage-harness:harness-spec` | `.harness/specs/{epic-id}.md`、`spec-council-notes.md` |
+| 把规格落成可执行任务与覆盖 | PLAN | `/stage-harness:harness-plan` | `bridge-spec.md`、`coverage-matrix.json`、`surface-routing.json`（与 CLARIFY 一致，门禁复验）、`.harness/tasks/`；可选先做 `codemap-audit.json` 以降级 stale 缓存 |
+| 按任务实现、测试、留痕 | EXECUTE | `/stage-harness:harness-work` | `receipts/`、代码变更 |
+| 多维度验收 | VERIFY | `/stage-harness:harness-review` | `verification.json` 等 |
+| 按审查意见返工 | FIX | `/stage-harness:harness-fix` | 修复后再 `/stage-harness:harness-review` |
+| 结案与经验沉淀 | DONE | `/stage-harness:harness-done` | `delivery-summary.md`、`release-notes.md`、`memory/`、`scan-metrics.json`（如记录 ROI/验收）等 |
 
 ---
 

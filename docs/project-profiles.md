@@ -80,7 +80,7 @@ harnessctl profile show
 
 ### low risk
 - Interrupt budget: 1 total
-- Stage gates: auto-approved (with `/harness:auto`)
+- Stage gates: auto-approved (with `/stage-harness:harness-auto`)
 - Council: 2 agents
 - Harness: minimal checks
 
@@ -119,7 +119,7 @@ When `workspace_mode: multi-repo`, add `.harness/repo-catalog.yaml` from `stage-
 You can override risk for a specific epic without changing the project default:
 
 ```
-/harness:start
+/stage-harness:harness-start
 > Epic: "Refactor payment processing"
 > Risk: high  ← override for this epic only
 ```

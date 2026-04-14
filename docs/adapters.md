@@ -10,7 +10,7 @@ ShipSpec provides the PRD → SDD → TASKS pipeline used in the SPEC stage.
 
 | Stage-Harness | ShipSpec | How |
 |--------------|----------|-----|
-| `/harness:spec` | `/feature-planning` | Invokes ShipSpec command |
+| `/stage-harness:harness-spec` | `/feature-planning` | Invokes ShipSpec command |
 | SPEC quality gate | TASKS.json | Validates ShipSpec output |
 | light_council | PRD.md + SDD.md | Reviews artifacts |
 | Bridge script | TASKS.json | Converts to bridge-spec.md |
