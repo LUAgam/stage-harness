@@ -27,16 +27,25 @@
 
 ## 安装与环境
 
+推荐先运行一次：
+
+```bash
+scripts/harnessctl setup
+scripts/harnessctl doctor
+```
+
+它会检查插件根目录、脚本权限、运行时依赖，并给出推荐的 `HARNESSCTL` 与 `claude --plugin-dir` 命令。
+
 1. **加载本插件**：将整个仓库作为 Claude Code 插件根目录（含 `.claude-plugin/plugin.json`）。使用 Claude CLI 时通过 **`--plugin-dir`** 指向本仓库根目录即可，例如：
    ```bash
    claude --plugin-dir /opt/agent-delivery-claude/stage-harness
    ```
    请将路径换成本机克隆位置；非交互/打印模式同样需要携带该参数。`plugin.json` 里 **`name` 为 `stage-harness`**，slash 命名空间为 **`/stage-harness:`**，启动 Epic 时在对话中输入 **`/stage-harness:harness-start <需求描述>`**（编排说明见 `commands/harness-start.md`）。
-2. 为脚本加上执行权限：
+2. 如需手工方式，可为脚本加上执行权限：
    ```bash
    chmod +x scripts/harnessctl.py scripts/*.sh
    ```
-3. 若未把 `harnessctl` 装进系统 `PATH`，在**被开发项目的根目录**设置 `HARNESSCTL`，指向插件内的 CLI（按布局二选一）：
+3. 若未把 `harnessctl` 装进系统 `PATH`，在**被开发项目的根目录**设置 `HARNESSCTL`，指向插件内的 CLI（`setup` 会打印推荐值；按布局二选一）：
    ```bash
    # 被开发项目与插件目录分离时（推荐写绝对路径，与 --plugin-dir 指向同一克隆）
    export HARNESSCTL=/opt/agent-delivery-claude/stage-harness/scripts/harnessctl
@@ -45,7 +54,15 @@
    # 被开发仓库把本插件作为子目录 stage-harness/ 时
    # export HARNESSCTL="${HARNESSCTL:-./stage-harness/scripts/harnessctl}"
    ```
-4. 首次使用 **`/stage-harness:harness-start`** 时会初始化项目下的 `.harness/`（也可手动执行 `$HARNESSCTL init`）。
+4. 首次使用 **`/stage-harness:harness-start`** 时会初始化项目下的 `.harness/`（也可手动执行 `$HARNESSCTL init`，或使用 `scripts/harnessctl setup --init-project --project-root <项目根>`）。
+
+如需自检或低风险修复：
+
+```bash
+scripts/harnessctl doctor
+scripts/harnessctl repair        # 仅预览修复计划
+scripts/harnessctl repair --apply
+```
 
 ---
 
@@ -101,6 +118,10 @@
 在项目根设置好 `HARNESSCTL` 后：
 
 ```bash
+$HARNESSCTL setup
+$HARNESSCTL doctor
+$HARNESSCTL repair        # dry-run
+$HARNESSCTL repair --apply
 $HARNESSCTL status
 $HARNESSCTL state get <epic-id>
 $HARNESSCTL task list <epic-id>

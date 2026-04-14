@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const { resolveInstallPlan, loadInstallManifests } = require('./install-manifests');
+const { getManifestPaths, resolveInstallPlan, loadInstallManifests } = require('./install-manifests');
 const { readInstallState, writeInstallState } = require('./install-state');
 const {
   createManifestInstallPlan,
@@ -12,6 +12,26 @@ const {
 } = require('./install-targets/registry');
 
 const DEFAULT_REPO_ROOT = path.join(__dirname, '../..');
+
+function tryLoadInstallManifests(options = {}) {
+  const manifestPaths = getManifestPaths(options.repoRoot || DEFAULT_REPO_ROOT);
+  const manifestsPresent = fs.existsSync(manifestPaths.modulesPath) && fs.existsSync(manifestPaths.profilesPath);
+  if (options.allowMissingManifests && !manifestsPresent) {
+    return {
+      manifests: null,
+      error: new Error(`Install manifests not found under ${options.repoRoot || DEFAULT_REPO_ROOT}`),
+    };
+  }
+
+  try {
+    return {
+      manifests: loadInstallManifests(options),
+      error: null,
+    };
+  } catch (error) {
+    throw error;
+  }
+}
 
 function readPackageVersion(repoRoot) {
   try {
@@ -749,6 +769,14 @@ function analyzeRecord(record, context) {
     };
   }
 
+  if (!context.manifestsAvailable) {
+    issues.push(buildIssue(
+      'warning',
+      'manifest-unavailable',
+      'Install manifests not found; running recorded-only checks'
+    ));
+  }
+
   if (!fs.existsSync(state.target.root)) {
     issues.push(buildIssue(
       'error',
@@ -829,7 +857,7 @@ function analyzeRecord(record, context) {
     ));
   }
 
-  if (state.source.manifestVersion !== context.manifestVersion) {
+  if (context.manifestsAvailable && state.source.manifestVersion !== context.manifestVersion) {
     issues.push(buildIssue(
       'warning',
       'manifest-version-mismatch',
@@ -849,7 +877,7 @@ function analyzeRecord(record, context) {
     ));
   }
 
-  if (!state.request.legacyMode) {
+  if (context.manifestsAvailable && !state.request.legacyMode) {
     try {
       const desiredPlan = resolveInstallPlan({
         repoRoot: context.repoRoot,
@@ -896,7 +924,11 @@ function analyzeRecord(record, context) {
 
 function buildDoctorReport(options = {}) {
   const repoRoot = options.repoRoot || DEFAULT_REPO_ROOT;
-  const manifests = loadInstallManifests({ repoRoot });
+  const manifestLoad = tryLoadInstallManifests({
+    repoRoot,
+    allowMissingManifests: options.allowMissingManifests,
+  });
+  const manifests = manifestLoad.manifests;
   const records = discoverInstalledStates({
     homeDir: options.homeDir,
     projectRoot: options.projectRoot,
@@ -906,7 +938,8 @@ function buildDoctorReport(options = {}) {
     repoRoot,
     homeDir: options.homeDir || process.env.HOME,
     projectRoot: options.projectRoot || process.cwd(),
-    manifestVersion: manifests.modulesVersion,
+    manifestsAvailable: Boolean(manifests),
+    manifestVersion: manifests ? manifests.modulesVersion : null,
     packageVersion: readPackageVersion(repoRoot),
   };
   const results = records.map(record => analyzeRecord(record, context));
@@ -929,6 +962,7 @@ function buildDoctorReport(options = {}) {
 
   return {
     generatedAt: new Date().toISOString(),
+    manifestMode: context.manifestsAvailable ? 'full' : 'recorded-only',
     packageVersion: context.packageVersion,
     manifestVersion: context.manifestVersion,
     results,
@@ -942,12 +976,14 @@ function createRepairPlanFromRecord(record, context) {
     throw new Error('No install-state available for repair');
   }
 
-  if (state.request.legacyMode || shouldRepairFromRecordedOperations(state)) {
+  if (!context.manifestsAvailable || state.request.legacyMode || shouldRepairFromRecordedOperations(state)) {
     const operations = hydrateRecordedOperations(context.repoRoot, getManagedOperations(state));
     const statePreview = buildRecordedStatePreview(state, context, operations);
 
     return {
-      mode: state.request.legacyMode ? 'legacy' : 'recorded',
+      mode: !context.manifestsAvailable
+        ? 'recorded-only'
+        : (state.request.legacyMode ? 'legacy' : 'recorded'),
       target: record.adapter.target,
       adapter: record.adapter,
       targetRoot: state.target.root,
@@ -985,12 +1021,17 @@ function createRepairPlanFromRecord(record, context) {
 
 function repairInstalledStates(options = {}) {
   const repoRoot = options.repoRoot || DEFAULT_REPO_ROOT;
-  const manifests = loadInstallManifests({ repoRoot });
+  const manifestLoad = tryLoadInstallManifests({
+    repoRoot,
+    allowMissingManifests: options.allowMissingManifests,
+  });
+  const manifests = manifestLoad.manifests;
   const context = {
     repoRoot,
     homeDir: options.homeDir || process.env.HOME,
     projectRoot: options.projectRoot || process.cwd(),
-    manifestVersion: manifests.modulesVersion,
+    manifestsAvailable: Boolean(manifests),
+    manifestVersion: manifests ? manifests.modulesVersion : null,
     packageVersion: readPackageVersion(repoRoot),
   };
   const records = discoverInstalledStates({
@@ -1022,7 +1063,7 @@ function repairInstalledStates(options = {}) {
           installStatePath: record.installStatePath,
           repairedPaths: [],
           plannedRepairs: [],
-          error: `Missing source file(s): ${operationHealth.missingSource.map(entry => entry.sourcePath).join(', ')}`,
+          error: `Missing source file(s) for recorded repair: ${operationHealth.missingSource.map(entry => entry.sourcePath).join(', ')}`,
         };
       }
 
@@ -1089,6 +1130,7 @@ function repairInstalledStates(options = {}) {
   return {
     dryRun: Boolean(options.dryRun),
     generatedAt: new Date().toISOString(),
+    manifestMode: context.manifestsAvailable ? 'full' : 'recorded-only',
     results,
     summary,
   };

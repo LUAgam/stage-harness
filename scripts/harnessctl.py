@@ -10,12 +10,16 @@ import errno
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 _HARNESSCTL_DIR = Path(__file__).resolve().parent
+PLUGIN_ROOT = _HARNESSCTL_DIR.parent
+INSTALL_LIFECYCLE_CLI = PLUGIN_ROOT / ".cursor" / "scripts" / "install-lifecycle-cli.js"
 if str(_HARNESSCTL_DIR) not in sys.path:
     sys.path.insert(0, str(_HARNESSCTL_DIR))
 from clarify_gate_shared import (
@@ -1713,6 +1717,446 @@ def cmd_init(args, project_root: Path) -> None:
         print(f"Initialized .harness/ at {h}")
         for sub in SUBDIRS:
             print(f"  created {sub}/")
+
+
+# ---------------------------------------------------------------------------
+# setup / doctor / repair
+# ---------------------------------------------------------------------------
+
+def _status_rank(status: str) -> int:
+    return {"ok": 0, "warning": 1, "error": 2}.get(status, 2)
+
+
+def _combine_status(*statuses: str) -> str:
+    ranked = max((_status_rank(status) for status in statuses), default=0)
+    for candidate in ("ok", "warning", "error"):
+        if _status_rank(candidate) == ranked:
+            return candidate
+    return "error"
+
+
+def _runtime_available(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def _required_script_paths() -> list[Path]:
+    scripts_dir = PLUGIN_ROOT / "scripts"
+    script_paths = [
+        scripts_dir / "harnessctl",
+        scripts_dir / "harnessctl.py",
+        *sorted(scripts_dir.glob("*.sh")),
+    ]
+    deduped: list[Path] = []
+    for path in script_paths:
+        if path not in deduped:
+            deduped.append(path)
+    return deduped
+
+
+def _set_executable(path: Path) -> bool:
+    current_mode = path.stat().st_mode
+    next_mode = current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    if next_mode == current_mode:
+        return False
+    path.chmod(next_mode)
+    return True
+
+
+def _is_executable(path: Path) -> bool:
+    return path.exists() and os.access(path, os.X_OK)
+
+
+def _build_plugin_health(plugin_root: Path) -> dict:
+    plugin_json = plugin_root / ".claude-plugin" / "plugin.json"
+    script_checks = []
+    issues = []
+
+    if not plugin_json.exists():
+        issues.append({"severity": "error", "code": "missing-plugin-json", "message": f"Missing {plugin_json}"})
+
+    if not INSTALL_LIFECYCLE_CLI.exists():
+        issues.append(
+            {
+                "severity": "warning",
+                "code": "missing-install-cli",
+                "message": f"Missing install lifecycle bridge: {INSTALL_LIFECYCLE_CLI}",
+            }
+        )
+
+    for script_path in _required_script_paths():
+        exists = script_path.exists()
+        executable = _is_executable(script_path) if exists else False
+        script_checks.append(
+            {
+                "path": str(script_path),
+                "exists": exists,
+                "executable": executable,
+            }
+        )
+        if not exists:
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "missing-script",
+                    "message": f"Missing required script: {script_path}",
+                }
+            )
+        elif not executable:
+            issues.append(
+                {
+                    "severity": "warning",
+                    "code": "script-not-executable",
+                    "message": f"Script is not executable: {script_path}",
+                }
+            )
+
+    runtimes = {}
+    for runtime_name in ("python3", "bash", "node"):
+        resolved = _runtime_available(runtime_name)
+        runtimes[runtime_name] = resolved
+        if resolved is None:
+            severity = "warning" if runtime_name == "node" else "error"
+            issues.append(
+                {
+                    "severity": severity,
+                    "code": "missing-runtime",
+                    "message": f"Runtime `{runtime_name}` not found in PATH",
+                }
+            )
+
+    status = "ok"
+    if any(issue["severity"] == "error" for issue in issues):
+        status = "error"
+    elif issues:
+        status = "warning"
+
+    return {
+        "status": status,
+        "plugin_root": str(plugin_root),
+        "plugin_json": str(plugin_json),
+        "script_checks": script_checks,
+        "runtimes": runtimes,
+        "issues": issues,
+    }
+
+
+def _build_project_health(project_root: Path) -> dict:
+    harness_dir = project_root / HARNESS_DIR
+    harness_exists = harness_dir.is_dir()
+    writable = _dir_is_writable(project_root)
+    issues = []
+    if not writable:
+        issues.append(
+            {
+                "severity": "warning",
+                "code": "project-root-not-writable",
+                "message": f"Project root is not writable: {project_root}",
+            }
+        )
+
+    current_harnessctl = os.environ.get("HARNESSCTL", "").strip()
+    recommended_harnessctl = str(PLUGIN_ROOT / "scripts" / "harnessctl")
+    harnessctl_resolved = Path(current_harnessctl).resolve() if current_harnessctl else None
+    recommended_resolved = Path(recommended_harnessctl).resolve()
+    if current_harnessctl and harnessctl_resolved != recommended_resolved:
+        issues.append(
+            {
+                "severity": "warning",
+                "code": "harnessctl-env-mismatch",
+                "message": f"HARNESSCTL points to {current_harnessctl}, recommended {recommended_harnessctl}",
+            }
+        )
+
+    status = "ok"
+    if any(issue["severity"] == "error" for issue in issues):
+        status = "error"
+    elif issues:
+        status = "warning"
+
+    return {
+        "status": status,
+        "project_root": str(project_root),
+        "harness_dir": str(harness_dir),
+        "harness_exists": harness_exists,
+        "can_initialize_harness": writable and not harness_exists,
+        "writable": writable,
+        "current_harnessctl": current_harnessctl or None,
+        "recommended_harnessctl": recommended_harnessctl,
+        "recommended_plugin_dir_command": f"claude --plugin-dir {PLUGIN_ROOT}",
+        "issues": issues,
+    }
+
+
+def _run_install_lifecycle(command: str, project_root: Path, *, apply: bool = False) -> dict:
+    node_path = _runtime_available("node")
+    if not node_path:
+        return {
+            "status": "warning",
+            "mode": "unavailable",
+            "message": "Node.js not found in PATH; install-state checks are unavailable",
+        }
+    if not INSTALL_LIFECYCLE_CLI.exists():
+        return {
+            "status": "warning",
+            "mode": "unavailable",
+            "message": f"Install lifecycle bridge not found: {INSTALL_LIFECYCLE_CLI}",
+        }
+
+    command_line = [
+        node_path,
+        str(INSTALL_LIFECYCLE_CLI),
+        command,
+        "--repo-root",
+        str(PLUGIN_ROOT),
+        "--project-root",
+        str(project_root),
+        "--json",
+    ]
+    if apply:
+        command_line.append("--apply")
+
+    proc = subprocess.run(
+        command_line,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if proc.returncode != 0:
+        message = (proc.stderr or proc.stdout or "").strip() or f"{command} bridge failed"
+        try:
+            parsed = json.loads(proc.stderr or "{}")
+            message = parsed.get("message", message)
+        except json.JSONDecodeError:
+            pass
+        return {
+            "status": "warning",
+            "mode": "unavailable",
+            "message": message,
+        }
+
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return {
+            "status": "warning",
+            "mode": "unavailable",
+            "message": f"Invalid JSON from install lifecycle bridge: {exc}",
+        }
+
+    if command == "doctor":
+        summary = payload.get("summary", {})
+        status = "ok"
+        if summary.get("errorCount", 0) > 0:
+            status = "error"
+        elif summary.get("warningCount", 0) > 0 or payload.get("manifestMode") == "recorded-only":
+            status = "warning"
+        return {
+            "status": status,
+            "mode": payload.get("manifestMode", "unknown"),
+            "report": payload,
+        }
+
+    summary = payload.get("summary", {})
+    status = "ok"
+    if summary.get("errorCount", 0) > 0:
+        status = "error"
+    elif summary.get("plannedRepairCount", 0) > 0:
+        status = "warning"
+    return {
+        "status": status,
+        "mode": payload.get("manifestMode", "unknown"),
+        "report": payload,
+    }
+
+
+def cmd_setup(args, project_root: Path) -> None:
+    fixed_permissions = []
+    permission_errors = []
+
+    for script_path in _required_script_paths():
+        if not script_path.exists() or _is_executable(script_path):
+            continue
+        try:
+            if _set_executable(script_path):
+                fixed_permissions.append(str(script_path))
+        except OSError as exc:
+            permission_errors.append(f"{script_path}: {exc}")
+
+    initialized = False
+    init_skipped = False
+    init_error = None
+    if getattr(args, "init_project", False):
+        if (project_root / HARNESS_DIR).is_dir():
+            init_skipped = True
+        else:
+            try:
+                _initialize_harness(project_root, force=False)
+                initialized = True
+            except SystemExit:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive
+                init_error = str(exc)
+
+    plugin_health = _build_plugin_health(PLUGIN_ROOT)
+
+    status = _combine_status(
+        plugin_health["status"],
+        "error" if permission_errors else "ok",
+        "error" if init_error else "ok",
+    )
+
+    payload = {
+        "status": status,
+        "plugin_root": str(PLUGIN_ROOT),
+        "project_root": str(project_root),
+        "fixed_permissions": fixed_permissions,
+        "permission_errors": permission_errors,
+        "plugin_health": plugin_health,
+        "recommended_harnessctl": str(PLUGIN_ROOT / "scripts" / "harnessctl"),
+        "recommended_plugin_dir_command": f"claude --plugin-dir {PLUGIN_ROOT}",
+        "export_harnessctl_command": f"export HARNESSCTL={PLUGIN_ROOT / 'scripts' / 'harnessctl'}",
+        "project_initialized": initialized,
+        "project_init_skipped": init_skipped,
+        "init_error": init_error,
+        "next_steps": [
+            f"claude --plugin-dir {PLUGIN_ROOT}",
+            f"export HARNESSCTL={PLUGIN_ROOT / 'scripts' / 'harnessctl'}",
+        ],
+    }
+    if getattr(args, "json", False):
+        out_json(payload)
+        return
+
+    print(f"Setup status: {status.upper()}")
+    print(f"Plugin root: {PLUGIN_ROOT}")
+    if fixed_permissions:
+        print("Fixed script permissions:")
+        for item in fixed_permissions:
+            print(f"  [FIXED] {item}")
+    if permission_errors:
+        print("Permission errors:")
+        for item in permission_errors:
+            print(f"  [ERROR] {item}")
+    if initialized:
+        print(f"Initialized project harness at {project_root / HARNESS_DIR}")
+    elif init_skipped:
+        print(f"Project harness already exists at {project_root / HARNESS_DIR}; skipped initialization")
+    elif init_error:
+        print(f"[ERROR] failed to initialize project harness: {init_error}")
+    print(f"Recommended plugin command: claude --plugin-dir {PLUGIN_ROOT}")
+    print(f"Recommended HARNESSCTL export: export HARNESSCTL={PLUGIN_ROOT / 'scripts' / 'harnessctl'}")
+
+
+def cmd_doctor(args, project_root: Path) -> None:
+    plugin_health = _build_plugin_health(PLUGIN_ROOT)
+    project_health = _build_project_health(project_root)
+    install_state_health = _run_install_lifecycle("doctor", project_root)
+    status = _combine_status(
+        plugin_health["status"],
+        project_health["status"],
+        install_state_health["status"],
+    )
+
+    payload = {
+        "status": status,
+        "plugin_root": str(PLUGIN_ROOT),
+        "project_root": str(project_root),
+        "checks": {
+            "plugin": plugin_health,
+            "project": project_health,
+            "install_state": install_state_health,
+        },
+    }
+    if getattr(args, "json", False):
+        out_json(payload)
+        return
+
+    print(f"Doctor status: {status.upper()}")
+    print(f"Plugin: {plugin_health['status'].upper()}")
+    for issue in plugin_health["issues"]:
+        print(f"  [{issue['severity'].upper()}] {issue['message']}")
+    print(f"Project: {project_health['status'].upper()}")
+    for issue in project_health["issues"]:
+        print(f"  [{issue['severity'].upper()}] {issue['message']}")
+    print(f"Install-state: {install_state_health['status'].upper()}")
+    if install_state_health.get("message"):
+        print(f"  {install_state_health['message']}")
+    elif install_state_health.get("report"):
+        report = install_state_health["report"]
+        print(
+            "  "
+            f"mode={report.get('manifestMode', 'unknown')} "
+            f"checked={report.get('summary', {}).get('checkedCount', 0)} "
+            f"errors={report.get('summary', {}).get('errorCount', 0)} "
+            f"warnings={report.get('summary', {}).get('warningCount', 0)}"
+        )
+
+
+def cmd_repair(args, project_root: Path) -> None:
+    planned_permissions = []
+    applied_permissions = []
+    permission_errors = []
+    for script_path in _required_script_paths():
+        if not script_path.exists() or _is_executable(script_path):
+            continue
+        planned_permissions.append(str(script_path))
+        if getattr(args, "apply", False):
+            try:
+                if _set_executable(script_path):
+                    applied_permissions.append(str(script_path))
+            except OSError as exc:
+                permission_errors.append(f"{script_path}: {exc}")
+
+    install_state_repair = _run_install_lifecycle(
+        "repair",
+        project_root,
+        apply=getattr(args, "apply", False),
+    )
+    status = _combine_status(
+        "warning" if planned_permissions and not getattr(args, "apply", False) else "ok",
+        "error" if permission_errors else "ok",
+        install_state_repair["status"],
+    )
+
+    payload = {
+        "status": status,
+        "apply": bool(getattr(args, "apply", False)),
+        "plugin_root": str(PLUGIN_ROOT),
+        "project_root": str(project_root),
+        "permission_repairs": {
+            "planned": planned_permissions,
+            "applied": applied_permissions,
+            "errors": permission_errors,
+        },
+        "install_state": install_state_repair,
+    }
+    if getattr(args, "json", False):
+        out_json(payload)
+        return
+
+    mode = "APPLY" if getattr(args, "apply", False) else "DRY-RUN"
+    print(f"Repair status: {status.upper()} ({mode})")
+    if planned_permissions:
+        print("Script permission repairs:")
+        for item in applied_permissions if getattr(args, "apply", False) else planned_permissions:
+            prefix = "[FIXED]" if getattr(args, "apply", False) else "[PLAN]"
+            print(f"  {prefix} {item}")
+    if permission_errors:
+        for item in permission_errors:
+            print(f"  [ERROR] {item}")
+    if install_state_repair.get("message"):
+        print(f"Install-state: {install_state_repair['status'].upper()} - {install_state_repair['message']}")
+    elif install_state_repair.get("report"):
+        report = install_state_repair["report"]
+        print(
+            "Install-state: "
+            f"{install_state_repair['status'].upper()} "
+            f"(mode={report.get('manifestMode', 'unknown')}, "
+            f"planned={report.get('summary', {}).get('plannedRepairCount', 0)}, "
+            f"repaired={report.get('summary', {}).get('repairedCount', 0)}, "
+            f"errors={report.get('summary', {}).get('errorCount', 0)})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5843,6 +6287,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--risk-level", dest="risk_level", choices=RISK_LEVELS)
     p_start.add_argument("--json", action="store_true")
 
+    # ---- setup / doctor / repair ----
+    p_setup = sub.add_parser("setup", help="Prepare plugin checkout and optionally initialize a project harness")
+    p_setup.add_argument(
+        "--init-project",
+        action="store_true",
+        help="Also initialize .harness/ under --project-root or cwd when missing",
+    )
+    p_setup.add_argument("--json", action="store_true")
+
+    p_doctor = sub.add_parser("doctor", help="Run plugin installation and runtime self-checks")
+    p_doctor.add_argument("--json", action="store_true")
+
+    p_repair = sub.add_parser("repair", help="Plan or apply low-risk installation/runtime repairs")
+    p_repair.add_argument("--apply", action="store_true", help="Apply repairs (default: dry-run only)")
+    p_repair.add_argument("--json", action="store_true")
+
     # ---- config ----
     p_config = sub.add_parser("config", help="Read/write .harness/config.json")
     config_sub = p_config.add_subparsers(dest="config_action", metavar="ACTION")
@@ -6288,7 +6748,7 @@ def main() -> None:
     if args.project_root:
         project_root = Path(args.project_root).resolve()
     else:
-        if args.command == "init":
+        if args.command in {"init", "setup", "doctor", "repair"}:
             project_root = Path.cwd().resolve()
         elif args.command == "start":
             project_root = find_bootstrap_root()
@@ -6300,6 +6760,15 @@ def main() -> None:
     # For init we don't require .harness/ to exist yet
     if args.command == "init":
         cmd_init(args, project_root)
+        return
+    if args.command == "setup":
+        cmd_setup(args, project_root)
+        return
+    if args.command == "doctor":
+        cmd_doctor(args, project_root)
+        return
+    if args.command == "repair":
+        cmd_repair(args, project_root)
         return
     if args.command == "start":
         cmd_start(args, project_root)
