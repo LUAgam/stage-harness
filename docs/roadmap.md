@@ -36,7 +36,7 @@
 
 | 优先级 | 方向 | 来源 | 实现状态 | 当前判断 | 核心原因 |
 |------|------|------|------|------|------|
-| P0 | setup / doctor / repair 安装与运行自检体系 | 推荐 | 未实现 | 强烈建议优先做 | 直接决定插件是否能稳定安装、诊断和恢复，是产品化与 `/plugin install` 的关键基础设施 |
+| P0 | setup / doctor / repair 安装与运行自检体系 | 推荐 | 基础已落地 | 强烈建议继续补强 | 已具备用户可用的 `harnessctl setup/doctor/repair` 入口与 recorded-only 降级诊断，但完整分发安装体系与更广覆盖的自动修复仍待补强 |
 | P0 | 期间分析自动落地成文档 | 用户 | 基础已落地 | 强烈建议继续做深 | 已有大量阶段产物，但还缺更强的复用摘要层和主动消费机制 |
 | P0 | 可回放执行证据链 | 推荐 | 部分实现 | 强烈建议优先补强 | 已有 `execution-trace` 基础，但还缺 session archive、audit findings、replay 视图 |
 | P0 | Focus Points 机制增强 | 推荐 | 部分实现 | 建议优先补强 | CLARIFY 闭环已有首版，但还未完整贯穿 TASK / TEST / VERIFY |
@@ -66,7 +66,7 @@
 
 ### 目前最明显的空白项
 
-- `setup / doctor / repair` 安装与运行自检体系
+- 完整 manifest / marketplace 驱动的安装分发闭环
 
 ## 推荐推进顺序
 
@@ -94,8 +94,8 @@
 
 - 来源：推荐
 - 优先级：`P0`
-- 实现状态：`未实现`
-- 推进状态：`planned`
+- 实现状态：`基础已落地`
+- 推进状态：`in_progress`
 
 ### 目标
 
@@ -109,15 +109,27 @@
 
 ### 当前落地情况
 
-- 当前主要依赖 `README` / `docs/usage.md` 中的手工说明完成安装和配置
-- 运行时路径仍大量依赖 `HARNESSCTL` 或相对路径假设
-- 仓库内没有统一的 `setup`、`doctor`、`repair` 命令入口
+- 已提供统一入口：
+  - `scripts/harnessctl setup`
+  - `scripts/harnessctl doctor`
+  - `scripts/harnessctl repair [--apply]`
+- `setup` 已能完成插件根目录检查、脚本执行权限修复、运行时依赖检查，并输出推荐的 `HARNESSCTL` / `claude --plugin-dir` 下一步命令
+- `doctor` 已能同时检查：
+  - 插件根目录与 `plugin.json`
+  - 脚本存在性与执行权限
+  - `python3` / `bash` / `node`
+  - 项目根的 `.harness/` 可初始化性
+  - 已发现 install-state 的 recorded-only 健康状态
+- `repair` 已默认 dry-run，只有显式 `--apply` 才执行；目前已支持低风险脚本权限修复，并复用 install-state repair 能力
+- install lifecycle 在 manifest 缺失时已支持 `recorded-only` 降级，不再因为缺少 install manifests 直接中断整个 doctor/repair 流程
+- `README` / `docs/usage.md` 已改为优先引导 `setup` / `doctor` / `repair`，原手工步骤作为 fallback 保留
 
 ### 仍需补强
 
-- 把安装、环境检查、恢复入口标准化
-- 把常见错误从“文档说明”升级为“命令级诊断”
-- 支持低风险自动修复和明确的风险分级输出
+- 完整 manifest / profile / component 驱动的安装规划仍未随本仓库一并落地，目前主要依赖 recorded-only 降级路径
+- `repair` 目前仍以低风险本地修复为主，还不能覆盖更完整的宿主目录恢复与重装场景
+- `doctor` / `repair` 的 JSON 契约和测试覆盖还可以继续补强，尤其是 recorded-only repair 的安全边界
+- 还未形成面向 `/plugin install` 或 marketplace 分发的真正产品化安装器
 
 ### 核心内容
 
@@ -158,9 +170,9 @@
 
 ### 验收信号
 
-- 新用户在没有额外解释的情况下能完成 setup
-- 常见环境问题可以通过 doctor 明确定位
-- 至少一批低风险问题可由 repair 自动恢复
+- 新用户能通过 `harnessctl setup` / `doctor` 完成基本自检与启动前准备
+- manifests 缺失时，doctor 不再异常退出，而是给出 recorded-only 诊断结果
+- 至少一批低风险问题可由 `repair --apply` 自动恢复（如脚本权限）
 - 安装和运行失败时的排障成本明显下降
 
 ## 2. 期间分析自动落地成文档

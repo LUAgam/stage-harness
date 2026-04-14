@@ -34,7 +34,7 @@ scripts/harnessctl setup
 scripts/harnessctl doctor
 ```
 
-它会检查插件根目录、脚本权限、运行时依赖，并给出推荐的 `HARNESSCTL` 与 `claude --plugin-dir` 命令。
+它会检查插件根目录、脚本权限、运行时依赖，并给出推荐的 `HARNESSCTL` 与 `claude --plugin-dir` 命令。`repair` 默认仅预览修复计划，需显式 `--apply` 才执行。若仓库缺少 install manifests，`doctor` / `repair` 会自动降级到 recorded-only 模式，而不是直接报错退出。
 
 1. **加载本插件**：将整个仓库作为 Claude Code 插件根目录（含 `.claude-plugin/plugin.json`）。使用 Claude CLI 时通过 **`--plugin-dir`** 指向本仓库根目录即可，例如：
    ```bash

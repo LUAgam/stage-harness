@@ -9,7 +9,7 @@ scripts/harnessctl setup
 scripts/harnessctl doctor
 ```
 
-`setup` 会检查插件根目录、脚本权限，并输出推荐的 `HARNESSCTL` / `claude --plugin-dir` 命令；`doctor` 会做安装与运行自检。若需要自动初始化项目下的 `.harness/`，可追加 `--init-project --project-root <项目根>`。
+`setup` 会检查插件根目录、脚本权限，并输出推荐的 `HARNESSCTL` / `claude --plugin-dir` 命令；`doctor` 会做安装与运行自检。若缺少 install manifests，`doctor` / `repair` 会自动降级到 recorded-only 模式继续输出诊断。若需要自动初始化项目下的 `.harness/`，可追加 `--init-project --project-root <项目根>`。
 
 1. 将整个 **stage-harness 仓库根目录**（含 `.claude-plugin/plugin.json`）作为 Claude Code 插件加载。使用 Claude CLI 时通过 **`--plugin-dir`** 指向该根目录，例如：
    ```bash
@@ -24,6 +24,7 @@ scripts/harnessctl doctor
    - `scripts/harnessctl doctor`
    - `scripts/harnessctl repair`（默认 dry-run）
    - `scripts/harnessctl repair --apply`
+   - 当输出 `recorded-only` 时，表示 install-state 诊断已降级运行；若源文件不可安全回放，repair 会给出明确错误或手工处理提示，而不会盲目重写文件
 
 ## 命令一览
 
