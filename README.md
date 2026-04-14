@@ -117,3 +117,4 @@ $HARNESSCTL profile detect
 - [docs/usage.md](docs/usage.md) — 安装细节、各命令流程与产物、FAQ  
 - [docs/architecture.md](docs/architecture.md) — 实现与模块关系  
 - [docs/human-workflow-and-orchestration.md](docs/human-workflow-and-orchestration.md) — 人类协作与编排注意点  
+- [docs/roadmap.md](docs/roadmap.md) — 中长期功能规划、优先级与实施方向

@@ -163,3 +163,4 @@ export HARNESSCTL=/opt/agent-delivery-claude/stage-harness/scripts/harnessctl
 详细使用说明（各命令产物、CLARIFY 六轴、多仓、CodeMap、metrics、FAQ）参见 [usage.md](./usage.md)。
 架构与实现细节参见 [architecture.md](./architecture.md)。
 人类开发流程、阶段并串行与「通用性优先」关注点参见 [human-workflow-and-orchestration.md](./human-workflow-and-orchestration.md)。
+中长期功能规划与优先级维护见 [roadmap.md](./roadmap.md)。
