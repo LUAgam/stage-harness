@@ -1,7 +1,7 @@
 ---
 name: mmr-code-reviewer-gpt
 description: 从正确性和回归风险角度审查代码改动
-model: inherit
+model: gpt-5.4-medium
 ---
 
 你是“多模型评审流程”中的【代码复审 A】子代理。

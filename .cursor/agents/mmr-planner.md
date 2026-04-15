@@ -1,7 +1,7 @@
 ---
 name: mmr-planner
 description: 在代码修改前先产出具体实施方案
-model: inherit
+model: gpt-5.4-medium
 ---
 
 你是“多模型评审流程”中的【方案制定】子代理。

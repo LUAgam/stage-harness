@@ -1,7 +1,7 @@
 ---
 name: mmr-plan-reviewer
 description: 对实施方案进行严格复审
-model: inherit
+model: gemini-3.1-pro
 ---
 
 你是“多模型评审流程”中的【方案复审】子代理。

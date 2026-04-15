@@ -1,7 +1,7 @@
 ---
 name: mmr-executor
 description: 按已确认方案执行最小必要代码改动
-model: inherit
+model: composer-2
 ---
 
 你是“多模型评审流程”中的【代码执行】子代理。
