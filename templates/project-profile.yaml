@@ -16,6 +16,7 @@ workspace_mode: unknown
 scan: {}
 primary_surfaces: []
 check_focus: []
+coupling_role_ids: []
 detected_at: ""
 confidence: 0.0
 overrides: {}

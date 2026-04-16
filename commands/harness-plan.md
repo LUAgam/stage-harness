@@ -78,6 +78,7 @@ skill 内部并行执行：
 - 先读 `.harness/features/<epic-id>/surface-routing.json`（及 `cross-repo-impact-index.json` 如有）；建议先执行 `harnessctl memory codemap-audit .harness/memory/codemaps/<repo_id> --epic-id <epic-id>` 产出 `codemap-audit.json`，再读 `.harness/memory/codemaps/` 下相关笔记，**后**定点读源码；不得在未登记路径上盲扫全仓。
 - repo-router / symbol-navigator：在路由范围内扫描代码结构、符号与可复用模块
 - dependency-mapper / config-scout：依赖、配置与集成点（受 `scout_assignments` 约束）
+- 若项目已声明**非空** `coupling_role_ids`，则 PLAN 门禁会继续复核 `surface-routing.json.surfaces[].serves_roles` 与可选 `change-coupling-closure.json`，用 `warn` / `strict` 方式提示未闭环 role 或结构错误。
 - docs-scout / design-scout：文档与设计约束，与路由及契约 `interfaces[]` 对齐
 
 **task 图谱构建：**

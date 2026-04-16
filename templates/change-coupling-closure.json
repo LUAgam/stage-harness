@@ -1,0 +1,12 @@
+{
+  "version": "1.0",
+  "epic_id": "<epic-id>",
+  "required_role_ids": [],
+  "exemptions": [
+    {
+      "role_id": "role.example",
+      "binds_to": "DEC-001",
+      "rationale": "Explain why this role is intentionally exempt for this epic"
+    }
+  ]
+}

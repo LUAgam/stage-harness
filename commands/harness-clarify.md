@@ -224,6 +224,7 @@ HARNESS_DIR=.harness ${CLAUDE_PLUGIN_ROOT}/scripts/unknowns-ledger-update.sh res
 - 明确哪些功能在范围外（out-of-scope）
 - 更新 `clarification-notes.md` 末尾追加「范围边界」章节
 - 按 `skills/project-surface/SKILL.md` 生成或更新 **`surface-routing.json`**（`type`、`path`、`repo_id`、`dive_strategy`、`scan_budget`、`evidence_level`），供 PLAN / VERIFY 约束扫描与审查范围；`surfaces[]` 中每项都必须显式带 `type` 与 `path`
+- 若 `.harness/project-profile.yaml` 已声明**非空** `coupling_role_ids`，同步判断当前 epic 是否需要额外的通用联动闭包；需要时补写 **`change-coupling-closure.json`**，并在 `surface-routing.json.surfaces[].serves_roles` 或 `exemptions[].binds_to = DEC-* / UNK-*` 中闭环
 
 ```bash
 # 更新 clarification-notes.md（追加章节，不覆盖前文）
@@ -365,6 +366,7 @@ $HARNESSCTL stage-gate check CLARIFY --epic-id <epic-id>
 - **`clarify_deep_dive_enabled=true`**：若高风险信号与 `requirements-draft.md` 中的 `UNCLEAR` / `AMBIGUOUS` 同时存在，CLI 会给出 deep-dive 提示；若启用 **`clarify_deep_dive_gate_strict=true`**，且仍缺少 `deep-dive-*.md`，则 CLARIFY 直接阻断。
 - **`clarify_deep_dive_enabled=true`**：若存在高风险信号且 `requirements-draft.md` 中出现 `UNCLEAR` / `AMBIGUOUS`，CLI 会提示触发 `deep-dive-specialist`；若再启用 **`clarify_deep_dive_gate_strict=true`**，则缺少 `deep-dive-*.md` 备忘录会成为阻断项。
 - **用户关注点**：若存在 **`## Focus Points` / `## 用户关注点` / `## 用户点名关注`** 小节（且含列表项）或 **`focus-points.json`** 含 `items`，则每项必须映射到 `REQ-` / `CHK-` / `SCN-` / `DEC-` / `UNK-`（见 `scripts/clarify_gate_shared.py`）。
+- **可选联动闭包**：若项目启用了**非空** `coupling_role_ids`，则 `stage-gate check CLARIFY`（`full` 模式）/ `PLAN` 会按 `.harness/config.json` 的 `coupling_closure_gate_mode`（`off | warn | strict`）校验 `surface-routing.json.surfaces[].serves_roles` 与 `change-coupling-closure.json`；`warn` 会输出结构问题与未闭环 role 的 warning，`strict` 则把结构错误升级为阻断项。
 
 **若任意检查项失败，报告缺失文件或校验错误并停止，不得推进到 SPEC。**
 

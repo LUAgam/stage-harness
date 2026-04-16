@@ -48,6 +48,7 @@ class HarnessctlStartTests(unittest.TestCase):
             self.assertEqual(profile["test_framework"], "unknown")
             self.assertEqual(profile["workspace_mode"], "unknown")
             self.assertEqual(profile["primary_surfaces"], [])
+            self.assertEqual(profile["coupling_role_ids"], [])
             self.assertIsNone(profile["has_database"])
             self.assertIsNone(profile["has_auth"])
             self.assertIsNone(profile["has_docker"])

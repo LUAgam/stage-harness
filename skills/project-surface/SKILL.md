@@ -44,6 +44,7 @@
    - deep：全量精读（仅高风险核心依赖）
 6. 若 `workspace_mode: multi-repo` 且处于 CLARIFY full mode，上游应已产出 `.harness/features/<epic-id>/cross-repo-impact-index.json`；本步骤应按其 `repos[]` / `interfaces[]` 对齐 surface，避免漏扫契约。单仓时该文件可缺省。
 7. `surface-routing.json.surfaces[]` 的每个条目都必须显式包含 `type` 与 `path`；不要依赖下游猜测补齐。
+8. 若项目画像 `.harness/project-profile.yaml` 声明了可选 `coupling_role_ids`，则可在对应 `surfaces[]` 条目补充 `serves_roles`，用于声明该承载面承担哪些通用联动责任；不得填写未在 `coupling_role_ids` 中登记的 role id。
 ```
 
 ## 输出：surface-routing.json
@@ -64,6 +65,7 @@
       "dive_strategy": "targeted",
       "scan_budget": { "max_files": 15, "max_grep_rounds": 3 },
       "evidence_level": "source",
+      "serves_roles": ["role.api_contract"],
       "assigned_to": "repo-router"
     },
     {
@@ -126,3 +128,5 @@ Output: .harness/features/<epic-id>/surface-routing.json
 ```
 
 `repo_id` 在单仓可为空字符串；`multi-repo` 时填 catalog 中的 `repo_id`。`evidence_level` 可取 `catalog` | `codemap` | `source`。
+
+`serves_roles` 是可选字段；未启用 `coupling_role_ids` 的项目不要凭空新增该字段。

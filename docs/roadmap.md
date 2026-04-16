@@ -42,7 +42,7 @@
 |------|------|------|------|------|------|
 | P0 | setup / doctor / repair 安装与运行自检体系 | 推荐 | 基础已落地 | 强烈建议继续补强 | 已具备用户可用的 `harnessctl setup/doctor/repair` 入口与 recorded-only 降级诊断，但完整分发安装体系与更广覆盖的自动修复仍待补强 |
 | P0 | 期间分析自动落地成文档 | 用户 | 基础已落地 | 强烈建议继续做深 | 已有大量阶段产物，但还缺更强的复用摘要层和主动消费机制 |
-| P0 | 可回放执行证据链 | 推荐 | 部分实现 | 强烈建议优先补强 | 已有 `execution-trace` 基础，但还缺 session archive、audit findings、replay 视图 |
+| P0 | 可回放执行证据链 | 推荐 | 基础已落地 | 强烈建议继续做深 | 已有 `execution-trace`、轻量 trace schema 收敛、`execution-summary.json` 与 `audit show` 摘要能力，但还缺 session archive、audit findings、replay 视图 |
 | P0 | Focus Points 机制增强 | 推荐 | 部分实现 | 建议优先补强 | CLARIFY 闭环已有首版，但还未完整贯穿 TASK / TEST / VERIFY |
 | P1 | 多仓代码分析并行 | 用户 | 部分实现 | 很值得做 | 多仓分析与路由基础已在，但执行并行与统一收口仍需继续完善 |
 | P1 | 项目画像持续刷新 | 推荐 | 部分实现 | 很值得做 | 目前更像初始化检测，动态刷新与热点演化机制还没完成 |
@@ -57,12 +57,12 @@
 - 阶段化开发主链与 `FIX` 回路
 - 结构化分析产物：`domain-frame`、`impact-scan`、`scenario-coverage`、`decision-bundle`、`verification`、`delivery-summary` 等
 - 阶段门禁、自检与产物校验：`stage-gate check`、`clarify-selfcheck`、`verify-artifacts.sh`
+- 执行证据链 MVP：`execution-trace.jsonl`、`execution-summary.json`、`audit show`，已能解释 CLARIFY 与 gate / guard / task 的关键执行事实
 - 多仓基础能力：`workspace_mode`、`repo-catalog`、`cross-repo-impact-index`、`surface-routing`
 - 复用资产基础：`memory/pitfalls.md`、`memory/codemaps/*`、`codemap-audit`
 
 ### 已有首版或局部实现，但还不宜宣传为完整能力
 
-- `execution-trace.jsonl` 与 trace 事件体系
 - `Focus Points` 闭环校验
 - `skill-miner` 与 candidate-skills
 - `profile detect`、扫描预算与工作区画像
@@ -429,8 +429,8 @@
 
 - 来源：推荐
 - 优先级：`P0`
-- 实现状态：`部分实现`
-- 推进状态：`planned`
+- 实现状态：`基础已落地`
+- 推进状态：`in_progress`
 
 ### 目标
 
@@ -446,19 +446,26 @@
 
 - 已有 `execution-trace.jsonl`
 - `harnessctl` 已在多处写入 trace event
+- 已对 trace event 做轻量 envelope 收敛：缺省时可稳定补齐 `event_id`、`ts`、默认 `status`，且兼容 legacy / raw 事件
+- 已有 `execution-summary.json`
+- 已有 `harnessctl audit show`，可直接汇总并展示 CLARIFY run、gate / guard / task 的关键执行事实
 - 已有 `gate-skips.json`
 - 已有 `patch diagnose` 消费 trace 的能力
 - 已有部分 session log 目录准备和 JIT patch 诊断链路
+- 已有针对 legacy trace 兼容、gate / guard / task 摘要的测试覆盖，MVP 链路已可稳定回归
 
 ### 仍需补强
 
 - 还缺完整的 session archive
 - 还缺 `audit-findings.json` / `audit-summary.md`
-- 还缺更高层的 replay / audit 入口和更稳定的 trace schema 约束
+- 还缺更高层的 replay / audit 子命令与更完整的跨阶段审计视图
+- 还缺与 session 级 transcript / archive 的稳定关联关系
+- 还缺更显式的 trace schema 注册表与长期兼容治理
 
 ### 核心内容
 
 - 只记录“决策事实”，不记录全量自由思维流
+- 已落地的 MVP 重点是：`execution-trace.jsonl` -> `execution-summary.json` -> `audit show`
 - 重点事件包括：
   - stage transition
   - gate pass / fail
@@ -470,8 +477,9 @@
 
 ### 适合新增的落点
 
-- `.harness/logs/sessions/<session-id>.jsonl`
 - `.harness/logs/epics/<epic-id>/execution-trace.jsonl`
+- `.harness/logs/epics/<epic-id>/execution-summary.json`
+- `.harness/logs/sessions/<session-id>.*`
 - `.harness/logs/epics/<epic-id>/audit-findings.json`
 
 ### 主要风险
@@ -481,6 +489,7 @@
 
 ### 验收信号
 
+- MVP 层面已能通过 `audit show` 解释 gate / guard / task 的关键路径
 - 能回放单个 Epic 的关键路径
 - 能解释 gate 为何通过或阻断
 - 后续分析不必依赖人工翻全量日志

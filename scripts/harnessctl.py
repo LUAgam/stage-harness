@@ -7,6 +7,7 @@ Manages .harness/ directory structure, epics, tasks, and state machine.
 
 import argparse
 import errno
+import hashlib
 import json
 import os
 import re
@@ -23,11 +24,16 @@ INSTALL_LIFECYCLE_CLI = PLUGIN_ROOT / ".cursor" / "scripts" / "install-lifecycle
 if str(_HARNESSCTL_DIR) not in sys.path:
     sys.path.insert(0, str(_HARNESSCTL_DIR))
 from clarify_gate_shared import (
+    change_coupling_closure_errors,
+    change_coupling_closure_warnings,
     clarify_focus_point_closure_errors,
     clarify_state_constraint_signal_scn_focus_errors,
+    coupling_role_ids_from_profile,
     domain_frame_missing_required_keys,
     generated_scenarios_strict_errors,
+    profile_coupling_role_errors,
     scenario_coverage_strict_errors,
+    surface_routing_coupling_errors,
 )
 
 # ---------------------------------------------------------------------------
@@ -68,6 +74,7 @@ PROFILE_NEUTRAL_DEFAULTS = {
     "workspace_mode": PROFILE_UNKNOWN,
     "primary_surfaces": [],
     "check_focus": [],
+    "coupling_role_ids": [],
 }
 LEGACY_PROFILE_TEMPLATE_DEFAULTS = {
     "type": "backend-service",
@@ -171,6 +178,8 @@ DEFAULT_CONFIG = {
     "patch_shadow_min_observations": 2,
     # CLARIFY: "full" = ledger + JSON artifacts (default); "notes_only" = closure only in clarification-notes.md
     "clarify_closure_mode": "full",
+    # Coupling closure gate: off | warn | strict. Warn/strict only apply when project declares coupling_role_ids.
+    "coupling_closure_gate_mode": "warn",
     # Enhancement layer: when True, use domain/scenario signals to require stronger coverage on selected axes.
     "clarify_signal_gate_enabled": True,
     # Enhancement layer: suggest / enforce deep-dive when high-risk signals coexist with ambiguous requirements.
@@ -254,6 +263,116 @@ def _incidents_index_path(h: Path, epic_id: str) -> Path:
     return _trace_dir_for_epic(h, epic_id) / "incident-index.json"
 
 
+def _trace_field_empty(val) -> bool:
+    """True for missing trace fields: None, JSON null, or blank string (not string 'None')."""
+    if val is None:
+        return True
+    if isinstance(val, str) and not val.strip():
+        return True
+    return False
+
+
+def _normalize_trace_event_write(event: dict) -> dict:
+    """Normalize on append/write: fill ts with current time when missing."""
+    if not isinstance(event, dict):
+        return event
+    out = dict(event)
+    if _trace_field_empty(out.get("ts")):
+        out["ts"] = now_iso()
+    if _trace_field_empty(out.get("status")):
+        et = str(out.get("event_type") or "").strip()
+        if et.endswith("_failed"):
+            out["status"] = "blocked"
+        else:
+            out["status"] = "ok"
+    if _trace_field_empty(out.get("event_id")):
+        basis = {k: v for k, v in out.items() if k != "event_id"}
+        canonical = json.dumps(basis, sort_keys=True, ensure_ascii=False, default=str)
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+        out["event_id"] = f"evt_{digest}"
+    return out
+
+
+def _normalize_trace_event_read(event: dict, line_index: int) -> dict:
+    """Normalize when loading trace from disk: stable ts/event_id (no wall-clock ts for legacy rows)."""
+    if not isinstance(event, dict):
+        return event
+    out = dict(event)
+    if _trace_field_empty(out.get("ts")):
+        out["ts"] = f"legacy_ts:{line_index}"
+    if _trace_field_empty(out.get("status")):
+        et = str(out.get("event_type") or "").strip()
+        if et.endswith("_failed"):
+            out["status"] = "blocked"
+        else:
+            out["status"] = "ok"
+    if _trace_field_empty(out.get("event_id")):
+        basis = {k: v for k, v in out.items() if k != "event_id"}
+        canonical = json.dumps(basis, sort_keys=True, ensure_ascii=False, default=str)
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+        out["event_id"] = f"evt_{digest}"
+    return out
+
+
+def _compact_audit_trace_event(e: dict | None) -> dict | None:
+    if not e:
+        return None
+    return {
+        "event_type": e.get("event_type"),
+        "ts": e.get("ts"),
+        "stage": e.get("stage"),
+        "status": e.get("status"),
+        "summary": e.get("summary"),
+        "event_id": e.get("event_id"),
+    }
+
+
+def _pick_latest_gate_event(events: list[dict]) -> dict | None:
+    """Latest gate-related event in trace order (checked vs pass/fail does not override chronology)."""
+    last: dict | None = None
+    for e in events:
+        et = str(e.get("event_type") or "").strip()
+        if et in ("stage_gate_passed", "stage_gate_failed", "stage_gate_checked"):
+            last = e
+    return last
+
+
+def _pick_latest_guard_event(events: list[dict]) -> dict | None:
+    """Latest guard-related event in trace order."""
+    last: dict | None = None
+    for e in events:
+        et = str(e.get("event_type") or "").strip()
+        if et in ("guard_passed", "guard_failed", "guard_checked"):
+            last = e
+    return last
+
+
+def _task_summary_from_events(events: list[dict]) -> dict:
+    task_latest: dict[str, str] = {}
+    last_change: dict | None = None
+    for e in events:
+        if str(e.get("event_type", "")).strip() != "task_status_changed":
+            continue
+        payload = e.get("payload", {}) if isinstance(e.get("payload"), dict) else {}
+        tid = str(payload.get("task_id") or e.get("task_id") or "").strip()
+        nst = str(payload.get("new_status") or "").strip()
+        if not tid or not nst:
+            continue
+        task_latest[tid] = nst
+        last_change = {
+            "task_id": tid,
+            "new_status": nst,
+            "ts": e.get("ts"),
+            "event_type": e.get("event_type"),
+            "summary": e.get("summary"),
+        }
+    by_status = {s: 0 for s in TASK_STATUSES}
+    for nst in task_latest.values():
+        if nst in by_status:
+            by_status[nst] += 1
+    return {"by_status": by_status, "latest_change": last_change}
+
+
 def append_trace_event(h: Path, event: dict) -> None:
     """Append a structured trace event to the epic's execution-trace.jsonl.
 
@@ -265,6 +384,7 @@ def append_trace_event(h: Path, event: dict) -> None:
     epic_id = event.get("epic_id")
     if not epic_id:
         return
+    event = _normalize_trace_event_write(event)
     trace_dir = _trace_dir_for_epic(h, epic_id)
     trace_dir.mkdir(parents=True, exist_ok=True)
     trace_path = trace_dir / "execution-trace.jsonl"
@@ -292,7 +412,7 @@ def _make_trace_event(
     payload: dict = None,
     artifact_paths: list = None,
 ) -> dict:
-    return {
+    return _normalize_trace_event_write({
         "ts": now_iso(),
         "epic_id": epic_id,
         "stage": stage,
@@ -306,7 +426,7 @@ def _make_trace_event(
         "summary": summary,
         "payload": payload or {},
         "artifact_paths": artifact_paths or [],
-    }
+    })
 
 
 def _load_trace_events(h: Path, epic_id: str) -> list[dict]:
@@ -396,7 +516,11 @@ def _write_execution_summary(h: Path, epic_id: str) -> dict:
     """Derive a concise execution summary from trace + state."""
     trace_dir = _trace_dir_for_epic(h, epic_id)
     trace_dir.mkdir(parents=True, exist_ok=True)
-    events = _load_trace_events(h, epic_id)
+    raw_trace = _load_trace_events(h, epic_id)
+    events = [
+        _normalize_trace_event_read(e, idx) if isinstance(e, dict) else e
+        for idx, e in enumerate(raw_trace)
+    ]
     latest_run_id = ""
     latest_run_start = -1
     for idx, event in enumerate(events):
@@ -494,6 +618,10 @@ def _write_execution_summary(h: Path, epic_id: str) -> dict:
                 steps_seen.add(step_name)
                 steps_completed.append(step_name)
 
+    gate_ev = _pick_latest_gate_event(events)
+    guard_ev = _pick_latest_guard_event(events)
+    task_summary = _task_summary_from_events(events)
+
     summary = {
         "epic_id": epic_id,
         "current_stage": state.get("current_stage", "") if isinstance(state, dict) else "",
@@ -506,6 +634,9 @@ def _write_execution_summary(h: Path, epic_id: str) -> dict:
         "pending_decisions_synced": pending_decisions_synced,
         "pending_decisions_count": len(pending_decisions),
         "latest_pause_reason": latest_pause_reason,
+        "latest_gate": _compact_audit_trace_event(gate_ev),
+        "latest_guard": _compact_audit_trace_event(guard_ev),
+        "task_summary": task_summary,
         "updated_at": now_iso(),
     }
     atomic_write_json(trace_dir / "execution-summary.json", summary)
@@ -2223,6 +2354,7 @@ def _default_profile_yaml() -> str:
         "scan: {}\n"
         "primary_surfaces: []\n"
         "check_focus: []\n"
+        "coupling_role_ids: []\n"
         "detected_at: \"\"\n"
         "confidence: 0.0\n"
         "overrides: {}\n"
@@ -4169,6 +4301,11 @@ def _stage_gate_artifacts_spec(stage: str, h: Path) -> list[str] | None:
     return list(artifacts_spec) if artifacts_spec is not None else None
 
 
+def _coupling_closure_gate_mode(harness_cfg: dict) -> str:
+    raw = str(harness_cfg.get("coupling_closure_gate_mode", "warn")).strip().lower()
+    return raw if raw in {"off", "warn", "strict"} else "warn"
+
+
 def _cross_repo_impact_index_errors(data: object) -> list[str]:
     if not isinstance(data, dict):
         return ["root must be a JSON object"]
@@ -4204,6 +4341,15 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
     missing = []
     present = []
     warnings = []
+    profile_data = {}
+    profile_path = h / PROFILE_FILE
+    if profile_path.exists():
+        try:
+            profile_data = _parse_simple_yaml(profile_path.read_text(encoding="utf-8"))
+        except OSError:
+            profile_data = {}
+    coupling_role_ids = coupling_role_ids_from_profile(profile_data)
+    coupling_gate_mode = _coupling_closure_gate_mode(harness_cfg)
 
     spec_file = spec_path_for_epic(h, epic_id)
     strict_semantic = bool(harness_cfg.get("spec_semantic_hints_strict", False))
@@ -4262,6 +4408,11 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
                     missing.append(msg)
 
     if stage == "CLARIFY" and not clarify_notes_only:
+        if coupling_gate_mode != "off":
+            for msg in profile_coupling_role_errors(profile_data):
+                target = missing if coupling_gate_mode == "strict" else warnings
+                target.append(msg)
+
         df_path = features_dir / "domain-frame.json"
         if df_path.exists():
             try:
@@ -4318,6 +4469,7 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
                     missing.append(f"{impact_path} (missing ## {heading} section)")
 
         sr_path = features_dir / "surface-routing.json"
+        sr_data = {}
         if sr_path.exists():
             try:
                 sr_data = json.loads(sr_path.read_text(encoding="utf-8"))
@@ -4341,8 +4493,31 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
                                     f"{sr_path} (surfaces[{idx}] missing type or path)"
                                 )
                                 break
+                    if coupling_gate_mode != "off" and coupling_role_ids:
+                        target = missing if coupling_gate_mode == "strict" else warnings
+                        for msg in surface_routing_coupling_errors(sr_data, coupling_role_ids):
+                            target.append(msg)
             except json.JSONDecodeError:
                 missing.append(f"{sr_path} (invalid JSON)")
+
+        if coupling_gate_mode != "off" and coupling_role_ids:
+            closure_path = features_dir / "change-coupling-closure.json"
+            if closure_path.exists():
+                try:
+                    closure_data = json.loads(closure_path.read_text(encoding="utf-8"))
+                    target = missing if coupling_gate_mode == "strict" else warnings
+                    for msg in change_coupling_closure_errors(closure_data, coupling_role_ids):
+                        target.append(msg)
+                    if coupling_gate_mode in {"warn", "strict"}:
+                        for msg in change_coupling_closure_warnings(closure_data, sr_data, coupling_role_ids):
+                            warnings.append(msg)
+                except json.JSONDecodeError:
+                    target = missing if coupling_gate_mode == "strict" else warnings
+                    target.append(f"{closure_path} (invalid JSON)")
+            else:
+                warnings.append(
+                    f"{closure_path} (project-profile declares coupling_role_ids but this epic has no closure review yet)"
+                )
 
         if _workspace_mode(h) == "multi-repo":
             cri_path = features_dir / "cross-repo-impact-index.json"
@@ -4404,6 +4579,39 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
             warnings.append(
                 f"{codemap_root} (codemaps exist but no {features_dir / 'codemap-audit.json'}; run memory codemap-audit before trusting cache)"
             )
+
+        if coupling_gate_mode != "off" and coupling_role_ids:
+            for msg in profile_coupling_role_errors(profile_data):
+                target = missing if coupling_gate_mode == "strict" else warnings
+                target.append(msg)
+            sr_path = features_dir / "surface-routing.json"
+            sr_data = {}
+            if sr_path.exists():
+                try:
+                    sr_data = json.loads(sr_path.read_text(encoding="utf-8"))
+                    target = missing if coupling_gate_mode == "strict" else warnings
+                    for msg in surface_routing_coupling_errors(sr_data, coupling_role_ids):
+                        target.append(msg)
+                except json.JSONDecodeError:
+                    sr_data = {}
+            closure_path = features_dir / "change-coupling-closure.json"
+            if closure_path.exists():
+                try:
+                    closure_data = json.loads(closure_path.read_text(encoding="utf-8"))
+                    target = missing if coupling_gate_mode == "strict" else warnings
+                    for msg in change_coupling_closure_errors(closure_data, coupling_role_ids):
+                        target.append(msg)
+                    for msg in change_coupling_closure_warnings(closure_data, sr_data, coupling_role_ids):
+                        warnings.append(msg)
+                except json.JSONDecodeError:
+                    if coupling_gate_mode == "strict":
+                        missing.append(f"{closure_path} (invalid JSON)")
+                    else:
+                        warnings.append(f"{closure_path} (invalid JSON)")
+            else:
+                warnings.append(
+                    f"{closure_path} (project-profile declares coupling_role_ids but this epic has no closure review yet)"
+                )
 
     if stage == "VERIFY":
         verification_path = features_dir / "verification.json"
@@ -5557,6 +5765,50 @@ def cmd_bundle_check_confirmed(args, h: Path) -> None:
 # audit commands
 # ---------------------------------------------------------------------------
 
+def _audit_text_compact_line(label: str, compact: dict | None) -> None:
+    if not compact:
+        print(f"  {label}: N/A")
+        return
+    bits = [str(compact.get("event_type") or "?")]
+    ts = str(compact.get("ts") or "").strip()
+    if ts:
+        bits.append(f"@ {ts}")
+    stg = str(compact.get("stage") or "").strip()
+    if stg:
+        bits.append(f"stage={stg}")
+    summ = str(compact.get("summary") or "").strip()
+    if summ:
+        bits.append(summ[:160])
+    print(f"  {label}: {' | '.join(bits)}")
+
+
+def _audit_text_task_summary(task_summary: dict | None) -> None:
+    if not isinstance(task_summary, dict):
+        print("  task_summary: N/A")
+        return
+    bs = task_summary.get("by_status")
+    lc = task_summary.get("latest_change")
+    if not isinstance(bs, dict):
+        bs = {}
+    tracked = sum(int(bs.get(s, 0) or 0) for s in TASK_STATUSES)
+    if tracked == 0 and not lc:
+        print("  task_summary: N/A")
+        return
+    parts = []
+    for s in TASK_STATUSES:
+        n = int(bs.get(s, 0) or 0)
+        if n:
+            parts.append(f"{s}={n}")
+    tail = "; ".join(parts) if parts else "(none)"
+    if isinstance(lc, dict) and lc:
+        tid = str(lc.get("task_id") or "").strip()
+        ns = str(lc.get("new_status") or "").strip()
+        lts = str(lc.get("ts") or "").strip()
+        extra = f" | latest: {tid} -> {ns}" + (f" @ {lts}" if lts else "")
+        tail = tail + extra
+    print(f"  task_summary: {tail}")
+
+
 def cmd_audit_show(args, h: Path) -> None:
     """Show derived execution audit summary for an epic."""
     epic_id = args.epic_id
@@ -5576,6 +5828,9 @@ def cmd_audit_show(args, h: Path) -> None:
         print(f"  pending_synced:           {'yes' if summary.get('pending_decisions_synced') else 'no'}")
         print(f"  pending_decisions_count:  {summary.get('pending_decisions_count', 0)}")
         print(f"  latest_pause_reason:      {summary.get('latest_pause_reason', '') or 'N/A'}")
+        _audit_text_compact_line("latest_gate", summary.get("latest_gate"))
+        _audit_text_compact_line("latest_guard", summary.get("latest_guard"))
+        _audit_text_task_summary(summary.get("task_summary"))
 
 
 # ---------------------------------------------------------------------------

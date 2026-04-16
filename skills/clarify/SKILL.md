@@ -97,6 +97,7 @@ Lead 在路由代码承载面之前，交叉核对 `domain-frame.json`、`genera
 
 - `project-surface-router` reads `requirements-draft.md` + `impact-scan.md`，将 REQ 映射到具体文件 → `surface-map.md`（按需）。
 - Lead 或专用步骤按 `skills/project-surface/SKILL.md` 生成/更新 **`surface-routing.json`**（承载面、`repo_id`、`dive_strategy`、`scan_budget`、`evidence_level`）；`surfaces[]` 每项都必须显式包含 `type` 和 `path`；输入可含 **`cross-repo-impact-index.json`**（multi-repo 时由 `impact-analyst` 写出，且 full mode 下不应缺失）。
+- 若 `.harness/project-profile.yaml` 声明了可选 `coupling_role_ids`，Lead 需要为本 epic 判断是否存在需要显式闭环的联动责任；需要时写出 `change-coupling-closure.json`，并在 `surface-routing.json.surfaces[].serves_roles` 或 `exemptions[].binds_to = DEC-* / UNK-*` 中闭环。
 
 ### Step 6 — Deep Dive (conditional)
 
@@ -147,6 +148,7 @@ Before proceeding to SPEC:
 | `impact-scan.md` | impact-analyst | 影响面扫描 |
 | `cross-repo-impact-index.json` | impact-analyst | multi-repo 时：契约优先的仓级影响索引（必需；单仓可缺省） |
 | `surface-routing.json` | Lead / project-surface 流程 | 承载面路由与扫描预算（与 `surface-map.md` 配合） |
+| `change-coupling-closure.json` | Lead（可选） | 项目已声明 `coupling_role_ids` 时，用于记录本 epic 的 `required_role_ids` 与 `exemptions`；未启用 taxonomy 时可缺省 |
 | `challenge-report.md` | challenger | 挑战报告（须含 `## Summary`） |
 | `scenario-coverage.json` | Lead 汇总 | `SCN-xxx` 到 REQ/CHK/DEC/UNK 的结构化映射 |
 | `surface-map.md` | project-surface-router | 需求→代码路由（若执行路由步骤） |

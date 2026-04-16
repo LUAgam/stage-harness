@@ -64,6 +64,99 @@ class HarnessctlClarifyAuditTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)["epic_id"]
 
+    def _write_minimal_full_clarify_artifacts(self, tmp_path: Path, epic_id: str) -> Path:
+        features_dir = tmp_path / ".harness" / "features" / epic_id
+        write_json(
+            features_dir / "domain-frame.json",
+            {
+                "epic_id": epic_id,
+                "version": "1.0",
+                "business_goals": ["Keep clarify artifacts canonical"],
+                "domain_constraints": ["No repo-specific shortcuts"],
+                "semantic_signals": [],
+                "candidate_edge_cases": [],
+                "candidate_open_questions": [],
+            },
+        )
+        write_json(
+            features_dir / "generated-scenarios.json",
+            {
+                "epic_id": epic_id,
+                "version": "1.0",
+                "scenarios": [],
+            },
+        )
+        write_json(
+            features_dir / "scenario-coverage.json",
+            {
+                "epic_id": epic_id,
+                "version": "1.0",
+                "scenarios": [],
+            },
+        )
+        (features_dir / "requirements-draft.md").write_text("### REQ-001\n\nDefined.\n", encoding="utf-8")
+        (features_dir / "challenge-report.md").write_text("## Summary\n\nok\n", encoding="utf-8")
+        (features_dir / "clarification-notes.md").write_text(
+            "\n".join(
+                [
+                    "## Domain Frame",
+                    "",
+                    "Ctx.",
+                    "",
+                    "## 六轴澄清覆盖",
+                    "- StateAndTime / 行为与流程: covered",
+                    "- ConstraintsAndConflict / 规则与边界: covered",
+                    "- CostAndCapacity / 规模与代价: covered",
+                    "- CrossSurfaceConsistency / 多入口: covered",
+                    "- OperationsAndRecovery / 运行与维护: covered",
+                    "- SecurityAndIsolation / 权限与隔离: covered",
+                    "",
+                    "## Unknowns 与待确认决策",
+                    "- 本轮无待确认",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (features_dir / "impact-scan.md").write_text(
+            "## Blast Radius Summary\n\nx\n\n## High Impact Surfaces\n\n- src/\n\n## Medium Impact Surfaces\n\n- docs/\n",
+            encoding="utf-8",
+        )
+        write_json(
+            features_dir / "surface-routing.json",
+            {
+                "epic": epic_id,
+                "created_at": "",
+                "surfaces": [{"type": "code_repository", "path": "src/"}],
+            },
+        )
+        write_json(
+            features_dir / "unknowns-ledger.json",
+            {
+                "version": "1.0",
+                "epic_id": epic_id,
+                "entries": [],
+                "summary": {"total": 0, "open": 0, "resolved_in_spec": 0, "resolved_in_plan": 0, "resolved_in_verify": 0, "deferred": 0},
+            },
+        )
+        write_json(
+            features_dir / "decision-bundle.json",
+            {"version": "1.0", "epic_id": epic_id, "stage": "CLARIFY", "decisions": []},
+        )
+        write_json(
+            features_dir / "decision-packet.json",
+            {
+                "version": "1.0",
+                "epic_id": epic_id,
+                "stage": "CLARIFY",
+                "packet_id": "DP-001",
+                "created_at": "",
+                "questions": [],
+                "auto_release_if_all_answered": True,
+            },
+        )
+        return features_dir
+
     def test_stage_gate_multi_repo_requires_cross_repo_impact_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -234,6 +327,207 @@ class HarnessctlClarifyAuditTests(unittest.TestCase):
             )
             ok = run_harnessctl(tmp_path, "stage-gate", "check", "CLARIFY", "--epic-id", epic_id)
             self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+
+    def test_stage_gate_warns_when_required_coupling_role_is_uncovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path, "Need coupling closure warnings")
+            features_dir = self._write_minimal_full_clarify_artifacts(tmp_path, epic_id)
+            profile_path = tmp_path / ".harness" / "project-profile.yaml"
+            profile_path.write_text(
+                "\n".join(
+                    [
+                        "type: unknown",
+                        "risk_level: medium",
+                        "primary_language: unknown",
+                        "build_tool: unknown",
+                        "test_framework: unknown",
+                        "has_database: null",
+                        "has_auth: null",
+                        "has_docker: null",
+                        "has_ci: null",
+                        "estimated_size: unknown",
+                        "workspace_mode: single-repo",
+                        "primary_surfaces: []",
+                        "check_focus: []",
+                        "coupling_role_ids:",
+                        "  - role.api_contract",
+                        "  - role.runtime_support",
+                        "intensity: {}",
+                        "scan: {}",
+                        'notes: ""',
+                        'framework: ""',
+                        "confidence: 0.9",
+                        "overrides: {}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            write_json(
+                features_dir / "surface-routing.json",
+                {
+                    "epic": epic_id,
+                    "created_at": "",
+                    "surfaces": [
+                        {
+                            "type": "code_repository",
+                            "path": "src/",
+                            "serves_roles": ["role.api_contract"],
+                        }
+                    ],
+                },
+            )
+            write_json(
+                features_dir / "change-coupling-closure.json",
+                {
+                    "version": "1.0",
+                    "epic_id": epic_id,
+                    "required_role_ids": ["role.api_contract", "role.runtime_support"],
+                    "exemptions": [],
+                },
+            )
+
+            result = run_harnessctl(tmp_path, "stage-gate", "check", "CLARIFY", "--epic-id", epic_id)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("required_role_ids not covered", result.stdout)
+
+    def test_stage_gate_strict_blocks_invalid_coupling_exemption(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path, "Need strict coupling closure validation")
+            features_dir = self._write_minimal_full_clarify_artifacts(tmp_path, epic_id)
+            harness_dir = tmp_path / ".harness"
+            write_json(
+                harness_dir / "config.json",
+                {
+                    "clarify_closure_mode": "full",
+                    "clarify_signal_gate_enabled": True,
+                    "clarify_deep_dive_enabled": True,
+                    "clarify_deep_dive_gate_strict": False,
+                    "coupling_closure_gate_mode": "strict",
+                },
+            )
+            (harness_dir / "project-profile.yaml").write_text(
+                "\n".join(
+                    [
+                        "type: unknown",
+                        "risk_level: medium",
+                        "primary_language: unknown",
+                        "build_tool: unknown",
+                        "test_framework: unknown",
+                        "has_database: null",
+                        "has_auth: null",
+                        "has_docker: null",
+                        "has_ci: null",
+                        "estimated_size: unknown",
+                        "workspace_mode: single-repo",
+                        "primary_surfaces: []",
+                        "check_focus: []",
+                        "coupling_role_ids:",
+                        "  - role.runtime_support",
+                        "intensity: {}",
+                        "scan: {}",
+                        'notes: ""',
+                        'framework: ""',
+                        "confidence: 0.9",
+                        "overrides: {}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            write_json(
+                features_dir / "change-coupling-closure.json",
+                {
+                    "version": "1.0",
+                    "epic_id": epic_id,
+                    "required_role_ids": ["role.runtime_support"],
+                    "exemptions": [
+                        {
+                            "role_id": "role.runtime_support",
+                            "binds_to": "NOTE-001",
+                            "rationale": "invalid on purpose",
+                        }
+                    ],
+                },
+            )
+
+            result = run_harnessctl(tmp_path, "stage-gate", "check", "CLARIFY", "--epic-id", epic_id)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must reference DEC-* or UNK-*", result.stdout)
+
+    def test_plan_gate_warns_when_required_coupling_role_is_uncovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path, "Need plan-stage coupling warning")
+            features_dir = self._write_minimal_full_clarify_artifacts(tmp_path, epic_id)
+            (tmp_path / ".harness" / "project-profile.yaml").write_text(
+                "\n".join(
+                    [
+                        "type: unknown",
+                        "risk_level: medium",
+                        "primary_language: unknown",
+                        "build_tool: unknown",
+                        "test_framework: unknown",
+                        "has_database: null",
+                        "has_auth: null",
+                        "has_docker: null",
+                        "has_ci: null",
+                        "estimated_size: unknown",
+                        "workspace_mode: single-repo",
+                        "primary_surfaces: []",
+                        "check_focus: []",
+                        "coupling_role_ids:",
+                        "  - role.api_contract",
+                        "  - role.runtime_support",
+                        "intensity: {}",
+                        "scan: {}",
+                        'notes: ""',
+                        'framework: ""',
+                        "confidence: 0.9",
+                        "overrides: {}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (features_dir / "bridge-spec.md").write_text("bridge\n", encoding="utf-8")
+            write_json(
+                features_dir / "coverage-matrix.json",
+                {"mappings": [], "unmapped_risks": []},
+            )
+            write_json(
+                tmp_path / ".harness" / "tasks" / f"{epic_id}.1.json",
+                {"id": f"{epic_id}.1", "status": "pending"},
+            )
+            write_json(
+                features_dir / "surface-routing.json",
+                {
+                    "epic": epic_id,
+                    "created_at": "",
+                    "surfaces": [
+                        {
+                            "type": "code_repository",
+                            "path": "src/",
+                            "serves_roles": ["role.api_contract"],
+                        }
+                    ],
+                },
+            )
+            write_json(
+                features_dir / "change-coupling-closure.json",
+                {
+                    "version": "1.0",
+                    "epic_id": epic_id,
+                    "required_role_ids": ["role.api_contract", "role.runtime_support"],
+                    "exemptions": [],
+                },
+            )
+
+            result = run_harnessctl(tmp_path, "stage-gate", "check", "PLAN", "--epic-id", epic_id)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("required_role_ids not covered", result.stdout)
 
     def test_audit_show_summarizes_clarify_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

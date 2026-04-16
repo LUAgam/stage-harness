@@ -39,6 +39,8 @@ STRICT_SCENARIO_ID_RE = re.compile(r"^SCN-\d+$", re.IGNORECASE)
 SCENARIO_COVERAGE_ALLOWED_STATUSES: frozenset[str] = frozenset(
     {"covered", "needs_decision", "deferred", "dropped_invalid"}
 )
+COUPLING_ROLE_ID_RE = re.compile(r"^role\.[a-z0-9_.-]+$", re.IGNORECASE)
+COUPLING_EXEMPTION_BIND_RE = re.compile(r"^(?:DEC|UNK)-\d+$", re.IGNORECASE)
 
 
 def domain_frame_missing_required_keys(data: dict) -> list[str]:
@@ -170,6 +172,250 @@ def scenario_coverage_strict_errors(data: object) -> list[str]:
                 f"scenarios[{idx}] missing non-empty `mapped_to` array when status != dropped_invalid"
             )
     return errors
+
+
+def _normalized_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = str(item).strip()
+        if not text:
+            continue
+        key = text.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def coupling_role_ids_from_profile(data: object) -> list[str]:
+    if not isinstance(data, dict):
+        return []
+    return _normalized_string_list(data.get("coupling_role_ids"))
+
+
+def profile_coupling_role_errors(data: object) -> list[str]:
+    if not isinstance(data, dict):
+        return []
+    if "coupling_role_ids" not in data:
+        return []
+    role_ids = data.get("coupling_role_ids")
+    if not isinstance(role_ids, list):
+        return ["project-profile.yaml (`coupling_role_ids` must be a YAML list when present)"]
+
+    errors: list[str] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(role_ids):
+        text = str(item).strip()
+        if not text:
+            errors.append(
+                f"project-profile.yaml (`coupling_role_ids[{idx}]` must be a non-empty string)"
+            )
+            continue
+        if not COUPLING_ROLE_ID_RE.fullmatch(text):
+            errors.append(
+                "project-profile.yaml "
+                f"(`coupling_role_ids[{idx}]` has invalid role id {text!r}; expected role.<name>)"
+            )
+            continue
+        key = text.upper()
+        if key in seen:
+            errors.append(
+                f"project-profile.yaml (`coupling_role_ids[{idx}]` duplicates role id {text!r})"
+            )
+            continue
+        seen.add(key)
+    return errors
+
+
+def surface_routing_coupling_errors(data: object, known_role_ids: list[str]) -> list[str]:
+    if not isinstance(data, dict):
+        return []
+    surfaces = data.get("surfaces")
+    if not isinstance(surfaces, list):
+        return []
+
+    known_roles_upper = {role.upper() for role in known_role_ids}
+    errors: list[str] = []
+    for idx, surface in enumerate(surfaces):
+        if not isinstance(surface, dict) or "serves_roles" not in surface:
+            continue
+        serves_roles = surface.get("serves_roles")
+        if not isinstance(serves_roles, list) or len(serves_roles) == 0:
+            errors.append(
+                f"surface-routing.json (surfaces[{idx}].serves_roles must be a non-empty array when present)"
+            )
+            continue
+        seen: set[str] = set()
+        for role_idx, raw_role in enumerate(serves_roles):
+            role_id = str(raw_role).strip()
+            if not role_id:
+                errors.append(
+                    f"surface-routing.json (surfaces[{idx}].serves_roles[{role_idx}] must be a non-empty string)"
+                )
+                continue
+            if not COUPLING_ROLE_ID_RE.fullmatch(role_id):
+                errors.append(
+                    "surface-routing.json "
+                    f"(surfaces[{idx}].serves_roles[{role_idx}] has invalid role id {role_id!r}; expected role.<name>)"
+                )
+                continue
+            role_key = role_id.upper()
+            if role_key in seen:
+                errors.append(
+                    f"surface-routing.json (surfaces[{idx}].serves_roles[{role_idx}] duplicates role id {role_id!r})"
+                )
+                continue
+            seen.add(role_key)
+            if known_roles_upper and role_key not in known_roles_upper:
+                errors.append(
+                    "surface-routing.json "
+                    f"(surfaces[{idx}].serves_roles[{role_idx}] references unknown role id {role_id!r})"
+                )
+    return errors
+
+
+def change_coupling_closure_errors(data: object, known_role_ids: list[str]) -> list[str]:
+    if not isinstance(data, dict):
+        return ["change-coupling-closure.json (root must be a JSON object)"]
+
+    errors: list[str] = []
+    if not _non_empty_string(data.get("version")):
+        errors.append("change-coupling-closure.json (missing non-empty `version`)")
+
+    required_role_ids = data.get("required_role_ids")
+    if required_role_ids is not None and not isinstance(required_role_ids, list):
+        errors.append("change-coupling-closure.json (`required_role_ids` must be a JSON array when present)")
+
+    exemptions = data.get("exemptions")
+    if exemptions is not None and not isinstance(exemptions, list):
+        errors.append("change-coupling-closure.json (`exemptions` must be a JSON array when present)")
+
+    known_roles_upper = {role.upper() for role in known_role_ids}
+    seen_required: set[str] = set()
+    for idx, raw_role in enumerate(required_role_ids or []):
+        role_id = str(raw_role).strip()
+        if not role_id:
+            errors.append(
+                f"change-coupling-closure.json (`required_role_ids[{idx}]` must be a non-empty string)"
+            )
+            continue
+        if not COUPLING_ROLE_ID_RE.fullmatch(role_id):
+            errors.append(
+                "change-coupling-closure.json "
+                f"(`required_role_ids[{idx}]` has invalid role id {role_id!r}; expected role.<name>)"
+            )
+            continue
+        role_key = role_id.upper()
+        if role_key in seen_required:
+            errors.append(
+                f"change-coupling-closure.json (`required_role_ids[{idx}]` duplicates role id {role_id!r})"
+            )
+            continue
+        seen_required.add(role_key)
+        if known_roles_upper and role_key not in known_roles_upper:
+            errors.append(
+                f"change-coupling-closure.json (`required_role_ids[{idx}]` references unknown role id {role_id!r})"
+            )
+
+    seen_exempt: set[str] = set()
+    for idx, item in enumerate(exemptions or []):
+        if not isinstance(item, dict):
+            errors.append(f"change-coupling-closure.json (`exemptions[{idx}]` must be a JSON object)")
+            continue
+        role_id = str(item.get("role_id", "")).strip()
+        if not role_id:
+            errors.append(f"change-coupling-closure.json (`exemptions[{idx}].role_id` is required)")
+            continue
+        if not COUPLING_ROLE_ID_RE.fullmatch(role_id):
+            errors.append(
+                "change-coupling-closure.json "
+                f"(`exemptions[{idx}].role_id` has invalid role id {role_id!r}; expected role.<name>)"
+            )
+            continue
+        role_key = role_id.upper()
+        if role_key in seen_exempt:
+            errors.append(
+                f"change-coupling-closure.json (`exemptions[{idx}].role_id` duplicates role id {role_id!r})"
+            )
+        seen_exempt.add(role_key)
+        if known_roles_upper and role_key not in known_roles_upper:
+            errors.append(
+                f"change-coupling-closure.json (`exemptions[{idx}].role_id` references unknown role id {role_id!r})"
+            )
+        binds_to = str(item.get("binds_to", "")).strip()
+        if not COUPLING_EXEMPTION_BIND_RE.fullmatch(binds_to):
+            errors.append(
+                "change-coupling-closure.json "
+                f"(`exemptions[{idx}].binds_to` must reference DEC-* or UNK-*, got {binds_to!r})"
+            )
+    return errors
+
+
+def change_coupling_closure_warnings(
+    closure_data: object,
+    surface_routing_data: object,
+    known_role_ids: list[str],
+) -> list[str]:
+    if not isinstance(closure_data, dict):
+        return []
+
+    required_roles = _normalized_string_list(closure_data.get("required_role_ids"))
+    if not required_roles:
+        return []
+
+    routed_roles: set[str] = set()
+    if isinstance(surface_routing_data, dict):
+        surfaces = surface_routing_data.get("surfaces")
+        if isinstance(surfaces, list):
+            for surface in surfaces:
+                if not isinstance(surface, dict):
+                    continue
+                for role_id in _normalized_string_list(surface.get("serves_roles")):
+                    routed_roles.add(role_id.upper())
+
+    exempt_roles: set[str] = set()
+    exemptions = closure_data.get("exemptions")
+    if isinstance(exemptions, list):
+        for item in exemptions:
+            if not isinstance(item, dict):
+                continue
+            role_id = str(item.get("role_id", "")).strip()
+            if role_id:
+                exempt_roles.add(role_id.upper())
+
+    warnings: list[str] = []
+    uncovered = [role_id for role_id in required_roles if role_id.upper() not in routed_roles and role_id.upper() not in exempt_roles]
+    if uncovered:
+        warnings.append(
+            "change-coupling-closure.json "
+            f"(required_role_ids not covered by surface-routing.json or exemptions: {', '.join(uncovered)})"
+        )
+
+    unused_exemptions = []
+    known_roles_upper = {role.upper() for role in known_role_ids}
+    exemption_role_values = []
+    if isinstance(exemptions, list):
+        for item in exemptions:
+            if isinstance(item, dict):
+                exemption_role_values.append(item.get("role_id"))
+    required_roles_upper = {r.upper() for r in required_roles}
+    for role_id in _normalized_string_list(exemption_role_values):
+        role_upper = role_id.upper()
+        if role_upper not in required_roles_upper:
+            unused_exemptions.append(role_id)
+        elif known_roles_upper and role_upper not in known_roles_upper:
+            unused_exemptions.append(role_id)
+    if unused_exemptions:
+        warnings.append(
+            "change-coupling-closure.json "
+            f"(exemptions reference role_ids outside required_role_ids: {', '.join(unused_exemptions)})"
+        )
+
+    return warnings
 
 
 CLARIFY_SIGNAL_RULES: list[dict] = [
