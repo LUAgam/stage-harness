@@ -68,11 +68,13 @@ harnessctl state transition sh-1-rbac SPEC
 
 | 层 | 产物 | 作用 |
 |----|------|------|
-| 索引与契约 | `.harness/repo-catalog.yaml`（multi-repo）、`.harness/features/<epic-id>/cross-repo-impact-index.json` | 先定「哪些仓、哪些契约」再下钻 |
+| 索引与契约 | `.harness/repo-catalog.yaml`（multi-repo）、`.harness/features/<epic-id>/cross-repo-impact-index.json` | 先定「哪些仓、哪些契约」再下钻；multi-repo 时 `cross-repo-impact-index.json` 还需带 `fanout_decision`（`repo_wave` / `single_agent`）说明本轮 fan-out 决策，并包含非空 `reason` 与 `repo_ids` |
 | 路由与预算 | `.harness/project-profile.yaml` 中 `workspace_mode` 与 `scan.*`、`.harness/features/<epic-id>/surface-routing.json` | 限定路径、`repo_id`、`dive_strategy`、`scan_budget`、`evidence_level` |
 | 知识与回源 | `.harness/memory/codemaps/<repo_id>/*.md` | 热点模块摘要；非真相源，冲突时以源码与契约为准 |
 
-CLARIFY 中 `impact-analyst` 负责 `impact-scan.md`；multi-repo 时另写 `cross-repo-impact-index.json`。Lead / `project-surface` 生成 `surface-routing.json`。PLAN 各 scout 默认只在该路由与 codemap 提示范围内工作。VERIFY 的 reviewer 优先审查路由内 diff，避免对未登记范围全仓 Grep。
+CLARIFY 中 `impact-analyst` 负责 `impact-scan.md`；multi-repo 时另写 `cross-repo-impact-index.json`。该 JSON 现要求带最小 `fanout_decision` 契约：`mode` 仅允许 `repo_wave` / `single_agent`，`reason` 为非空字符串，`repo_ids` 表示本轮需要按仓独立 fan-out 深扫的 catalog `repo_id` 列表；`repo_wave` 时 `repo_ids` 非空，`single_agent` 时 `repo_ids` 必须为空数组 `[]`。Lead / `project-surface` 生成 `surface-routing.json`。PLAN 各 scout 默认只在该路由与 codemap 提示范围内工作。VERIFY 的 reviewer 优先审查路由内 diff，避免对未登记范围全仓 Grep。
+
+审计侧，`execution-summary.json` 会保留总量字段 `parallel_waves_completed`，并额外记录 `repo_fanout_waves_completed`。其中 `repo_fanout_waves_completed` 只统计 repo-scope `parallel_wave_completed`；`fanout_used` / `fanout_children_count` 优先根据 repo-scope `parallel_wave_completed` 推导；若缺少该类 trace，multi-repo 下允许从 `cross-repo-impact-index.json.fanout_decision` 做 artifact fallback。
 
 ---
 

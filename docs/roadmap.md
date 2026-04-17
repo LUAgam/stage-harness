@@ -332,12 +332,14 @@
 - 已支持 `workspace_mode: multi-repo`
 - 已有 `.harness/repo-catalog.yaml`
 - 已有 `cross-repo-impact-index.json`
+- `cross-repo-impact-index.json` 已带最小 `fanout_decision` 契约，可显式区分 `repo_wave` 与 `single_agent`
 - 已有 `surface-routing.json` 和扫描预算
 - PLAN 阶段已有多 scout 并行研究设计
+- `execution-summary.json` 已补充 `repo_fanout_waves_completed`，可将 repo 级 fan-out 波次与总并行波次区分开来
 
 ### 仍需补强
 
-- fan-out / fan-in 收口流程还需更明确
+- fan-out / fan-in 收口流程在 EXECUTE / VERIFY 的统一约束仍需更明确
 - EXECUTE 的多仓并行边界和风险控制还不够成熟
 - `cross-repo verification`、`repo-level task lease` 仍未形成稳定能力
 

@@ -181,7 +181,7 @@ Stage-Harness 提供 11 个 slash 命令：
 2. **Intake**：Lead 产出简要结构化摘要（风险、预算、初始假设与开放问题）
 3. **领域预分析（必选）**：`domain-scout` 仅基于需求与画像 → `domain-frame.json`；Lead 写入 `clarification-notes.md` 的 **Domain Frame / 领域框架** 小节（非独立阶段）
 4. **需求分析**：`requirement-analyst`（输入含 `domain-frame.json`，如可用也消费 `generated-scenarios.json`）分解为 REQ-xxx → `requirements-draft.md`
-5. **影响扫描**：`impact-analyst` 扫描代码库 → `impact-scan.md`（与上一步并行）。**多仓**（`project-profile.yaml` 中 `workspace_mode: multi-repo`）时另写 `cross-repo-impact-index.json`：先 `repo-catalog` + 契约 `interfaces[]`，深扫仓数不超过 `scan.max_repos_deep_scan`；超出则 Risk Flags 要求收敛。若首轮 map 命中 3+ 主要模块、`risk_level=high` 或 broad/systemic，可在**内部**并行 fan-out，但对外仍只交付一份汇总后的 `impact-scan.md`
+5. **影响扫描**：`impact-analyst` 扫描代码库 → `impact-scan.md`（与上一步并行）。**多仓**（`project-profile.yaml` 中 `workspace_mode: multi-repo`）时另写 `cross-repo-impact-index.json`：先 `repo-catalog` + 契约 `interfaces[]`，深扫仓数不超过 `scan.max_repos_deep_scan`；超出则 Risk Flags 要求收敛。该文件现在还必须带结构化 **`fanout_decision`**，用于说明本轮是按仓 fan-out（`repo_wave`）还是保持单 agent（`single_agent`）。`fanout_decision` 的最小契约是：`mode`、非空 `reason`、以及 `repo_ids`（表示本轮需要按仓独立 fan-out 深扫的 catalog `repo_id` 列表）。其中 `repo_wave` 时 `repo_ids` 非空，`single_agent` 时 `repo_ids` 必须为空数组 `[]`。若首轮 map 命中 3+ 主要模块、`risk_level=high` 或 broad/systemic，可在**内部**并行 fan-out，但对外仍只交付一份汇总后的 `impact-scan.md`
 6. **挑战测试**：`challenger`（输入含 `domain-frame.json`）→ `challenge-report.md`（与影响扫描并行）；Critical/Warnings 须沉淀到台账或决策包
 7. **场景展开**：`scenario-expander`（输入含 `domain-frame.json`）→ `generated-scenarios.json`
 8. **语义归并**：Lead 汇总 `domain-frame`、`generated-scenarios`、`requirements-draft`、`challenge-report`，生成 `scenario-coverage.json`
@@ -201,7 +201,7 @@ Stage-Harness 提供 11 个 slash 命令：
 - `challenge-report.md` — 挑战报告（challenger，须含 `## Summary`）
 - `clarification-notes.md` — 澄清备忘录（**默认 full 也须含 Domain Frame / 领域框架 / 需求上下文 标题，以及六轴覆盖或极简绕行 + Unknowns 闭环**）
 - `impact-scan.md` — 影响扫描报告
-- `cross-repo-impact-index.json` — `workspace_mode: multi-repo` 时 **门禁必备**；单仓可缺省
+- `cross-repo-impact-index.json` — `workspace_mode: multi-repo` 时 **门禁必备**；单仓可缺省。当前需包含合法 **`fanout_decision`**：`mode`、非空 `reason`、以及 `repo_ids`；`mode=repo_wave` 时 `repo_ids` 非空，`mode=single_agent` 时 `repo_ids` 必须为空数组 `[]`
 - `surface-routing.json` — 承载面路由与扫描预算（**CLARIFY / PLAN 门禁必备**；`surfaces` 须非空）
 - `change-coupling-closure.json` — 可选联动闭包件；项目声明 `coupling_role_ids` 时，可为当前 epic 记录 `required_role_ids` 与 `exemptions`
 - `unknowns-ledger.json` — 未知问题台账
@@ -391,7 +391,8 @@ $HARNESSCTL clarify-selfcheck --epic-id sh-1-xxx
 
 1. 在 `.harness/project-profile.yaml` 设置 `workspace_mode: multi-repo`（可与 `harnessctl profile detect` 结果合并或手改）。
 2. 复制 `stage-harness/templates/repo-catalog.yaml` → `.harness/repo-catalog.yaml`，填写各 `repo_id`、`path`、`package_aliases` / `import_prefixes`（可选，利于依赖名映射到仓）。可用 `$HARNESSCTL profile discover-repo-aliases` 根据各仓根目录的清单文件**启发式补全**别名（默认 dry-run，`--write` 写回）。
-3. CLARIFY 阶段会生成 `cross-repo-impact-index.json` 与 `surface-routing.json`；扫描深度受 `scan.max_repos_deep_scan`、`scan.max_files_deep_read_per_scout` 等约束（见模板 `project-profile.yaml`）。
+3. CLARIFY 阶段会生成 `cross-repo-impact-index.json` 与 `surface-routing.json`；扫描深度受 `scan.max_repos_deep_scan`、`scan.max_files_deep_read_per_scout` 等约束（见模板 `project-profile.yaml`）。其中 `cross-repo-impact-index.json` 现在必须带 `fanout_decision`：包含 `mode`、非空 `reason` 和 `repo_ids`；`repo_wave` 表示按 catalog `repo_id` 做 repo 级 fan-out，`single_agent` 表示多仓已识别但本轮保持单 agent 收口，且 `repo_ids` 必须为空数组 `[]`。
+4. 审计查看时，`execution-summary.json` / `harnessctl audit show` 现在会额外区分 `repo_fanout_waves_completed`。它只统计 repo-scope `parallel_wave_completed`；`fanout_used` / `fanout_children_count` 优先根据 repo-scope `parallel_wave_completed` 推导，若缺少该类 trace，才会回退到 multi-repo 的 artifact 证据。
 
 ### Q: 多仓 Epic 怎么记录每个 repo 的 branch / worktree？
 

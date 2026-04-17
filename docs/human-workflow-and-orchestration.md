@@ -25,7 +25,7 @@ Stage-Harness 把人类开发里「先想清楚再动手」的习惯，外显成
 | 人类在做什么 | 插件阶段 | 主要命令 | 典型产物（Epic 目录下，节选） |
 |--------------|----------|----------|-------------------------------|
 | 立项、建档、接住原始描述 | IDEA → CLARIFY | `/stage-harness:harness-start` | `.harness/` 初始化、`project-profile.yaml`、Epic 元数据、`state.json` |
-| 把需求说清楚、圈范围、列未知与决策 | CLARIFY | `/stage-harness:harness-clarify` | **默认（full）**：`clarification-notes.md`（含 [六轴澄清覆盖](usage.md) 或极简绕行）、`domain-frame.json`、`requirements-draft.md`、`impact-scan.md`、`surface-routing.json`、`challenge-report.md`、`generated-scenarios.json`、`scenario-coverage.json`、multi-repo 时 `cross-repo-impact-index.json`、`unknowns-ledger.json`、`decision-bundle.json`、`decision-packet.json` 等。**`clarify_closure_mode=notes_only`** 时门禁可仅校验 `clarification-notes.md` 结构，未知与决策写入同文件即可（见 [usage.md](usage.md)） |
+| 把需求说清楚、圈范围、列未知与决策 | CLARIFY | `/stage-harness:harness-clarify` | **默认（full）**：`clarification-notes.md`（含 [六轴澄清覆盖](usage.md) 或极简绕行）、`domain-frame.json`、`requirements-draft.md`、`impact-scan.md`、`surface-routing.json`、`challenge-report.md`、`generated-scenarios.json`、`scenario-coverage.json`、multi-repo 时 `cross-repo-impact-index.json`（含 `fanout_decision`）、`unknowns-ledger.json`、`decision-bundle.json`、`decision-packet.json` 等。**`clarify_closure_mode=notes_only`** 时门禁可仅校验 `clarification-notes.md` 结构，未知与决策写入同文件即可（见 [usage.md](usage.md)） |
 | 把澄清结果写成正式规格 | SPEC | `/stage-harness:harness-spec` | `.harness/specs/{epic-id}.md`、`spec-council-notes.md` |
 | 把规格落成可执行任务与覆盖 | PLAN | `/stage-harness:harness-plan` | `bridge-spec.md`、`coverage-matrix.json`、`surface-routing.json`（与 CLARIFY 一致，门禁复验）、`.harness/tasks/`；可选先做 `codemap-audit.json` 以降级 stale 缓存 |
 | 按任务实现、测试、留痕 | EXECUTE | `/stage-harness:harness-work` | `receipts/`、代码变更 |
@@ -52,7 +52,7 @@ Stage-Harness 把人类开发里「先想清楚再动手」的习惯，外显成
 - **串行前置**：Intake → **`domain-scout`**（产出 `domain-frame.json`）→ Lead 写入 `clarification-notes` 中 Domain Frame 小节。
 - **可并行一批**（在同一批次内，输入主要依赖 epic、画像、`domain-frame.json`）：
   - `requirement-analyst` → `requirements-draft.md`
-  - `impact-analyst` → `impact-scan.md`（多仓时另有 `cross-repo-impact-index.json`）
+  - `impact-analyst` → `impact-scan.md`（多仓时另有 `cross-repo-impact-index.json`，并在其中用 `fanout_decision.mode` 明确记录是 `repo_wave` 还是 `single_agent`）
   - `challenger` → `challenge-report.md`
   - `scenario-expander` → `generated-scenarios.json`
 - **必须串行收口**：
@@ -70,6 +70,10 @@ Lead intake → domain-scout
   → [ 并行：requirement-analyst | impact-analyst | challenger | scenario-expander ]
   → Lead 语义归并 → unknowns / decisions →（用户确认）→ gate
 ```
+
+补充说明：
+- `repo_wave` 表示多仓分析在本轮按 catalog `repo_id` 做 repo 级 fan-out。
+- `single_agent` 表示虽然识别为 multi-repo，但本轮保持单 agent 收口；这同样是合法结果，只是 `cross-repo-impact-index.json` 里必须显式写明原因。
 
 #### SPEC
 

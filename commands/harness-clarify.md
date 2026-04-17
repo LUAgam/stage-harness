@@ -142,7 +142,7 @@ clarification-notes.md 必须包含：
 
 `impact-analyst` 读取 `project-profile.yaml`（含 `workspace_mode`、`scan.max_repos_deep_scan`、`scan.max_files_deep_read_per_scout`、`scan.max_subagents_wave`）后：
 
-- **多仓**（`workspace_mode: multi-repo`）：先对照 `.harness/repo-catalog.yaml` 做契约优先的 **Phase A**，写出 **`cross-repo-impact-index.json`**；深扫仓数不得超过 `max_repos_deep_scan`，超出须在 `impact-scan.md` 的 Risk Flags 中要求 Lead/用户收敛后再深扫。
+- **多仓**（`workspace_mode: multi-repo`）：先对照 `.harness/repo-catalog.yaml` 做契约优先的 **Phase A**，写出 **`cross-repo-impact-index.json`**；深扫仓数不得超过 `max_repos_deep_scan`，超出须在 `impact-scan.md` 的 Risk Flags 中要求 Lead/用户收敛后再深扫。该 JSON 现要求带 **`fanout_decision`**：`mode` 仅允许 `repo_wave` / `single_agent`，`reason` 为非空字符串；`repo_ids` 表示“本轮需要按仓独立 fan-out 深扫的 catalog `repo_id` 列表”。其中 `repo_wave` 时 `repo_ids` 必须非空，`single_agent` 时 `repo_ids` 必须为空数组 `[]`。
 - **单仓 / monorepo**：沿用 map → scatter → gather；若首轮 map 命中 **3+ 主要模块/目录**、或 `risk_level=high`、或 broad/systemic，可在**自身内部**使用并行 subagents，且受上述 `scan.*` 预算约束。
 - **承载面 hint 失效**：若 `primary_surfaces` 指向的路径不存在，只能进入**有界重定向**（顶层浅扫 + 预算内缩圈）；**禁止**直接退化为根目录 `**/*` 或等价全仓宽扫。若预算内仍无法定位，必须在 `impact-scan.md` 的 Risk Flags 中显式写出 evidence gap / retarget required。
 
@@ -153,6 +153,10 @@ clarification-notes.md 必须包含：
 ```bash
 # 产物路径：.harness/features/<epic-id>/impact-scan.md
 # multi-repo 时同目录：cross-repo-impact-index.json（见 stage-harness/templates/cross-repo-impact-index.json）
+# 其中 fanout_decision 为门禁必填：
+#   - mode: repo_wave | single_agent
+#   - reason: 非空字符串
+#   - repo_ids: repo_wave 时非空；single_agent 时必须为空数组
 # 由 Agent 直接写入（Markdown / JSON，无脚本依赖）
 ```
 
@@ -360,7 +364,7 @@ $HARNESSCTL stage-gate check CLARIFY --epic-id <epic-id>
 
 检查项（以 `$HARNESSCTL stage-gate check CLARIFY` 为准）：
 
-- **`clarify_closure_mode=full`（默认）**：`domain-frame.json`、`generated-scenarios.json`、`requirements-draft.md`、`challenge-report.md`（含 `## Summary`）、`clarification-notes.md`（含 **Domain Frame / 领域框架 / 需求上下文** 标题，且含六轴或极简绕行 + Unknowns 闭环）、`impact-scan.md`、`scenario-coverage.json`、`surface-routing.json`、`unknowns-ledger.json`、`decision-bundle.json`、`decision-packet.json`；多仓时尚需 `cross-repo-impact-index.json`。
+- **`clarify_closure_mode=full`（默认）**：`domain-frame.json`、`generated-scenarios.json`、`requirements-draft.md`、`challenge-report.md`（含 `## Summary`）、`clarification-notes.md`（含 **Domain Frame / 领域框架 / 需求上下文** 标题，且含六轴或极简绕行 + Unknowns 闭环）、`impact-scan.md`、`scenario-coverage.json`、`surface-routing.json`、`unknowns-ledger.json`、`decision-bundle.json`、`decision-packet.json`；多仓时尚需带合法 **`fanout_decision`** 的 `cross-repo-impact-index.json`。
 - **`clarify_closure_mode=notes_only`**：仅 **`clarification-notes.md`** 须存在且通过 CLI 内置结构校验（六轴表或极简绕行、闭环小节）。
 - **`clarify_signal_gate_enabled=true`（默认）**：若 `domain-frame.json` / `generated-scenarios.json` 命中高/中置信度语义信号，则对应轴不得以 `not_applicable` 跳过；命中轴需显式写成 `covered` 或 `unknown`。简单需求若无命中信号，不会额外加重。
 - **`clarify_deep_dive_enabled=true`**：若高风险信号与 `requirements-draft.md` 中的 `UNCLEAR` / `AMBIGUOUS` 同时存在，CLI 会给出 deep-dive 提示；若启用 **`clarify_deep_dive_gate_strict=true`**，且仍缺少 `deep-dive-*.md`，则 CLARIFY 直接阻断。
