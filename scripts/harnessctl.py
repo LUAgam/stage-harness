@@ -538,8 +538,10 @@ def _write_execution_summary(h: Path, epic_id: str) -> dict:
     steps_completed: list[str] = []
     steps_seen: set[str] = set()
     parallel_waves_completed = 0
-    fanout_used = False
-    fanout_children_count = 0
+    repo_fanout_waves_completed = 0
+    legacy_fanout_used = False
+    legacy_fanout_children_count = 0
+    repo_scope_wave_payloads: list[dict] = []
     decision_packet_generated = False
     pending_decisions_synced = False
     latest_pause_reason = ""
@@ -562,16 +564,19 @@ def _write_execution_summary(h: Path, epic_id: str) -> dict:
                 steps_seen.add(step_name)
                 steps_completed.append(step_name)
             if payload.get("fanout_used") or str(payload.get("execution_mode", "")).strip() == "fan_out_team":
-                fanout_used = True
+                legacy_fanout_used = True
             try:
-                fanout_children_count = max(
-                    fanout_children_count,
+                legacy_fanout_children_count = max(
+                    legacy_fanout_children_count,
                     int(payload.get("fanout_children_count", 0) or 0),
                 )
             except (TypeError, ValueError):
                 pass
         elif event_type == "parallel_wave_completed":
             parallel_waves_completed += 1
+            if str(payload.get("scope_type", "")).strip() == "repo":
+                repo_fanout_waves_completed += 1
+                repo_scope_wave_payloads.append(payload)
         elif event_type == "decision_packet_generated":
             decision_packet_generated = True
         elif event_type == "pending_decisions_synced":
@@ -622,12 +627,47 @@ def _write_execution_summary(h: Path, epic_id: str) -> dict:
     guard_ev = _pick_latest_guard_event(events)
     task_summary = _task_summary_from_events(events)
 
+    repo_wave_children_count = 0
+    for wp in repo_scope_wave_payloads:
+        try:
+            fc = int(wp.get("fanout_children_count", 0) or 0)
+        except (TypeError, ValueError):
+            fc = 0
+        rids = wp.get("repo_ids")
+        n_repo = len(rids) if isinstance(rids, list) else 0
+        wave_n = fc if fc > 0 else n_repo
+        repo_wave_children_count = max(repo_wave_children_count, wave_n)
+
+    artifact_fanout_used = False
+    artifact_fanout_children_count = 0
+    if _workspace_mode(h) == "multi-repo":
+        cri_path = h / "features" / epic_id / "cross-repo-impact-index.json"
+        if cri_path.exists():
+            try:
+                cri_obj = json.loads(cri_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                cri_obj = None
+            if isinstance(cri_obj, dict):
+                fd = cri_obj.get("fanout_decision")
+                if isinstance(fd, dict) and str(fd.get("mode", "")).strip() == "repo_wave":
+                    artifact_fanout_used = True
+                    rids = fd.get("repo_ids")
+                    artifact_fanout_children_count = len(rids) if isinstance(rids, list) else 0
+
+    fanout_used = bool(repo_scope_wave_payloads) or artifact_fanout_used or legacy_fanout_used
+    fanout_children_count = max(
+        legacy_fanout_children_count,
+        repo_wave_children_count,
+        artifact_fanout_children_count,
+    )
+
     summary = {
         "epic_id": epic_id,
         "current_stage": state.get("current_stage", "") if isinstance(state, dict) else "",
         "latest_run_id": latest_run_id,
         "steps_completed": steps_completed,
         "parallel_waves_completed": parallel_waves_completed,
+        "repo_fanout_waves_completed": repo_fanout_waves_completed,
         "fanout_used": fanout_used,
         "fanout_children_count": fanout_children_count,
         "decision_packet_generated": decision_packet_generated,
@@ -4306,18 +4346,53 @@ def _coupling_closure_gate_mode(harness_cfg: dict) -> str:
     return raw if raw in {"off", "warn", "strict"} else "warn"
 
 
+_CRI_FANOUT_MODES = frozenset({"repo_wave", "single_agent"})
+
+
 def _cross_repo_impact_index_errors(data: object) -> list[str]:
+    errors: list[str] = []
     if not isinstance(data, dict):
         return ["root must be a JSON object"]
     repos = data.get("repos")
     if not isinstance(repos, list) or len(repos) == 0:
-        return ["repos must be a non-empty JSON array"]
-    if not any(
+        errors.append("repos must be a non-empty JSON array")
+    elif not any(
         isinstance(item, dict) and str(item.get("repo_id", "")).strip()
         for item in repos
     ):
-        return ["repos must include at least one object with non-empty `repo_id`"]
-    return []
+        errors.append("repos must include at least one object with non-empty `repo_id`")
+
+    fd = data.get("fanout_decision")
+    if "fanout_decision" not in data:
+        errors.append("missing required top-level key `fanout_decision`")
+    elif not isinstance(fd, dict):
+        errors.append("fanout_decision must be a JSON object")
+    else:
+        mode = str(fd.get("mode", "")).strip()
+        if not mode:
+            errors.append("fanout_decision.mode must be a non-empty string")
+        elif mode not in _CRI_FANOUT_MODES:
+            errors.append(
+                "fanout_decision.mode must be one of: repo_wave, single_agent "
+                f"(got {mode!r})"
+            )
+        reason = str(fd.get("reason", "")).strip()
+        if not reason:
+            errors.append("fanout_decision.reason must be a non-empty string")
+        repo_ids = fd.get("repo_ids")
+        if not isinstance(repo_ids, list):
+            errors.append("fanout_decision.repo_ids must be a JSON array")
+        else:
+            non_empty_ids = [x for x in repo_ids if str(x).strip()]
+            if mode == "repo_wave" and not non_empty_ids:
+                errors.append(
+                    "fanout_decision.repo_ids must be non-empty when mode is repo_wave"
+                )
+            elif mode == "single_agent" and non_empty_ids:
+                errors.append(
+                    "fanout_decision.repo_ids must be empty when mode is single_agent"
+                )
+    return errors
 
 
 def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
@@ -5821,6 +5896,7 @@ def cmd_audit_show(args, h: Path) -> None:
         print(f"  latest_run_id:            {summary.get('latest_run_id', '') or 'N/A'}")
         print(f"  steps_completed:          {', '.join(summary.get('steps_completed', [])) or 'N/A'}")
         print(f"  parallel_waves_completed: {summary.get('parallel_waves_completed', 0)}")
+        print(f"  repo_fanout_waves_completed: {summary.get('repo_fanout_waves_completed', 0)}")
         print(f"  fanout_used:              {'yes' if summary.get('fanout_used') else 'no'}")
         print(f"  fanout_children_count:    {summary.get('fanout_children_count', 0)}")
         state = "generated" if summary.get("decision_packet_generated") else "not_generated"

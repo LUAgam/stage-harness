@@ -1,12 +1,23 @@
 {
   "epic": "<epic-id>",
   "generated_at": "",
+  "fanout_decision": {
+    "mode": "repo_wave",
+    "reason": "Multiple catalog repos in scope; parallelize by repo before per-repo subagents",
+    "repo_ids": ["example-service", "example-worker"]
+  },
   "repos": [
     {
       "repo_id": "example-service",
       "impact": "high",
       "reason": "REQ touches user API implemented here",
       "confidence": "high"
+    },
+    {
+      "repo_id": "example-worker",
+      "impact": "medium",
+      "reason": "Background worker consumes the same shared contract",
+      "confidence": "medium"
     }
   ],
   "interfaces": [

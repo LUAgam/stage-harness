@@ -56,7 +56,7 @@ Extract: key nouns (entities), verbs (operations), and named components.
 5. **Phase B — deep pass:** Only inside the **Top N** repos, run the same “major module + subagent” logic as Section 4, but:
    - Fan-out **by repo** first when multiple repos remain in scope; within each repo, at most `scan.max_subagents_wave` parallel tasks.
    - Each subagent prompt must include the repo root path from catalog and a **file budget** (`<= scan.max_files_deep_read_per_scout` concrete paths to read).
-6. Write **`.harness/features/<epic-id>/cross-repo-impact-index.json`** using the schema in `stage-harness/templates/cross-repo-impact-index.json` (same `epic`, `repos`, `interfaces`, `shared_artifacts`, `excluded_repos`). Do not omit it in multi-repo mode, and do not emit a placeholder without a real `repos[]` list.
+6. Write **`.harness/features/<epic-id>/cross-repo-impact-index.json`** using the schema in `stage-harness/templates/cross-repo-impact-index.json` (same `epic`, `repos`, `interfaces`, `shared_artifacts`, `excluded_repos`). **You must also include a top-level `fanout_decision` object** (required by CLARIFY gate): `mode` (`repo_wave` or `single_agent`), non-empty `reason`, and `repo_ids` (JSON array — use the list of catalog `repo_id` values you intend to fan out to when `mode` is `repo_wave`; if staying `single_agent`, `repo_ids` must be an empty array and you must still record why). Do not omit the file in multi-repo mode, and do not emit a placeholder without a real `repos[]` list.
 
 ### 4. Single-repo / monorepo: Global Reconnaissance & Scatter (Subagent / Agent Teams Mode)
 
@@ -121,7 +121,7 @@ If blast radius is `broad` or `systemic`:
 
 Write to `.harness/features/<epic-id>/impact-scan.md`.
 
-When `workspace_mode: multi-repo`, also write `.harness/features/<epic-id>/cross-repo-impact-index.json` (see Section 3). This is a required writer-side artifact for CLARIFY full mode in multi-repo workspaces.
+When `workspace_mode: multi-repo`, also write `.harness/features/<epic-id>/cross-repo-impact-index.json` (see Section 3). This is a required writer-side artifact for CLARIFY full mode in multi-repo workspaces. The JSON **must** include **`fanout_decision`**: if you parallelize by catalog repo (repo-level fan-out), set `mode` to `repo_wave` and list those `repo_id` values under `repo_ids`; if you stay single-agent (sequential or tooling-limited), set `mode` to `single_agent`, explain in `reason`, and keep `repo_ids` as an empty array if no parallel repo wave is planned.
 
 The output must stay compatible with existing CLARIFY docs and downstream readers:
 - It MUST contain `## Blast Radius Summary`

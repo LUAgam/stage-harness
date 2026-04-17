@@ -325,6 +325,63 @@ class HarnessctlClarifyAuditTests(unittest.TestCase):
                     "excluded_repos": [],
                 },
             )
+            no_fd = run_harnessctl(tmp_path, "stage-gate", "check", "CLARIFY", "--epic-id", epic_id)
+            self.assertNotEqual(no_fd.returncode, 0)
+            self.assertIn("fanout_decision", no_fd.stdout)
+
+            write_json(
+                features_dir / "cross-repo-impact-index.json",
+                {
+                    "epic": epic_id,
+                    "repos": [{"repo_id": "repo-a", "path": "repo-a/"}],
+                    "interfaces": [],
+                    "shared_artifacts": [],
+                    "excluded_repos": [],
+                    "fanout_decision": {
+                        "mode": "repo_wave",
+                        "reason": "bad test data",
+                        "repo_ids": [],
+                    },
+                },
+            )
+            bad_wave = run_harnessctl(tmp_path, "stage-gate", "check", "CLARIFY", "--epic-id", epic_id)
+            self.assertNotEqual(bad_wave.returncode, 0)
+            self.assertIn("repo_ids must be non-empty when mode is repo_wave", bad_wave.stdout)
+
+            write_json(
+                features_dir / "cross-repo-impact-index.json",
+                {
+                    "epic": epic_id,
+                    "repos": [{"repo_id": "repo-a", "path": "repo-a/"}],
+                    "interfaces": [],
+                    "shared_artifacts": [],
+                    "excluded_repos": [],
+                    "fanout_decision": {
+                        "mode": "single_agent",
+                        "reason": "Stayed sequential for this epic",
+                        "repo_ids": ["repo-a"],
+                    },
+                },
+            )
+            dirty_single = run_harnessctl(tmp_path, "stage-gate", "check", "CLARIFY", "--epic-id", epic_id)
+            self.assertNotEqual(dirty_single.returncode, 0)
+            self.assertIn("repo_ids must be empty when mode is single_agent", dirty_single.stdout)
+
+            write_json(
+                features_dir / "cross-repo-impact-index.json",
+                {
+                    "epic": epic_id,
+                    "repos": [{"repo_id": "repo-a", "path": "repo-a/"}],
+                    "interfaces": [],
+                    "shared_artifacts": [],
+                    "excluded_repos": [],
+                    "fanout_decision": {
+                        "mode": "single_agent",
+                        "reason": "Stayed sequential for this epic",
+                        "repo_ids": [],
+                    },
+                },
+            )
             ok = run_harnessctl(tmp_path, "stage-gate", "check", "CLARIFY", "--epic-id", epic_id)
             self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
 
@@ -654,10 +711,280 @@ class HarnessctlClarifyAuditTests(unittest.TestCase):
             self.assertIn("domain-scout", payload["steps_completed"])
             self.assertNotIn("old-run-step", payload["steps_completed"])
             self.assertEqual(payload["parallel_waves_completed"], 1)
+            self.assertEqual(payload["repo_fanout_waves_completed"], 0)
             self.assertTrue(payload["fanout_used"])
             self.assertEqual(payload["fanout_children_count"], 3)
             self.assertTrue(payload["decision_packet_generated"])
             self.assertTrue(payload["pending_decisions_synced"])
+
+    def test_audit_parallel_wave_role_scope_does_not_count_repo_fanout_waves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path)
+            events = [
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "clarify_run_started",
+                    "payload": {"run_id": "clr-001"},
+                },
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "parallel_wave_completed",
+                    "payload": {
+                        "run_id": "clr-001",
+                        "wave_id": "wave-1",
+                        "scope_type": "role",
+                        "roles": ["requirement-analyst", "impact-analyst"],
+                    },
+                },
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "clarify_run_completed",
+                    "payload": {"run_id": "clr-001"},
+                },
+            ]
+            for event in events:
+                r = run_harnessctl(
+                    tmp_path,
+                    "patch",
+                    "trace",
+                    "--event-json",
+                    json.dumps(event, ensure_ascii=False),
+                    "--json",
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+            result = run_harnessctl(tmp_path, "audit", "show", "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["parallel_waves_completed"], 1)
+            self.assertEqual(payload["repo_fanout_waves_completed"], 0)
+            self.assertFalse(payload["fanout_used"])
+
+    def test_audit_parallel_wave_repo_scope_counts_repo_fanout_and_sets_fanout_used(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path)
+            events = [
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "clarify_run_started",
+                    "payload": {"run_id": "clr-001"},
+                },
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "parallel_wave_completed",
+                    "payload": {
+                        "run_id": "clr-001",
+                        "wave_id": "wave-r1",
+                        "scope_type": "repo",
+                        "repo_ids": ["svc-a", "svc-b"],
+                    },
+                },
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "clarify_run_completed",
+                    "payload": {"run_id": "clr-001"},
+                },
+            ]
+            for event in events:
+                r = run_harnessctl(
+                    tmp_path,
+                    "patch",
+                    "trace",
+                    "--event-json",
+                    json.dumps(event, ensure_ascii=False),
+                    "--json",
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+            result = run_harnessctl(tmp_path, "audit", "show", "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["parallel_waves_completed"], 1)
+            self.assertEqual(payload["repo_fanout_waves_completed"], 1)
+            self.assertTrue(payload["fanout_used"])
+            self.assertEqual(payload["fanout_children_count"], 2)
+
+    def test_audit_cross_repo_index_repo_wave_fallback_without_repo_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path)
+            features_dir = tmp_path / ".harness" / "features" / epic_id
+            profile_path = tmp_path / ".harness" / "project-profile.yaml"
+            profile_path.write_text(
+                "\n".join(
+                    [
+                        "type: unknown",
+                        "risk_level: medium",
+                        "primary_language: unknown",
+                        "build_tool: unknown",
+                        "test_framework: unknown",
+                        "has_database: null",
+                        "has_auth: null",
+                        "has_docker: null",
+                        "has_ci: null",
+                        "estimated_size: unknown",
+                        "workspace_mode: multi-repo",
+                        "primary_surfaces: []",
+                        "check_focus: []",
+                        "intensity: {}",
+                        "scan: {}",
+                        'notes: ""',
+                        'framework: ""',
+                        "confidence: 0.9",
+                        "overrides: {}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            write_json(
+                features_dir / "cross-repo-impact-index.json",
+                {
+                    "epic": epic_id,
+                    "repos": [{"repo_id": "svc-a", "impact": "high", "reason": "x", "confidence": "high"}],
+                    "interfaces": [],
+                    "shared_artifacts": [],
+                    "excluded_repos": [],
+                    "fanout_decision": {
+                        "mode": "repo_wave",
+                        "reason": "Parallel by repo per catalog",
+                        "repo_ids": ["svc-a", "svc-b"],
+                    },
+                },
+            )
+            events = [
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "clarify_run_started",
+                    "payload": {"run_id": "clr-001"},
+                },
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "step_completed",
+                    "payload": {
+                        "run_id": "clr-001",
+                        "step": "domain-scout",
+                        "execution_mode": "single_agent",
+                    },
+                },
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "clarify_run_completed",
+                    "payload": {"run_id": "clr-001"},
+                },
+            ]
+            for event in events:
+                r = run_harnessctl(
+                    tmp_path,
+                    "patch",
+                    "trace",
+                    "--event-json",
+                    json.dumps(event, ensure_ascii=False),
+                    "--json",
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+            result = run_harnessctl(tmp_path, "audit", "show", "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["parallel_waves_completed"], 0)
+            self.assertEqual(payload["repo_fanout_waves_completed"], 0)
+            self.assertTrue(payload["fanout_used"])
+            self.assertEqual(payload["fanout_children_count"], 2)
+
+    def test_audit_repo_wave_keeps_legacy_peak_when_repo_wave_width_is_smaller(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path)
+            events = [
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "clarify_run_started",
+                    "payload": {"run_id": "clr-001"},
+                },
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "impact-analyst",
+                    "event_type": "step_completed",
+                    "payload": {
+                        "run_id": "clr-001",
+                        "step": "impact-analysis",
+                        "agent_role": "impact-analyst",
+                        "execution_mode": "fan_out_team",
+                        "fanout_used": True,
+                        "fanout_children_count": 3,
+                    },
+                },
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "parallel_wave_completed",
+                    "payload": {
+                        "run_id": "clr-001",
+                        "wave_id": "wave-r1",
+                        "scope_type": "repo",
+                        "repo_ids": ["svc-a", "svc-b"],
+                    },
+                },
+                {
+                    "epic_id": epic_id,
+                    "stage": "CLARIFY",
+                    "source": "command",
+                    "actor": "lead-orchestrator",
+                    "event_type": "clarify_run_completed",
+                    "payload": {"run_id": "clr-001"},
+                },
+            ]
+            for event in events:
+                r = run_harnessctl(
+                    tmp_path,
+                    "patch",
+                    "trace",
+                    "--event-json",
+                    json.dumps(event, ensure_ascii=False),
+                    "--json",
+                )
+                self.assertEqual(r.returncode, 0, r.stderr)
+            result = run_harnessctl(tmp_path, "audit", "show", "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["parallel_waves_completed"], 1)
+            self.assertEqual(payload["repo_fanout_waves_completed"], 1)
+            self.assertTrue(payload["fanout_used"])
+            self.assertEqual(payload["fanout_children_count"], 3)
 
     def test_decision_packet_syncs_state_and_guard_uses_bundle_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
