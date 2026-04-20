@@ -75,7 +75,7 @@ bridge 脚本负责：
 skill 内部并行执行：
 
 **承载面调研（并行 scouts）：**
-- 先读 `.harness/features/<epic-id>/surface-routing.json`（及 `cross-repo-impact-index.json` 如有）；建议先执行 `harnessctl memory codemap-audit .harness/memory/codemaps/<repo_id> --epic-id <epic-id>` 产出 `codemap-audit.json`，再读 `.harness/memory/codemaps/` 下相关笔记，**后**定点读源码；不得在未登记路径上盲扫全仓。
+- 先读 `.harness/features/<epic-id>/surface-routing.json`（及 `cross-repo-impact-index.json` 如有）。`fanout_decision` 是 CLARIFY 写入的 PLAN 输入决策；当 `workspace_mode: multi-repo` 且 `fanout_decision.mode` 为 `repo_wave` 时，在离开 PLAN 前必须落盘 `.harness/features/<epic-id>/repo-fanin-summary.json`（模板见 `templates/repo-fanin-summary.json`）；`single_agent` 不要求该文件。建议先执行 `harnessctl memory codemap-audit .harness/memory/codemaps/<repo_id> --epic-id <epic-id>` 产出 `codemap-audit.json`，再读 `.harness/memory/codemaps/` 下相关笔记，**后**定点读源码；不得在未登记路径上盲扫全仓。
 - repo-router / symbol-navigator：在路由范围内扫描代码结构、符号与可复用模块
 - dependency-mapper / config-scout：依赖、配置与集成点（受 `scout_assignments` 约束）
 - 若项目已声明**非空** `coupling_role_ids`，则 PLAN 门禁会继续复核 `surface-routing.json.surfaces[].serves_roles` 与可选 `change-coupling-closure.json`，用 `warn` / `strict` 方式提示未闭环 role 或结构错误。

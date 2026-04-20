@@ -68,7 +68,7 @@ harnessctl state transition sh-1-rbac SPEC
 
 | 层 | 产物 | 作用 |
 |----|------|------|
-| 索引与契约 | `.harness/repo-catalog.yaml`（multi-repo）、`.harness/features/<epic-id>/cross-repo-impact-index.json` | 先定「哪些仓、哪些契约」再下钻；multi-repo 时 `cross-repo-impact-index.json` 还需带 `fanout_decision`（`repo_wave` / `single_agent`）说明本轮 fan-out 决策，并包含非空 `reason` 与 `repo_ids` |
+| 索引与契约 | `.harness/repo-catalog.yaml`（multi-repo）、`.harness/features/<epic-id>/cross-repo-impact-index.json` | 先定「哪些仓、哪些契约」再下钻；multi-repo 时 `cross-repo-impact-index.json` 还需带 `fanout_decision`（CLARIFY 输入、PLAN 消费的决策：`repo_wave` / `single_agent`），并包含非空 `reason` 与 `repo_ids`。`repo_wave` 时 PLAN 出口前须有 `repo-fanin-summary.json`；`single_agent` 不要求 |
 | 路由与预算 | `.harness/project-profile.yaml` 中 `workspace_mode` 与 `scan.*`、`.harness/features/<epic-id>/surface-routing.json` | 限定路径、`repo_id`、`dive_strategy`、`scan_budget`、`evidence_level` |
 | 知识与回源 | `.harness/memory/codemaps/<repo_id>/*.md` | 热点模块摘要；非真相源，冲突时以源码与契约为准 |
 
@@ -312,7 +312,7 @@ STAGE_GATE_ARTIFACTS = {
 
 当 `.harness/config.json` 中 `clarify_deep_dive_enabled=true` 时，`clarify-selfcheck` 会在“高风险信号 + `requirements-draft.md` 中存在 `UNCLEAR` / `AMBIGUOUS` + 尚无 `deep-dive-*.md`”时给出 deep-dive 提示；若进一步设置 `clarify_deep_dive_gate_strict=true`，则 `stage-gate check CLARIFY` 与 `verify-artifacts.sh` 会把缺少 `deep-dive-*.md` 视为阻断项。该升级链依赖 `requirements-draft.md`，因此在默认 `full` 模式下它也属于 CLARIFY 必需产物。
 
-**PLAN**：除表内文件外，`surface-routing.json` 须仍存在（与 CLARIFY 一致），供 scouts 强约束。
+**PLAN**：除表内文件外，`surface-routing.json` 须仍存在（与 CLARIFY 一致），供 scouts 强约束。multi-repo 且 `cross-repo-impact-index.json.fanout_decision.mode == repo_wave` 时另需 `repo-fanin-summary.json`（`harnessctl stage-gate check PLAN` 校验）；`single_agent` 不要求。
 
 **SPEC**：`spec_semantic_hints_strict` 为 `true` 时，`_spec_semantic_warnings` 的提示会记入 `missing`；默认仅 stderr 提示。
 

@@ -44,7 +44,7 @@
 | P0 | 期间分析自动落地成文档 | 用户 | 基础已落地 | 强烈建议继续做深 | 已有大量阶段产物，但还缺更强的复用摘要层和主动消费机制 |
 | P0 | 可回放执行证据链 | 推荐 | 基础已落地 | 强烈建议继续做深 | 已有 `execution-trace`、轻量 trace schema 收敛、`execution-summary.json` 与 `audit show` 摘要能力，但还缺 session archive、audit findings、replay 视图 |
 | P0 | Focus Points 机制增强 | 推荐 | 部分实现 | 建议优先补强 | CLARIFY 闭环已有首版，但还未完整贯穿 TASK / TEST / VERIFY |
-| P1 | 多仓代码分析并行 | 用户 | 部分实现 | 很值得做 | 多仓分析与路由基础已在，但执行并行与统一收口仍需继续完善 |
+| P1 | 多仓代码分析并行 | 用户 | 部分实现 | 很值得做 | 多仓分析与路由基础已在，`CLARIFY/PLAN` 最小 fan-in 闭环已落地，但 audit 状态表达与 EXECUTE/VERIFY 多仓并发仍待补强 |
 | P1 | 项目画像持续刷新 | 推荐 | 部分实现 | 很值得做 | 目前更像初始化检测，动态刷新与热点演化机制还没完成 |
 | P1 | 复用资产库 | 推荐 | 基础已落地 | 很值得做 | `codemap` / `pitfalls` 已有基础，但还未形成更广义资产库 |
 | P2 | 记忆 + 自学习到 skills | 用户 | 部分实现 | 值得做但应后置 | 已有 `skill-miner` 与 candidate-skill 基础，但还没有完整 shadow / replay 闭环 |
@@ -315,7 +315,7 @@
 - 来源：用户
 - 优先级：`P1`
 - 实现状态：`部分实现`
-- 推进状态：`planned`
+- 推进状态：`in_progress`
 
 ### 目标
 
@@ -333,12 +333,16 @@
 - 已有 `.harness/repo-catalog.yaml`
 - 已有 `cross-repo-impact-index.json`
 - `cross-repo-impact-index.json` 已带最小 `fanout_decision` 契约，可显式区分 `repo_wave` 与 `single_agent`
+- `fanout_decision.repo_ids` 已加强为契约校验：`repo_wave` 时必须是非空字符串数组，且必须引用同文件 `repos[].repo_id`
 - 已有 `surface-routing.json` 和扫描预算
 - PLAN 阶段已有多 scout 并行研究设计
 - `execution-summary.json` 已补充 `repo_fanout_waves_completed`，可将 repo 级 fan-out 波次与总并行波次区分开来
+- 已新增 `repo-fanin-summary.json` 作为 `PLAN` 阶段最小 fan-in 收口件；在 `workspace_mode: multi-repo` 且 `fanout_decision.mode == repo_wave` 时，`stage-gate check PLAN` 会强制要求该产物存在且合法
+- `verify-artifacts.sh` 的 `PLAN` 检查已直接委托 `harnessctl stage-gate check PLAN`，与主门禁语义保持一致，不再存在 shell / gate 分叉
 
 ### 仍需补强
 
+- `execution-summary.json` / `audit show` 仍未显式表达 fan-in 状态，当前还不能结构化区分“只有决策”“已 fan-out 未收口”“已闭环”
 - fan-out / fan-in 收口流程在 EXECUTE / VERIFY 的统一约束仍需更明确
 - EXECUTE 的多仓并行边界和风险控制还不够成熟
 - `cross-repo verification`、`repo-level task lease` 仍未形成稳定能力
@@ -374,6 +378,7 @@
 - 多仓 Epic 的 CLARIFY / PLAN 耗时下降
 - fan-out 结果能被统一汇总而非碎片化
 - 并行不会显著增加 FIX 回流率
+- `repo_wave` 若未产出合法 `repo-fanin-summary.json`，不能通过 `PLAN` gate；`single_agent` 路径不受影响
 
 ## 5. 项目画像持续刷新
 

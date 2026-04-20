@@ -61,7 +61,7 @@ cat .harness/features/<epic-id>/surface-routing.json
 - 哪些承载面（surfaces）被标记为 in-scope
 - 哪些已在 SPEC 阶段排除
 - 跨承载面边界是否已在 spec 中明确
-- `repo_id` / `scan_budget` / `evidence_level` 是否与 `cross-repo-impact-index.json`（如有）一致
+- `repo_id` / `scan_budget` / `evidence_level` 是否与 `cross-repo-impact-index.json`（如有）一致。`fanout_decision` 为 CLARIFY 产出的 PLAN 输入决策；multi-repo 且 `fanout_decision.mode == repo_wave` 时，PLAN 出口前必须写 `.harness/features/<epic-id>/repo-fanin-summary.json`（见 `templates/repo-fanin-summary.json`）；`single_agent` 不要求。
 
 建议先对相关缓存运行，并将结果落盘为本轮 PLAN 产物：
 

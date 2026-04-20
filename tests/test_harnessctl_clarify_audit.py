@@ -35,6 +35,7 @@ def run_decision_bundle(cwd: Path, epic_id: str, *args: str) -> subprocess.Compl
     )
 
 
+# CLARIFY / PLAN: verify-artifacts.sh exec-delegates to harnessctl stage-gate check (same semantics as direct harnessctl).
 def run_verify_artifacts(cwd: Path, epic_id: str, stage: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["bash", str(VERIFY_ARTIFACTS), epic_id, stage],
@@ -376,6 +377,51 @@ class HarnessctlClarifyAuditTests(unittest.TestCase):
                     "shared_artifacts": [],
                     "excluded_repos": [],
                     "fanout_decision": {
+                        "mode": "repo_wave",
+                        "reason": "bad test data",
+                        "repo_ids": ["repo-ghost"],
+                    },
+                },
+            )
+            bad_unknown_repo = run_harnessctl(
+                tmp_path, "stage-gate", "check", "CLARIFY", "--epic-id", epic_id
+            )
+            self.assertNotEqual(bad_unknown_repo.returncode, 0)
+            self.assertIn("cross-repo-impact-index.json", bad_unknown_repo.stdout)
+            self.assertIn("unknown", bad_unknown_repo.stdout)
+
+            write_json(
+                features_dir / "cross-repo-impact-index.json",
+                {
+                    "epic": epic_id,
+                    "repos": [{"repo_id": "repo-a", "path": "repo-a/"}],
+                    "interfaces": [],
+                    "shared_artifacts": [],
+                    "excluded_repos": [],
+                    "fanout_decision": {
+                        "mode": "repo_wave",
+                        "reason": "bad test data",
+                        "repo_ids": [True],
+                    },
+                },
+            )
+            bad_elt_type = run_harnessctl(
+                tmp_path, "stage-gate", "check", "CLARIFY", "--epic-id", epic_id
+            )
+            self.assertNotEqual(bad_elt_type.returncode, 0)
+            self.assertIn("cross-repo-impact-index.json", bad_elt_type.stdout)
+            self.assertIn("repo_ids[0]", bad_elt_type.stdout)
+            self.assertIn("boolean", bad_elt_type.stdout)
+
+            write_json(
+                features_dir / "cross-repo-impact-index.json",
+                {
+                    "epic": epic_id,
+                    "repos": [{"repo_id": "repo-a", "path": "repo-a/"}],
+                    "interfaces": [],
+                    "shared_artifacts": [],
+                    "excluded_repos": [],
+                    "fanout_decision": {
                         "mode": "single_agent",
                         "reason": "Stayed sequential for this epic",
                         "repo_ids": [],
@@ -585,6 +631,197 @@ class HarnessctlClarifyAuditTests(unittest.TestCase):
             result = run_harnessctl(tmp_path, "stage-gate", "check", "PLAN", "--epic-id", epic_id)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("required_role_ids not covered", result.stdout)
+
+    def test_plan_gate_repo_fanin_summary_multi_repo(self) -> None:
+        profile_multi = "\n".join(
+            [
+                "type: unknown",
+                "risk_level: medium",
+                "primary_language: unknown",
+                "build_tool: unknown",
+                "test_framework: unknown",
+                "has_database: null",
+                "has_auth: null",
+                "has_docker: null",
+                "has_ci: null",
+                "estimated_size: unknown",
+                "workspace_mode: multi-repo",
+                "primary_surfaces: []",
+                "check_focus: []",
+                "coupling_role_ids: []",
+                "intensity: {}",
+                "scan: {}",
+                'notes: ""',
+                'framework: ""',
+                "confidence: 0.9",
+                "overrides: {}",
+                "",
+            ]
+        )
+
+        def setup_plan_tree(base: Path, epic: str, fanout_decision: dict) -> Path:
+            features_dir = self._write_minimal_full_clarify_artifacts(base, epic)
+            (base / ".harness" / "project-profile.yaml").write_text(profile_multi, encoding="utf-8")
+            write_json(
+                features_dir / "cross-repo-impact-index.json",
+                {
+                    "epic": epic,
+                    "repos": [
+                        {
+                            "repo_id": "repo-a",
+                            "impact": "high",
+                            "reason": "a",
+                            "confidence": "high",
+                        },
+                        {
+                            "repo_id": "repo-b",
+                            "impact": "medium",
+                            "reason": "b",
+                            "confidence": "medium",
+                        },
+                    ],
+                    "interfaces": [],
+                    "shared_artifacts": [],
+                    "excluded_repos": [],
+                    "fanout_decision": fanout_decision,
+                },
+            )
+            (features_dir / "bridge-spec.md").write_text("bridge\n", encoding="utf-8")
+            write_json(
+                features_dir / "coverage-matrix.json",
+                {"mappings": [], "unmapped_risks": []},
+            )
+            write_json(
+                base / ".harness" / "tasks" / f"{epic}.1.json",
+                {"id": f"{epic}.1", "status": "pending"},
+            )
+            return features_dir
+
+        wave_fd = {
+            "mode": "repo_wave",
+            "reason": "Parallel by repo",
+            "repo_ids": ["repo-a", "repo-b"],
+        }
+        single_fd = {
+            "mode": "single_agent",
+            "reason": "Single agent",
+            "repo_ids": [],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path, "fanin missing")
+            features_dir = setup_plan_tree(tmp_path, epic_id, wave_fd)
+            fail = run_harnessctl(tmp_path, "stage-gate", "check", "PLAN", "--epic-id", epic_id)
+            self.assertNotEqual(fail.returncode, 0)
+            self.assertIn("repo-fanin-summary.json", fail.stdout)
+            vf = run_verify_artifacts(tmp_path, epic_id, "PLAN")
+            self.assertNotEqual(vf.returncode, 0, vf.stdout + vf.stderr)
+            self.assertIn("repo-fanin-summary.json", vf.stdout + vf.stderr)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path, "fanin partial ids")
+            features_dir = setup_plan_tree(tmp_path, epic_id, wave_fd)
+            write_json(
+                features_dir / "repo-fanin-summary.json",
+                {
+                    "summarized_repo_ids": ["repo-a"],
+                    "summary": "Only one repo summarized.",
+                },
+            )
+            fail2 = run_harnessctl(tmp_path, "stage-gate", "check", "PLAN", "--epic-id", epic_id)
+            self.assertNotEqual(fail2.returncode, 0)
+            self.assertIn("missing:", fail2.stdout)
+            self.assertIn("repo-b", fail2.stdout)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path, "fanin extra ids")
+            features_dir = setup_plan_tree(tmp_path, epic_id, wave_fd)
+            write_json(
+                features_dir / "repo-fanin-summary.json",
+                {
+                    "summarized_repo_ids": ["repo-a", "repo-b", "repo-unplanned"],
+                    "summary": "Includes an id not in fanout_decision.repo_ids.",
+                },
+            )
+            fail_extra = run_harnessctl(
+                tmp_path, "stage-gate", "check", "PLAN", "--epic-id", epic_id
+            )
+            self.assertNotEqual(fail_extra.returncode, 0)
+            self.assertIn("unplanned repo ids", fail_extra.stdout)
+            self.assertIn("repo-unplanned", fail_extra.stdout)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path, "fanin non-string id")
+            features_dir = setup_plan_tree(tmp_path, epic_id, wave_fd)
+            write_json(
+                features_dir / "repo-fanin-summary.json",
+                {
+                    "summarized_repo_ids": ["repo-a", "repo-b", 1],
+                    "summary": "Numeric id should fail gate.",
+                },
+            )
+            fail_ns = run_harnessctl(tmp_path, "stage-gate", "check", "PLAN", "--epic-id", epic_id)
+            self.assertNotEqual(fail_ns.returncode, 0)
+            self.assertIn("must be non-empty strings", fail_ns.stdout)
+            self.assertIn("does not accept non-string", fail_ns.stdout)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path, "fanin ok")
+            features_dir = setup_plan_tree(tmp_path, epic_id, wave_fd)
+            write_json(
+                features_dir / "repo-fanin-summary.json",
+                {
+                    "summarized_repo_ids": ["repo-a", "repo-b"],
+                    "summary": "Merged plan across repos.",
+                },
+            )
+            ok = run_harnessctl(tmp_path, "stage-gate", "check", "PLAN", "--epic-id", epic_id)
+            self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+            vf_ok = run_verify_artifacts(tmp_path, epic_id, "PLAN")
+            self.assertEqual(vf_ok.returncode, 0, vf_ok.stdout + vf_ok.stderr)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            epic_id = self._bootstrap_epic(tmp_path, "single_agent no fanin")
+            self._write_minimal_full_clarify_artifacts(tmp_path, epic_id)
+            (tmp_path / ".harness" / "project-profile.yaml").write_text(profile_multi, encoding="utf-8")
+            fdir = tmp_path / ".harness" / "features" / epic_id
+            write_json(
+                fdir / "cross-repo-impact-index.json",
+                {
+                    "epic": epic_id,
+                    "repos": [
+                        {
+                            "repo_id": "repo-a",
+                            "impact": "high",
+                            "reason": "a",
+                            "confidence": "high",
+                        },
+                    ],
+                    "interfaces": [],
+                    "shared_artifacts": [],
+                    "excluded_repos": [],
+                    "fanout_decision": single_fd,
+                },
+            )
+            (fdir / "bridge-spec.md").write_text("bridge\n", encoding="utf-8")
+            write_json(
+                fdir / "coverage-matrix.json",
+                {"mappings": [], "unmapped_risks": []},
+            )
+            write_json(
+                tmp_path / ".harness" / "tasks" / f"{epic_id}.1.json",
+                {"id": f"{epic_id}.1", "status": "pending"},
+            )
+            ok2 = run_harnessctl(tmp_path, "stage-gate", "check", "PLAN", "--epic-id", epic_id)
+            self.assertEqual(ok2.returncode, 0, ok2.stdout + ok2.stderr)
+            vf_single = run_verify_artifacts(tmp_path, epic_id, "PLAN")
+            self.assertEqual(vf_single.returncode, 0, vf_single.stdout + vf_single.stderr)
 
     def test_audit_show_summarizes_clarify_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

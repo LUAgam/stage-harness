@@ -201,7 +201,7 @@ Stage-Harness 提供 11 个 slash 命令：
 - `challenge-report.md` — 挑战报告（challenger，须含 `## Summary`）
 - `clarification-notes.md` — 澄清备忘录（**默认 full 也须含 Domain Frame / 领域框架 / 需求上下文 标题，以及六轴覆盖或极简绕行 + Unknowns 闭环**）
 - `impact-scan.md` — 影响扫描报告
-- `cross-repo-impact-index.json` — `workspace_mode: multi-repo` 时 **门禁必备**；单仓可缺省。当前需包含合法 **`fanout_decision`**：`mode`、非空 `reason`、以及 `repo_ids`；`mode=repo_wave` 时 `repo_ids` 非空，`mode=single_agent` 时 `repo_ids` 必须为空数组 `[]`
+- `cross-repo-impact-index.json` — `workspace_mode: multi-repo` 时 **门禁必备**；单仓可缺省。当前需包含合法 **`fanout_decision`**（CLARIFY 写入的 PLAN 输入决策）：`mode`、非空 `reason`、以及 `repo_ids`；`mode=repo_wave` 时 `repo_ids` 非空，`mode=single_agent` 时 `repo_ids` 必须为空数组 `[]`。`repo_wave` 时 PLAN 阶段结束前还须落盘 **`repo-fanin-summary.json`**（仅含 `summarized_repo_ids` 与 `summary`）；`single_agent` 不要求该文件
 - `surface-routing.json` — 承载面路由与扫描预算（**CLARIFY / PLAN 门禁必备**；`surfaces` 须非空）
 - `change-coupling-closure.json` — 可选联动闭包件；项目声明 `coupling_role_ids` 时，可为当前 epic 记录 `required_role_ids` 与 `exemptions`
 - `unknowns-ledger.json` — 未知问题台账

@@ -22,6 +22,10 @@ if [[ "$STAGE_UPPER" == "CLARIFY" ]]; then
   exec python3 "$_SCRIPT_DIR/harnessctl.py" --project-root "$PWD" stage-gate check CLARIFY --epic-id "$EPIC_ID"
 fi
 
+if [[ "$STAGE_UPPER" == "PLAN" ]]; then
+  exec python3 "$_SCRIPT_DIR/harnessctl.py" --project-root "$PWD" stage-gate check PLAN --epic-id "$EPIC_ID"
+fi
+
 EPIC_DIR="$HARNESS_DIR/epics"
 FEATURES_DIR="$HARNESS_DIR/features/$EPIC_ID"
 
@@ -44,11 +48,7 @@ REQUIRED_ARTIFACTS[SPEC]="
   .harness/specs/$EPIC_ID.md
   $FEATURES_DIR/spec-council-notes.md
 "
-REQUIRED_ARTIFACTS[PLAN]="
-  $FEATURES_DIR/bridge-spec.md
-  $FEATURES_DIR/coverage-matrix.json
-  $FEATURES_DIR/surface-routing.json
-"
+# PLAN stage is checked by harnessctl stage-gate check PLAN via exec above.
 REQUIRED_ARTIFACTS[EXECUTE]="
   $FEATURES_DIR/receipts
 "

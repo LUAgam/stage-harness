@@ -4311,6 +4311,7 @@ STAGE_GATE_ARTIFACTS = {
         "{features_dir}/bridge-spec.md",
         "{features_dir}/coverage-matrix.json",
         "{features_dir}/surface-routing.json",  # 须与 CLARIFY 产物一致，供 scouts 强约束
+        # repo-fanin-summary.json：仅 multi-repo 且 cross-repo-impact-index.fanout_decision.mode==repo_wave 时由 _plan_multi_repo_repo_fanin_summary_gate_errors 校验，不列入静态列表
     ],
     "EXECUTE": [],
     "VERIFY": [
@@ -4349,6 +4350,23 @@ def _coupling_closure_gate_mode(harness_cfg: dict) -> str:
 _CRI_FANOUT_MODES = frozenset({"repo_wave", "single_agent"})
 
 
+def _cri_fanout_repo_id_element_issue(x: object) -> str | None:
+    """If x is not an allowed non-empty string entry for fanout_decision.repo_ids, return a short detail."""
+    if isinstance(x, bool):
+        return "boolean"
+    if isinstance(x, str):
+        return None if x.strip() else "blank string"
+    if x is None:
+        return "null"
+    if isinstance(x, (int, float)):
+        return "number"
+    if isinstance(x, dict):
+        return "object"
+    if isinstance(x, list):
+        return "array"
+    return type(x).__name__
+
+
 def _cross_repo_impact_index_errors(data: object) -> list[str]:
     errors: list[str] = []
     if not isinstance(data, dict):
@@ -4361,6 +4379,14 @@ def _cross_repo_impact_index_errors(data: object) -> list[str]:
         for item in repos
     ):
         errors.append("repos must include at least one object with non-empty `repo_id`")
+
+    declared_repo_ids: set[str] = set()
+    if isinstance(repos, list):
+        for item in repos:
+            if isinstance(item, dict):
+                rid = item.get("repo_id")
+                if isinstance(rid, str) and rid.strip():
+                    declared_repo_ids.add(rid.strip())
 
     fd = data.get("fanout_decision")
     if "fanout_decision" not in data:
@@ -4383,16 +4409,117 @@ def _cross_repo_impact_index_errors(data: object) -> list[str]:
         if not isinstance(repo_ids, list):
             errors.append("fanout_decision.repo_ids must be a JSON array")
         else:
-            non_empty_ids = [x for x in repo_ids if str(x).strip()]
-            if mode == "repo_wave" and not non_empty_ids:
-                errors.append(
-                    "fanout_decision.repo_ids must be non-empty when mode is repo_wave"
-                )
-            elif mode == "single_agent" and non_empty_ids:
-                errors.append(
-                    "fanout_decision.repo_ids must be empty when mode is single_agent"
-                )
+            valid_repo_ids: list[str] = []
+            for i, x in enumerate(repo_ids):
+                elt_issue = _cri_fanout_repo_id_element_issue(x)
+                if elt_issue is not None:
+                    errors.append(
+                        "fanout_decision.repo_ids["
+                        f"{i}] must be a non-empty string (cross-repo-impact-index.json "
+                        f"contract; got {elt_issue})"
+                    )
+                else:
+                    valid_repo_ids.append(x.strip())
+            if mode in _CRI_FANOUT_MODES:
+                if mode == "repo_wave":
+                    if not valid_repo_ids:
+                        errors.append(
+                            "fanout_decision.repo_ids must be non-empty when mode is repo_wave "
+                            "(cross-repo-impact-index.json contract)"
+                        )
+                    else:
+                        unknown = sorted({rid for rid in valid_repo_ids if rid not in declared_repo_ids})
+                        if unknown:
+                            shown = ", ".join(repr(u) for u in unknown)
+                            errors.append(
+                                "fanout_decision.repo_ids must only reference repo_id values "
+                                "declared in this file's repos[] (cross-repo-impact-index.json "
+                                f"contract); unknown: {shown}"
+                            )
+                elif mode == "single_agent" and valid_repo_ids:
+                    errors.append(
+                        "fanout_decision.repo_ids must be empty when mode is single_agent "
+                        "(cross-repo-impact-index.json contract)"
+                    )
     return errors
+
+
+def _plan_multi_repo_repo_fanin_summary_gate_errors(features_dir: Path, h: Path) -> list[str]:
+    """PLAN gate: when multi-repo + fanout_decision.mode==repo_wave, require repo-fanin-summary.json."""
+    if _workspace_mode(h) != "multi-repo":
+        return []
+    cri_path = features_dir / "cross-repo-impact-index.json"
+    if not cri_path.exists():
+        return [
+            f"{cri_path} (missing; required for multi-repo workspace PLAN gate to resolve fanout_decision)"
+        ]
+    try:
+        cri = json.loads(cri_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return [f"{cri_path} (cannot read: {exc})"]
+    except json.JSONDecodeError:
+        return [f"{cri_path} (invalid JSON)"]
+    errs: list[str] = []
+    for msg in _cross_repo_impact_index_errors(cri):
+        errs.append(f"{cri_path} ({msg})")
+    if errs:
+        return errs
+    fd = cri.get("fanout_decision")
+    if not isinstance(fd, dict):
+        return [f"{cri_path} (fanout_decision must be a JSON object)"]
+    mode = str(fd.get("mode", "")).strip()
+    if mode != "repo_wave":
+        return []
+    repo_ids_raw = fd.get("repo_ids")
+    expected: set[str] = set()
+    if isinstance(repo_ids_raw, list):
+        for x in repo_ids_raw:
+            s = str(x).strip()
+            if s:
+                expected.add(s)
+    fanin_path = features_dir / "repo-fanin-summary.json"
+    if not fanin_path.exists():
+        return [
+            f"{fanin_path} (missing; required when cross-repo-impact-index fanout_decision.mode is repo_wave)"
+        ]
+    try:
+        fanin = json.loads(fanin_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return [f"{fanin_path} (cannot read: {exc})"]
+    except json.JSONDecodeError:
+        return [f"{fanin_path} (invalid JSON)"]
+    if not isinstance(fanin, dict):
+        return [f"{fanin_path} (root must be a JSON object)"]
+    summ_ids = fanin.get("summarized_repo_ids")
+    if not isinstance(summ_ids, list) or len(summ_ids) == 0:
+        return [f"{fanin_path} (summarized_repo_ids must be a non-empty JSON array)"]
+    summarized: set[str] = set()
+    for x in summ_ids:
+        if not isinstance(x, str):
+            return [
+                f"{fanin_path} (summarized_repo_ids entries must be non-empty strings; "
+                f"repo-fanin-summary.json does not accept non-string repo id values)"
+            ]
+        s = x.strip()
+        if not s:
+            return [f"{fanin_path} (summarized_repo_ids entries must be non-empty strings)"]
+        summarized.add(s)
+    if not expected.issubset(summarized):
+        missing_ids = sorted(expected - summarized)
+        return [
+            f"{fanin_path} (summarized_repo_ids must cover fanout_decision.repo_ids; missing: {missing_ids})"
+        ]
+    extra_ids = sorted(summarized - expected)
+    if extra_ids:
+        shown = ", ".join(repr(i) for i in extra_ids)
+        return [
+            f"{fanin_path} (repo-fanin-summary.json summarized_repo_ids contains unplanned repo ids "
+            f"(not in fanout_decision.repo_ids): {shown})"
+        ]
+    summary = fanin.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return [f"{fanin_path} (summary must be a non-empty string)"]
+    return []
 
 
 def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
@@ -4687,6 +4814,9 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
                 warnings.append(
                     f"{closure_path} (project-profile declares coupling_role_ids but this epic has no closure review yet)"
                 )
+
+        for msg in _plan_multi_repo_repo_fanin_summary_gate_errors(features_dir, h):
+            missing.append(msg)
 
     if stage == "VERIFY":
         verification_path = features_dir / "verification.json"
