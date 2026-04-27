@@ -40,6 +40,12 @@ Read the existing codebase to extract architectural patterns, interface contract
 - Retry and circuit-breaker patterns in use
 - Authentication patterns
 
+### Reuse & Extension Surface
+- What existing modules, abstractions, or infrastructure can the epic build on instead of creating new ones?
+- Does the project have extension mechanisms (plugin system, middleware chain, hook registry, provider interface, command registration, etc.)? If so, list them.
+- Are there base classes, shared utilities, or framework built-ins that overlap with what the epic needs?
+- If no reusable surface is found, note that explicitly.
+
 ## Scouting Process
 
 1. Read `surface-map.md` for targeted file list; intersect with `surface-routing.json` paths.
@@ -71,6 +77,13 @@ Read the existing codebase to extract architectural patterns, interface contract
 - Error handling: throw typed errors, catch at controller level
 - Async: always async/await, never callbacks
 - Tests: unit tests mock repositories, integration tests use test DB
+
+## Reuse & Extension Surface
+| Mechanism | Location | Relevant to Epic? | Notes |
+|-----------|----------|--------------------|-------|
+| Express middleware chain | src/middleware/ | Yes — auth can be added as middleware | Standard pattern in this project |
+| Plugin registry | lib/plugins/ | No — unrelated domain | |
+| BaseRepository class | src/data/base.ts | Yes — new entity can extend it | Provides CRUD + validation |
 
 ## Design Gaps / Risks
 - No existing auth middleware (new feature must design from scratch)

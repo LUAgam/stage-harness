@@ -131,6 +131,17 @@ Spawn parallel:
   Agent 3 (impact-analyst): Blast radius & dependencies reflected in spec
 ```
 
+### 概念一致性检查（light_council 必检项）
+
+CLARIFY 决策中使用的关键术语，在 SDD 中的实现必须与术语的实际含义一致。
+
+检查方法：
+1. 读取 `decision-bundle.json` 中所有 `resolved` 状态的决策
+2. 对每个决策的 `resolution` 中出现的技术术语（如"subagent"、"event-driven"、"plugin"等），检查 SDD 中对应的架构描述是否真正实现了该术语的含义
+3. 如果发现术语标签与实际实现不匹配（例如：决策写"subagent 模式"但 SDD 实际描述的是 subprocess 调用），标记为 **high finding**，verdict 降为 REVISE
+
+此检查由 challenger 角色承担，作为其 scope 挑战的一部分。
+
 Aggregated notes written to `.harness/features/<epic-id>/spec-council-notes.md`.
 
 `$HARNESSCTL stage-gate check SPEC` 通过后仍会打印 **语义提示**（stderr，非阻断），例如建议补充「场景矩阵」— 见 `scripts/harnessctl.py` 中 `_spec_semantic_warnings`。

@@ -36,7 +36,7 @@ cat <coverage_matrix>
 cat .harness/features/<epic-id>/unknowns-ledger.json
 ```
 
-### 2. 执行 6 个审查维度
+### 2. 执行 7 个审查维度
 
 **维度 1 — 需求覆盖**
 - CLARIFY 和 SPEC 中的所有问题/需求是否都映射到了 task？
@@ -67,6 +67,12 @@ cat .harness/features/<epic-id>/unknowns-ledger.json
 - 如果某个 task 失败，是否有回滚/恢复方案？
 - 是否有对外部服务依赖的 task 缺少降级策略？
 
+**维度 7 — 方案适配性（Approach Fitness）**
+- design-scout 报告中是否识别了可复用的现有机制（模块 / 抽象 / 扩展点 / 框架内置能力）？
+- 计划是否优先利用了已有机制，而非从零构建？
+- 如果计划创建了与现有机制功能重叠的新组件（wrapper / adapter / 独立脚本），design-scout 报告中是否给出了不复用的明确理由？
+- 如果 design-scout 报告中 Reuse & Extension Surface 一节为空或缺失，标记为 medium finding
+
 ---
 
 ## 输出格式
@@ -80,7 +86,7 @@ cat .harness/features/<epic-id>/unknowns-ledger.json
   "severity": "none|low|medium|high|critical",
   "findings": [
     {
-      "dimension": "需求覆盖|任务边界|依赖路径|测试策略|安全风险|恢复策略",
+      "dimension": "需求覆盖|任务边界|依赖路径|测试策略|安全风险|恢复策略|方案适配性",
       "severity": "low|medium|high|critical",
       "description": "具体发现",
       "affected_tasks": ["task-id-1"],
