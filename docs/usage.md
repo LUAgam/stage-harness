@@ -28,7 +28,7 @@ scripts/harnessctl doctor
 
 ## 命令一览
 
-Stage-Harness 提供 11 个 slash 命令：
+Stage-Harness 提供 12 个 slash 命令：
 
 | 命令 | 阶段 | 说明 |
 |------|------|------|
@@ -44,8 +44,9 @@ Stage-Harness 提供 11 个 slash 命令：
 | `/stage-harness:harness-auto` | 全阶段 | 自治模式：自动循环推进所有阶段直到 DONE |
 | `/stage-harness:harness-status` | 任意 | 只读状态查看：显示当前 Epic、阶段、预算、任务进度 |
 | `/stage-harness:harness-bridge` | PLAN | 将 ShipSpec 规格转化为深度计划的 Bridge 脚本 |
+| `/stage-harness:mmr` | 快速修复 | 轻量 MMR：方案→方案复审→执行→A/B 代码复审 |
 
-命名空间与 `.claude-plugin/plugin.json` 中的 `name` 一致（本仓库为 **`stage-harness`**）。若你的环境仍把插件注册为短名 `harness`，也可能看到 **`/harness:*`** 形式；与上表及 `commands/harness-*.md` 一一对应，钩子侧等价识别。
+命名空间与 `.claude-plugin/plugin.json` 中的 `name` 一致（本仓库为 **`stage-harness`**）。若你的环境仍把插件注册为短名 `harness`，也可能看到 **`/harness:*`** 形式；`harness-*` 命令与 `commands/harness-*.md` 一一对应，钩子侧做等价识别；MMR 入口对应 `commands/mmr.md`。
 
 ## 典型工作流
 
@@ -122,6 +123,21 @@ Stage-Harness 提供 11 个 slash 命令：
   → 会话重新启动，热加载刚写入的补丁规则
   → 模型带着新约束继续执行，成功避开刚才的坑
 ```
+
+### 轻量 MMR 模式（小型修复）
+
+```
+用户: /stage-harness:mmr 修复用户头像上传失败：选择 png 后接口返回 400，期望成功上传并展示新头像
+
+  → mmr-planner 制定最小修复方案
+  → mmr-plan-reviewer 复审方案风险
+  → 无 P0 阻塞时由 mmr-executor 执行最小改动
+  → mmr-code-reviewer-a 从正确性和回归风险角度复审
+  → mmr-code-reviewer-b 从边界、契约、一致性和隐性风险角度复审
+  → 主会话一次性汇总改动、校验、两轮复审与是否建议提交
+```
+
+MMR 不初始化完整 `.harness/` Epic，也不生成任务 DAG；如果需求跨模块、风险高或需要正式验收，请改用 `/stage-harness:harness-start` 的完整流程。
 
 ### 自治模式
 

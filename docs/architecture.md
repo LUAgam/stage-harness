@@ -784,12 +784,12 @@ verify-artifacts.sh <epic-id> [STAGE]
 stage-harness/
 ├── .claude-plugin/
 │   └── plugin.json          # 插件清单
-├── agents/                  # 23 个 Agent 定义
+├── agents/                  # Agent 定义
 │   ├── lead-orchestrator.md
 │   ├── requirement-analyst.md
 │   ├── ...
 │   └── worker.md
-├── commands/                # 11 个阶段命令
+├── commands/                # 阶段命令与轻量辅助命令
 │   ├── harness-start.md
 │   ├── harness-clarify.md
 │   ├── harness-spec.md

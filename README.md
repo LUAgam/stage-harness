@@ -85,6 +85,7 @@ scripts/harnessctl repair --apply
 | `/stage-harness:harness-auto` | 全阶段 | 自治循环推进直至 DONE |
 | `/stage-harness:harness-status` | 任意 | 只读：Epic、阶段、预算、任务进度 |
 | `/stage-harness:harness-bridge` | PLAN | ShipSpec → 深度计划的 Bridge 脚本 |
+| `/stage-harness:mmr` | 快速修复 | 轻量 MMR：方案 → 方案复审 → 执行 → A/B 代码复审 |
 
 > **兼容说明**：若安装方式将插件注册为短名 `harness`，对话里也可能显示为 `/harness:*`；钩子与下文示例中的 **`/stage-harness:harness-*`** 会被等价识别，编排均以 `commands/harness-*.md` 为准。
 
@@ -107,6 +108,14 @@ scripts/harnessctl repair --apply
 ```
 
 `/stage-harness:harness-auto` 会按当前阶段循环执行对应推进逻辑，并在 EXECUTE / VERIFY / FIX 间自动处理，直到 DONE。
+
+### 快速 MMR
+
+```text
+/stage-harness:mmr 修复用户头像上传失败的问题：选择 png 后接口返回 400，期望成功上传并展示新头像
+```
+
+`/stage-harness:mmr` 不创建完整 `.harness` Epic，适合边界清晰的小型修复。它会按 `mmr-planner`、`mmr-plan-reviewer`、`mmr-executor`、`mmr-code-reviewer-a`、`mmr-code-reviewer-b` 顺序推进，并在最后汇总方案、改动、校验和两轮复审结论。
 
 ### 运行受阻时（JIT 纠偏）
 
@@ -139,7 +148,7 @@ $HARNESSCTL profile detect
 
 | 路径 | 作用 |
 |------|------|
-| `commands/` | 各 `/stage-harness:harness-*` slash 的编排说明（与 `commands/harness-*.md` 一一对应） |
+| `commands/` | 各 `/stage-harness:harness-*` slash 与 `/stage-harness:mmr` 的编排说明 |
 | `agents/` | 专业 Agent 角色定义 |
 | `skills/` | 可复用技能（如 clarify、plan、council） |
 | `hooks/` | SessionStart、PreToolUse 等钩子 |
