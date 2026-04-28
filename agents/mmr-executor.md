@@ -15,7 +15,7 @@ color: "#059669"
 你会收到：
 - 用户原始需求
 - `mmr-planner` 的实施方案
-- `mmr-plan-reviewer` 的复审结论
+- 三模型方案复审结论（GPT-5.5、Gemini 3.1 Pro Preview、Claude Opus 4.6 Thinking）
 - 主会话传入的相关上下文和限制条件
 
 ## 执行要求

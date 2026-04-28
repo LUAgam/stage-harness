@@ -44,7 +44,7 @@ Stage-Harness 提供 12 个 slash 命令：
 | `/stage-harness:harness-auto` | 全阶段 | 自治模式：自动循环推进所有阶段直到 DONE |
 | `/stage-harness:harness-status` | 任意 | 只读状态查看：显示当前 Epic、阶段、预算、任务进度 |
 | `/stage-harness:harness-bridge` | PLAN | 将 ShipSpec 规格转化为深度计划的 Bridge 脚本 |
-| `/stage-harness:mmr` | 快速修复 | 轻量 MMR：方案→方案复审→执行→A/B 代码复审 |
+| `/stage-harness:mmr` | 快速修复 | 轻量 MMR：方案→三模型方案复审→执行→三模型代码复审 |
 
 命名空间与 `.claude-plugin/plugin.json` 中的 `name` 一致（本仓库为 **`stage-harness`**）。若你的环境仍把插件注册为短名 `harness`，也可能看到 **`/harness:*`** 形式；`harness-*` 命令与 `commands/harness-*.md` 一一对应，钩子侧做等价识别；MMR 入口对应 `commands/mmr.md`。
 
@@ -130,14 +130,13 @@ Stage-Harness 提供 12 个 slash 命令：
 用户: /stage-harness:mmr 修复用户头像上传失败：选择 png 后接口返回 400，期望成功上传并展示新头像
 
   → mmr-planner 制定最小修复方案
-  → mmr-plan-reviewer 复审方案风险
+  → gpt-5.5 / google/gemini-3.1-pro-preview / claude-opus-4.6-thinking 三模型视角复审方案
   → 无 P0 阻塞时由 mmr-executor 执行最小改动
-  → mmr-code-reviewer-a 从正确性和回归风险角度复审
-  → mmr-code-reviewer-b 从边界、契约、一致性和隐性风险角度复审
-  → 主会话一次性汇总改动、校验、两轮复审与是否建议提交
+  → gpt-5.5 / google/gemini-3.1-pro-preview / claude-opus-4.6-thinking 三模型视角复审代码
+  → 主会话一次性汇总改动、校验、六份复审与是否建议提交
 ```
 
-MMR 不初始化完整 `.harness/` Epic，也不生成任务 DAG；如果需求跨模块、风险高或需要正式验收，请改用 `/stage-harness:harness-start` 的完整流程。
+MMR 不初始化完整 `.harness/` Epic，也不生成任务 DAG；如果需求跨模块、风险高或需要正式验收，请改用 `/stage-harness:harness-start` 的完整流程。三模型名称是 MMR 的目标路由与审查视角，实际是否强制路由取决于 Claude Code 宿主或外部模型网关是否支持这些模型标识。
 
 ### 自治模式
 
