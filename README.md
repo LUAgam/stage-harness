@@ -115,7 +115,7 @@ scripts/harnessctl repair --apply
 /stage-harness:mmr 修复用户头像上传失败的问题：选择 png 后接口返回 400，期望成功上传并展示新头像
 ```
 
-`/stage-harness:mmr` 不创建完整 `.harness` Epic，适合边界清晰的小型修复。它会先由 `mmr-planner` 出方案，再通过 `gpt-5.5`、`google/gemini-3.1-pro-preview`、`claude-opus-4.6-thinking` 三个目标模型视角做方案复审；执行后再用同一组三模型视角做代码复审，并在最后汇总方案、改动、校验和六份复审结论。
+`/stage-harness:mmr` 不创建完整 `.harness` Epic，适合边界清晰的小型修复。它会先由 `mmr-planner` 出方案，再通过已配置为 `gpt-5.5`、`google/gemini-3.1-pro-preview`、`claude-opus-4.6-thinking` 的三个 reviewer 做方案复审；执行后再用同一组三模型 reviewer 做代码复审，并在最后汇总方案、改动、校验和六份复审结论。
 
 ### 运行受阻时（JIT 纠偏）
 

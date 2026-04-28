@@ -136,7 +136,7 @@ Stage-Harness 提供 12 个 slash 命令：
   → 主会话一次性汇总改动、校验、六份复审与是否建议提交
 ```
 
-MMR 不初始化完整 `.harness/` Epic，也不生成任务 DAG；如果需求跨模块、风险高或需要正式验收，请改用 `/stage-harness:harness-start` 的完整流程。三模型名称是 MMR 的目标路由与审查视角，实际是否强制路由取决于 Claude Code 宿主或外部模型网关是否支持这些模型标识。
+MMR 不初始化完整 `.harness/` Epic，也不生成任务 DAG；如果需求跨模块、风险高或需要正式验收，请改用 `/stage-harness:harness-start` 的完整流程。三模型 reviewer 已在 subagent frontmatter 中直接配置对应 `model` 值；运行环境需要能识别这些模型标识。
 
 ### 自治模式
 
