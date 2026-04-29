@@ -20,6 +20,7 @@
 - **执行证据链**：已有 `execution-trace.jsonl` 和 trace 事件基础，但完整 session archive / audit 视图仍在继续完善。
 - **用户关注点闭环**：已支持 `Focus Points` / `focus-points.json` 校验，但从 CLARIFY 贯穿到 TASK / TEST / VERIFY 的完整闭环仍在增强。
 - **候选技能与度量**：已具备 `skill-miner`、candidate-skills、`scan-metrics.json`、`scan-roi.jsonl` 基础，但完整自学习闭环与更宽的成功率指标仍在 roadmap 中。
+- **反馈驱动重开闭环**：新增设计草案 [Feedback-driven Reopen Loop](docs/feedback-driven-reopen-loop.md)，用于在人工发现 SPEC / PLAN 上游理解错误时，结构化回到 CLARIFY / SPEC / PLAN 并增量重建。
 
 完整演进方向见 [docs/roadmap.md](docs/roadmap.md)。
 
@@ -157,4 +158,5 @@ $HARNESSCTL profile detect
 - [docs/usage.md](docs/usage.md) — 安装细节、各命令流程与产物、FAQ  
 - [docs/architecture.md](docs/architecture.md) — 实现与模块关系  
 - [docs/human-workflow-and-orchestration.md](docs/human-workflow-and-orchestration.md) — 人类协作与编排注意点  
+- [docs/feedback-driven-reopen-loop.md](docs/feedback-driven-reopen-loop.md) — 人工反馈驱动的阶段重开与增量重建设计  
 - [docs/roadmap.md](docs/roadmap.md) — 中长期功能规划、优先级与实施方向
