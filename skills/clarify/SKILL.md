@@ -87,11 +87,30 @@ Wait for all four to complete.
 
 若 `primary_surfaces` hint 无效，`impact-analyst` 必须先做**有界重定向**（顶层浅扫 + 预算内缩圈），而不是退化为全仓宽扫；若预算内仍无法定位，必须显式报告 evidence gap / retarget required。
 
+**证据分级要求（适用于所有 Step 3 并行 agent）**：所有并行 agent 在产出中涉及组件职责、模块归属、依赖关系、技术能力等事实性声明时，必须区分声明类型：
+- **FACT**：有明确代码路径、文档引用、配置文件或运行证据支持
+- **INFERENCE**：基于多处线索推断，但尚无单一直接证据
+- **ASSUMPTION**：当前未验证，仅用于推动后续澄清
+
+不得将 INFERENCE / ASSUMPTION 写成无标注的断言。涉及后续 Decision Bundle 前提的判断，必须保留 evidence 来源（文件路径、文档章节、代码符号）。
+
 **沉淀规则**：`challenge-report.md` 中 Critical / Warnings 级发现须进入 `unknowns-ledger.json` 或 `decision-bundle.json`，不得仅停留在报告中。
 
 ### Step 4 — Semantic Reconciliation（语义归并）
 
-Lead 在路由代码承载面之前，交叉核对 `domain-frame.json`、`generated-scenarios.json`、`requirements-draft.md`、`challenge-report.md`：合并矛盾语义、将未闭合组合升级为 **must_confirm / UNK / DEC**，并产出 `scenario-coverage.json`。`generated-scenarios.json` 必须使用 canonical `scenarios[]` 结构，且高/中置信度场景应带 `scenario_id`、`pattern`、`source_signals`、`scenario`、`why_it_matters`、`expected_followup`；`scenario-coverage.json` 则使用 canonical `{ epic_id, version, scenarios, signals? }`，记录每个 `SCN-xxx` 的覆盖状态与映射去向，并在需要时通过 `signals[]` 显式闭合高/中置信度语义信号。`clarification-notes.md` 中则追加简短 **Semantic Reconciliation / 语义归并** 小节（可与 Traceability 合并）。
+Lead 在路由代码承载面之前，交叉核对 `domain-frame.json`、`generated-scenarios.json`、`requirements-draft.md`、`challenge-report.md`。语义归并分为两个认知阶段，必须按顺序执行：
+
+**阶段 A — Evidence Reconciliation（证据归并）**：
+
+- 汇总各并行产物中对同一实体（组件、模块、接口、职责边界）的事实性声明，按 FACT / INFERENCE / ASSUMPTION 分级。
+- 识别多份产物之间的冲突声明（如：产物 A 声称组件 X 负责功能 Y，产物 B 声称组件 Z 负责功能 Y）。
+- 冲突裁决优先级：FACT > INFERENCE > ASSUMPTION；同级冲突时以项目权威文档（README、架构文档、project-profile.yaml、代码证据）为准。
+- 被裁决为错误或未证实的声明，不得作为 Decision Bundle 中 must_confirm 的前提条件。
+- 裁决摘要写入 `clarification-notes.md` 的「语义归并」小节。
+
+**阶段 B — Scenario Reconciliation（场景归并）**：
+
+合并矛盾语义、将未闭合组合升级为 **must_confirm / UNK / DEC**，并产出 `scenario-coverage.json`。`generated-scenarios.json` 必须使用 canonical `scenarios[]` 结构，且高/中置信度场景应带 `scenario_id`、`pattern`、`source_signals`、`scenario`、`why_it_matters`、`expected_followup`；`scenario-coverage.json` 则使用 canonical `{ epic_id, version, scenarios, signals? }`，记录每个 `SCN-xxx` 的覆盖状态与映射去向，并在需要时通过 `signals[]` 显式闭合高/中置信度语义信号。`clarification-notes.md` 中则追加简短 **Semantic Reconciliation / 语义归并** 小节（可与 Traceability 合并）。
 
 ### Step 5 — Surface Routing
 

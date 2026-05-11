@@ -31,6 +31,16 @@ You may use **Write** only to create or replace this single artifact:
 
 Do **not** write any other `.harness/` path, ledger, JSON, or application source. Use **Read** / **Grep** / **Glob** for inputs.
 
+## Evidence Classification
+
+All factual claims about component responsibilities, module ownership, dependency relationships, or technical capabilities MUST be tagged with an evidence level:
+
+- **FACT**: Supported by explicit code path, documentation reference, configuration, or runtime evidence (cite the source)
+- **INFERENCE**: Derived from multiple indirect signals but no single direct proof (state the reasoning)
+- **ASSUMPTION**: Not yet verified; used to drive further clarification (mark explicitly)
+
+Do NOT present INFERENCE or ASSUMPTION as unqualified assertions. When a requirement's Notes or Assumptions reference which component handles a function, that claim must carry its evidence level and source reference.
+
 ## Output: requirements-draft.md
 
 Produce a markdown document at `.harness/features/<epic-id>/requirements-draft.md`:

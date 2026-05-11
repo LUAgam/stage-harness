@@ -171,11 +171,28 @@ impact-scan.md 必须包含：
 - **`challenger`**：输入含 `domain-frame.json` → **`challenge-report.md`**（须含 `## Summary`）
 - **`scenario-expander`**：输入含 `domain-frame.json` → **`generated-scenarios.json`**
 
+**证据分级要求（适用于所有 Step 2 并行 agent）**：所有并行 agent 在产出中涉及组件职责、模块归属、依赖关系、技术能力等事实性声明时，必须区分声明类型：
+- **FACT**：有明确代码路径、文档引用、配置文件或运行证据支持
+- **INFERENCE**：基于多处线索推断，但尚无单一直接证据
+- **ASSUMPTION**：当前未验证，仅用于推动后续澄清
+
+不得将 INFERENCE / ASSUMPTION 写成无标注的断言。涉及后续 Decision Bundle 前提的判断，必须保留 evidence 来源（文件路径、文档章节、代码符号）。
+
 **沉淀规则**：`challenge-report.md` 中 **Critical Challenges** 与 **Warnings** 须在后续步骤进入 `unknowns-ledger.json`（`unknowns-ledger-update.sh add`）或 `decision-bundle.json`（`decision-bundle.sh add`），不得仅停留在报告中。**若 `clarify_closure_mode=notes_only`**，等价信息须写入 `clarification-notes.md` 的 **Unknowns 与待确认决策** 小节，编号可追溯即可。
 
 ### Step 2.5 — 语义归并（Semantic Reconciliation）
 
-在初始化 unknowns 台账之前，Lead 应基于 `domain-frame.json`、`generated-scenarios.json`、`requirements-draft.md`、`challenge-report.md` 做一次语义闭合：
+在初始化 unknowns 台账之前，Lead 应基于 `domain-frame.json`、`generated-scenarios.json`、`requirements-draft.md`、`challenge-report.md` 做一次语义闭合。语义归并分为两个认知阶段，必须按顺序执行：
+
+**阶段 A — Evidence Reconciliation（证据归并）**：
+
+- 汇总各并行产物中对同一实体（组件、模块、接口、职责边界）的事实性声明，按 FACT / INFERENCE / ASSUMPTION 分级。
+- 识别多份产物之间的冲突声明（如：产物 A 声称组件 X 负责功能 Y，产物 B 声称组件 Z 负责功能 Y）。
+- 冲突裁决优先级：FACT > INFERENCE > ASSUMPTION；同级冲突时以项目权威文档（README、架构文档、project-profile.yaml、代码证据）为准。
+- 被裁决为错误或未证实的声明，不得作为 Decision Bundle 中 must_confirm 的前提条件。
+- 裁决摘要写入 `clarification-notes.md` 的「语义归并」小节。
+
+**阶段 B — Scenario Reconciliation（场景归并）**：
 
 - 识别高/中置信度 `SCN-xxx` 中尚未落到 REQ/CHK 或决策的语义缝隙与组合冲突。
 - 每个高/中置信度场景须映射到 REQ/CHK，或写入 **DEC/UNK**；不得仅留在 JSON。

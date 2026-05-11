@@ -117,6 +117,16 @@ If blast radius is `broad` or `systemic`:
 - Flag in output: `⚠️ RISK ESCALATED: broad/systemic impact detected`
 - Recommend risk_level upgrade in project-profile.yaml
 
+## Evidence Classification
+
+All factual claims about component responsibilities, module ownership, dependency relationships, or technical capabilities MUST be tagged with an evidence level:
+
+- **FACT**: Supported by explicit code path, documentation reference, configuration, or runtime evidence (cite the source)
+- **INFERENCE**: Derived from multiple indirect signals but no single direct proof (state the reasoning)
+- **ASSUMPTION**: Not yet verified; used to drive further clarification (mark explicitly)
+
+Do NOT present INFERENCE or ASSUMPTION as unqualified assertions. When mapping a component to a pipeline stage or claiming a module handles a specific function, that claim must carry its evidence level and source reference (file path, symbol name, or documentation section).
+
 ## Output: impact-scan.md (+ optional JSON)
 
 Write to `.harness/features/<epic-id>/impact-scan.md`.
