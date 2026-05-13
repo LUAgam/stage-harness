@@ -7476,6 +7476,28 @@ def cmd_feedback_evidence_pack(args, h: Path) -> None:
     pack_path = _feedback_dir(h, epic_id) / f"{feedback_id}.evidence-pack.json"
     atomic_write_json(pack_path, evidence_pack)
 
+    # Source probe integration (P2) — append dynamic code search results
+    try:
+        project_root = h.parent
+        probe_keywords = _extract_probe_keywords(feedback_text)
+        if probe_keywords:
+            search_roots = _discover_search_roots(h, epic_id, project_root)
+            probe_result = _run_source_probe(project_root, probe_keywords, search_roots, _PROBE_DEFAULTS)
+            evidence_pack["source_probe_results"] = {
+                "keywords": probe_keywords,
+                "search_roots": search_roots,
+                "candidates": probe_result["candidates"],
+                "stats": probe_result["stats"],
+                "resource_limits": _PROBE_DEFAULTS,
+            }
+        else:
+            evidence_pack["source_probe_results"] = None
+    except Exception:
+        evidence_pack["source_probe_results"] = None
+
+    # Re-write with probe results
+    atomic_write_json(pack_path, evidence_pack)
+
     if args.json:
         out_json({"status": "ok", "path": str(pack_path), **evidence_pack})
     else:
@@ -7963,6 +7985,301 @@ def cmd_feedback_related_gap_scan(args, h: Path) -> None:
         print(f"  Primary gap: {primary_gap[:60]}")
         print(f"  Sibling categories: {len(sibling_categories)}")
         print(f"  Output: {scan_path}")
+
+
+# ---------------------------------------------------------------------------
+# Source Evidence Probe (P2)
+# ---------------------------------------------------------------------------
+
+_PROBE_IGNORE_DIRS = frozenset({
+    "node_modules", "dist", "build", "target", "vendor", ".git",
+    "__pycache__", ".next", "coverage", ".tox", ".mypy_cache",
+})
+
+_PROBE_SECRET_PATTERNS: list[str] = [
+    r'(?i)(password|passwd|secret|token|api_key|apikey|private_key)\s*[=:]',
+    r'(?i)(aws_access_key|aws_secret)',
+]
+
+_PROBE_DEFAULTS = {
+    "max_files": 30,
+    "max_snippet_lines_per_file": 20,
+    "max_total_snippet_lines": 200,
+    "timeout_seconds": 10,
+}
+
+
+def _extract_probe_keywords(text: str) -> list[str]:
+    """Extract search keywords from feedback text (Chinese + English)."""
+    import re as _re
+    cn_keywords = _re.findall(r'[\u4e00-\u9fff]{2,4}', text)[:10]
+    en_keywords = _re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', text)[:10]
+    return list(set(cn_keywords + en_keywords))
+
+
+def _discover_search_roots(h: Path, epic_id: str, project_root: Path) -> list[str]:
+    """Discover search roots from surface-routing and codemaps."""
+    roots: list[str] = []
+
+    # From surface-routing
+    sr_path = h / "features" / epic_id / "surface-routing.json"
+    if sr_path.exists():
+        try:
+            sr = json.loads(sr_path.read_text(encoding="utf-8"))
+            surfaces = sr.get("surfaces", [])
+            if isinstance(surfaces, dict):
+                surfaces = list(surfaces.values())
+            for s in surfaces:
+                p = s.get("path", "")
+                if p and p not in roots:
+                    roots.append(p)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # From codemaps
+    codemaps_dir = h / "memory" / "codemaps"
+    if codemaps_dir.exists():
+        for cm_file in codemaps_dir.rglob("*.md"):
+            try:
+                text = cm_file.read_text(encoding="utf-8")
+                meta, _ = _split_codemap_frontmatter(text)
+                for sp in meta.get("source_paths", []):
+                    if sp and sp not in roots:
+                        roots.append(sp)
+            except OSError:
+                pass
+
+    # Fallback: project root
+    if not roots:
+        roots.append(".")
+
+    return roots
+
+
+def _is_binary_file(filepath: Path) -> bool:
+    """Quick binary check — read first 512 bytes."""
+    try:
+        chunk = filepath.read_bytes()[:512]
+        return b'\x00' in chunk
+    except OSError:
+        return True
+
+
+def _redact_secrets(line: str) -> str:
+    """Redact lines that look like they contain secrets."""
+    import re as _re
+    for pattern in _PROBE_SECRET_PATTERNS:
+        if _re.search(pattern, line):
+            return "[REDACTED]"
+    return line
+
+
+def _run_source_probe(project_root: Path, keywords: list[str],
+                      search_roots: list[str], limits: dict) -> dict:
+    """Execute source probe: search files and extract snippets."""
+    import time
+    start_time = time.time()
+
+    max_files = limits.get("max_files", 30)
+    max_lines_per_file = limits.get("max_snippet_lines_per_file", 20)
+    max_total_lines = limits.get("max_total_snippet_lines", 200)
+    timeout_sec = limits.get("timeout_seconds", 10)
+
+    # Build exclude args
+    exclude_args = []
+    for d in _PROBE_IGNORE_DIRS:
+        exclude_args.extend(["--exclude-dir", d])
+
+    # Search for each keyword, collect file hit counts
+    file_hits: dict[str, set[str]] = {}  # path -> set of matched keywords
+    files_searched = 0
+
+    for keyword in keywords:
+        if time.time() - start_time > timeout_sec:
+            break
+        if len(keyword) < 2:
+            continue
+
+        for root in search_roots:
+            abs_root = project_root / root if not Path(root).is_absolute() else Path(root)
+            if not abs_root.exists():
+                continue
+
+            try:
+                # Try git grep first (faster in git repos)
+                cmd = ["git", "grep", "-l", "-i", "--no-color", keyword, "--", str(abs_root)]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, check=False,
+                    cwd=str(project_root), timeout=timeout_sec,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    for line in result.stdout.strip().split("\n"):
+                        line = line.strip()
+                        if line:
+                            file_hits.setdefault(line, set()).add(keyword)
+                elif result.returncode != 0:
+                    # Fallback to grep -rl
+                    cmd2 = ["grep", "-rl", "-i", keyword, str(abs_root)] + exclude_args
+                    result2 = subprocess.run(
+                        cmd2, capture_output=True, text=True, check=False,
+                        cwd=str(project_root), timeout=timeout_sec,
+                    )
+                    if result2.returncode == 0 and result2.stdout.strip():
+                        for line in result2.stdout.strip().split("\n"):
+                            line = line.strip()
+                            if line:
+                                # Make relative to project root
+                                try:
+                                    rel = str(Path(line).relative_to(project_root))
+                                except ValueError:
+                                    rel = line
+                                file_hits.setdefault(rel, set()).add(keyword)
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+
+    # Filter out ignored dirs and binary files
+    filtered_hits: dict[str, set[str]] = {}
+    for fpath, kws in file_hits.items():
+        parts = Path(fpath).parts
+        if any(p in _PROBE_IGNORE_DIRS for p in parts):
+            continue
+        abs_path = project_root / fpath
+        if abs_path.exists() and not _is_binary_file(abs_path):
+            filtered_hits[fpath] = kws
+        files_searched += 1
+
+    # Rank by hit count, take top N
+    ranked = sorted(filtered_hits.items(), key=lambda x: len(x[1]), reverse=True)
+    top_files = ranked[:max_files]
+
+    # Extract snippets
+    candidates = []
+    total_snippet_lines = 0
+
+    for fpath, matched_kws in top_files:
+        if total_snippet_lines >= max_total_lines:
+            break
+
+        abs_path = project_root / fpath
+        if not abs_path.exists():
+            continue
+
+        try:
+            lines = abs_path.read_text(encoding="utf-8", errors="replace").split("\n")
+        except OSError:
+            continue
+
+        # Find matching line numbers
+        match_lines: list[int] = []
+        for i, line in enumerate(lines):
+            for kw in matched_kws:
+                if kw.lower() in line.lower():
+                    match_lines.append(i)
+                    break
+
+        # Extract snippets around matches (context of 3 lines)
+        snippets = []
+        lines_used = 0
+        seen_ranges: set[tuple[int, int]] = set()
+
+        for ml in match_lines:
+            if lines_used >= max_lines_per_file:
+                break
+            if total_snippet_lines >= max_total_lines:
+                break
+
+            start = max(0, ml - 3)
+            end = min(len(lines), ml + 4)  # 3 before + match + 3 after = 7 lines
+
+            # Skip overlapping ranges
+            range_key = (start, end)
+            if range_key in seen_ranges:
+                continue
+            seen_ranges.add(range_key)
+
+            snippet_lines = lines[start:end]
+            snippet_lines = [_redact_secrets(l) for l in snippet_lines]
+            snippet_content = "\n".join(snippet_lines)
+
+            snippets.append({
+                "start_line": start + 1,
+                "end_line": end,
+                "content": snippet_content,
+            })
+            added = end - start
+            lines_used += added
+            total_snippet_lines += added
+
+        if snippets:
+            candidates.append({
+                "path": fpath,
+                "hit_count": len(matched_kws),
+                "keywords_matched": sorted(matched_kws),
+                "snippets": snippets,
+            })
+
+    elapsed_ms = int((time.time() - start_time) * 1000)
+
+    return {
+        "candidates": candidates,
+        "stats": {
+            "files_searched": files_searched,
+            "files_matched": len(filtered_hits),
+            "total_snippet_lines": total_snippet_lines,
+            "search_time_ms": elapsed_ms,
+        },
+    }
+
+
+def cmd_feedback_source_probe(args, h: Path) -> None:
+    """Run dynamic source code probe for a feedback item."""
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    feedback_text = fb.get("text", "")
+    keywords = _extract_probe_keywords(feedback_text)
+
+    if not keywords:
+        if args.json:
+            out_json({"status": "ok", "feedback_id": feedback_id,
+                      "message": "No keywords extracted", "candidates": []})
+        else:
+            print(f"No keywords extracted from feedback {feedback_id}")
+        return
+
+    # Find project root (parent of .harness)
+    project_root = h.parent
+
+    # Discover search roots
+    search_roots = _discover_search_roots(h, epic_id, project_root)
+
+    # Run probe
+    probe_result = _run_source_probe(project_root, keywords, search_roots, _PROBE_DEFAULTS)
+
+    output = {
+        "feedback_id": feedback_id,
+        "epic_id": epic_id,
+        "probed_at": now_iso(),
+        "keywords": keywords,
+        "search_roots": search_roots,
+        "candidates": probe_result["candidates"],
+        "stats": probe_result["stats"],
+        "resource_limits": _PROBE_DEFAULTS,
+    }
+
+    probe_path = _feedback_dir(h, epic_id) / f"{feedback_id}.source-probe.json"
+    atomic_write_json(probe_path, output)
+
+    if args.json:
+        out_json({"status": "ok", "path": str(probe_path), **output})
+    else:
+        print(f"Source probe completed for {feedback_id}")
+        print(f"  Keywords: {', '.join(keywords[:5])}")
+        print(f"  Search roots: {', '.join(search_roots[:3])}")
+        print(f"  Files matched: {probe_result['stats']['files_matched']}")
+        print(f"  Candidates: {len(probe_result['candidates'])}")
+        print(f"  Output: {probe_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -8741,6 +9058,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_rgap.add_argument("--phase", default="pre", choices=["pre", "stage"], help="Scan phase (pre or stage)")
     p_fb_rgap.add_argument("--json", action="store_true")
 
+    p_fb_sprobe = fb_sub.add_parser("source-probe", help="Run dynamic source code probe for a feedback item")
+    p_fb_sprobe.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_sprobe.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_sprobe.add_argument("--json", action="store_true")
+
     # ---- reopen ----
     p_reopen = sub.add_parser("reopen", help="Controlled stage reopen via approved feedback")
     p_reopen.add_argument("--epic-id", dest="epic_id", required=True)
@@ -9062,6 +9384,8 @@ def main() -> None:
             cmd_feedback_re_complete(args, h)
         elif args.feedback_action == "related-gap-scan":
             cmd_feedback_related_gap_scan(args, h)
+        elif args.feedback_action == "source-probe":
+            cmd_feedback_source_probe(args, h)
 
     elif args.command == "reopen":
         cmd_reopen(args, h)

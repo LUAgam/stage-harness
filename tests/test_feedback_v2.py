@@ -307,5 +307,150 @@ class TestRelatedGapScan(unittest.TestCase):
             self.assertTrue(len(data["sibling_categories"]) >= 5)
 
 
+def setup_git_repo_with_files(tmp_path: Path, epic_id: str) -> None:
+    """Create a git repo with sample source files for probe testing."""
+    # Init git repo
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"],
+                   cwd=str(tmp_path), capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"],
+                   cwd=str(tmp_path), capture_output=True, check=True)
+
+    # Create source files
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+
+    (src_dir / "mapping.ts").write_text(
+        "export const ENDPOINT_INFOS = {\n"
+        "  SQLSERVER: {\n"
+        "    enableMigrationDest: [{ name: 'OB_MYSQL' }],\n"
+        "    enableSyncDest: [{ name: 'OB_MYSQL' }],\n"
+        "  },\n"
+        "  POSTGRESQL: {\n"
+        "    enableMigrationDest: [{ name: 'OB_MYSQL' }],\n"
+        "  },\n"
+        "};\n"
+    )
+
+    (src_dir / "config.ts").write_text(
+        "export const DB_PASSWORD = 'super_secret_123';\n"
+        "export const API_KEY = 'sk-1234567890abcdef';\n"
+        "export const SQLSERVER_HOST = 'localhost';\n"
+    )
+
+    # Create ignored dir
+    nm_dir = tmp_path / "node_modules" / "pkg"
+    nm_dir.mkdir(parents=True)
+    (nm_dir / "index.js").write_text("const SQLSERVER = 'ignore me';\n")
+
+    # Commit all
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"],
+                   cwd=str(tmp_path), capture_output=True, check=True)
+
+
+class TestSourceProbe(unittest.TestCase):
+    """Test source evidence probe (P2)."""
+
+    def test_probe_finds_matching_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            setup_git_repo_with_files(tmp_path, epic_id)
+
+            # Submit feedback mentioning SQLSERVER
+            run_harnessctl(tmp_path, "feedback", "submit",
+                          "--epic-id", epic_id,
+                          "--text", "SQLSERVER enableMigrationDest missing POSTGRESQL")
+
+            result = run_harnessctl(tmp_path, "feedback", "source-probe",
+                                   "--epic-id", epic_id,
+                                   "--feedback-id", "HFB-001",
+                                   "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["status"], "ok")
+            self.assertTrue(len(data["candidates"]) > 0)
+
+            # mapping.ts should be in candidates
+            paths = [c["path"] for c in data["candidates"]]
+            self.assertTrue(any("mapping.ts" in p for p in paths))
+
+    def test_probe_skips_ignored_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            setup_git_repo_with_files(tmp_path, epic_id)
+
+            run_harnessctl(tmp_path, "feedback", "submit",
+                          "--epic-id", epic_id,
+                          "--text", "SQLSERVER configuration issue")
+
+            result = run_harnessctl(tmp_path, "feedback", "source-probe",
+                                   "--epic-id", epic_id,
+                                   "--feedback-id", "HFB-001",
+                                   "--json")
+            data = json.loads(result.stdout)
+
+            # node_modules files should NOT appear
+            paths = [c["path"] for c in data["candidates"]]
+            self.assertFalse(any("node_modules" in p for p in paths))
+
+    def test_probe_redacts_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            setup_git_repo_with_files(tmp_path, epic_id)
+
+            run_harnessctl(tmp_path, "feedback", "submit",
+                          "--epic-id", epic_id,
+                          "--text", "SQLSERVER config password issue")
+
+            result = run_harnessctl(tmp_path, "feedback", "source-probe",
+                                   "--epic-id", epic_id,
+                                   "--feedback-id", "HFB-001",
+                                   "--json")
+            data = json.loads(result.stdout)
+
+            # Check that secret lines are redacted in snippets
+            for candidate in data["candidates"]:
+                if "config.ts" in candidate["path"]:
+                    for snippet in candidate["snippets"]:
+                        content = snippet["content"]
+                        self.assertNotIn("super_secret_123", content)
+                        # Should contain REDACTED
+                        if "PASSWORD" in content.upper() or "API_KEY" in content.upper():
+                            self.assertIn("[REDACTED]", content)
+
+    def test_probe_respects_resource_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            setup_git_repo_with_files(tmp_path, epic_id)
+
+            run_harnessctl(tmp_path, "feedback", "submit",
+                          "--epic-id", epic_id,
+                          "--text", "SQLSERVER enableMigrationDest")
+
+            result = run_harnessctl(tmp_path, "feedback", "source-probe",
+                                   "--epic-id", epic_id,
+                                   "--feedback-id", "HFB-001",
+                                   "--json")
+            data = json.loads(result.stdout)
+
+            # Verify resource limits are reported
+            self.assertIn("resource_limits", data)
+            self.assertEqual(data["resource_limits"]["max_files"], 30)
+            self.assertEqual(data["resource_limits"]["max_total_snippet_lines"], 200)
+
+            # Verify total snippet lines don't exceed limit
+            total_lines = sum(
+                s["end_line"] - s["start_line"] + 1
+                for c in data["candidates"]
+                for s in c["snippets"]
+            )
+            self.assertLessEqual(total_lines, 200)
+
+
 if __name__ == "__main__":
     unittest.main()

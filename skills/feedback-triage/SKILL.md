@@ -79,6 +79,13 @@ $HARNESSCTL feedback evidence-pack \
 - spec 存在性
 - coverage-matrix 任务覆盖
 - source_evidence_hints（关键词 + 候选路径）
+- **source_probe_results**（P2 动态代码搜索结果）：
+  - 基于 feedback 关键词自动搜索项目源码
+  - 返回命中文件列表 + 短代码片段（每文件最多 20 行，总计最多 200 行）
+  - Council agents 可直接引用 `candidates[].snippets` 作为 evidence
+- spec 存在性
+- coverage-matrix 任务覆盖
+- source_evidence_hints（关键词 + 候选路径）
 
 ### Step 3: 初始化 Council
 
