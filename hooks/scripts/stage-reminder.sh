@@ -281,6 +281,8 @@ print(json.dumps({
     --epic-id "$ACTIVE_EPIC_ID" \
     --stage "$ACTIVE_STAGE" \
     --text "$EXCERPT" \
+    --source hook \
+    --candidate-type "$FEEDBACK_CANDIDATE_TYPE" \
     --json 2>/dev/null)
   AUTO_FB_ID=$(echo "$AUTO_FB_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('feedback_id',''))" 2>/dev/null)
 fi

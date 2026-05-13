@@ -5817,7 +5817,7 @@ def cmd_guard_check(args, h: Path, project_root: Path) -> None:
                         continue
                     try:
                         fb = json.loads(fb_file.read_text(encoding="utf-8"))
-                        if fb.get("status") in ("submitted", "approved", "reopened", "amending"):
+                        if fb.get("status") not in ("closed", "rejected", "deferred"):
                             issues.append(
                                 f"unresolved feedback {fb['feedback_id']} "
                                 f"(status: {fb['status']})"
@@ -6887,6 +6887,8 @@ def cmd_feedback_submit(args, h: Path) -> None:
         "submitted_in_stage": args.stage or "",
         "text": args.text,
         "status": "submitted",
+        "source": getattr(args, "source", "") or "",
+        "candidate_type": getattr(args, "candidate_type", "") or "",
     }
     _save_feedback(h, epic_id, feedback_id, data)
 
@@ -7067,6 +7069,11 @@ def cmd_reopen(args, h: Path) -> None:
     triage = load_json(triage_path)
     if not triage.get("requires_reopen"):
         err(f"Triage for {feedback_id} does not require reopen")
+
+    # Validate target matches triage recommendation
+    triage_target = triage.get("target_stage", "")
+    if triage_target and target_stage != triage_target:
+        err(f"Reopen target '{target_stage}' does not match triage recommendation '{triage_target}'")
 
     # Load state and update
     state_path = h / "features" / epic_id / "state.json"
@@ -8310,6 +8317,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_submit.add_argument("--epic-id", dest="epic_id", required=True)
     p_fb_submit.add_argument("--stage", default="", help="Stage where feedback was given")
     p_fb_submit.add_argument("--text", required=True, help="Feedback text")
+    p_fb_submit.add_argument("--source", default="", help="Source of feedback (e.g. hook, manual)")
+    p_fb_submit.add_argument("--candidate-type", dest="candidate_type", default="", help="Candidate type (correction, scope_gap_question, scope_change)")
     p_fb_submit.add_argument("--json", action="store_true")
 
     p_fb_list = fb_sub.add_parser("list", help="List feedback items")

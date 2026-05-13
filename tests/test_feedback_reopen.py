@@ -177,6 +177,21 @@ class TestReopen(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
 
+    def test_reopen_rejects_mismatched_target(self):
+        """Reopen must match triage target_stage."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            self._setup_approved_feedback(tmp_path, epic_id)
+
+            # Triage says CLARIFY, but we try SPEC
+            result = run_harnessctl(
+                tmp_path, "reopen", "--epic-id", epic_id,
+                "--to", "SPEC", "--feedback-id", "HFB-001", "--json",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("does not match triage recommendation", result.stderr)
+
     def test_reopen_invalidates_downstream_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
