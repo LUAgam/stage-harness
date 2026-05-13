@@ -7913,6 +7913,37 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
     if args.artifacts:
         artifacts = [a.strip() for a in args.artifacts.split(",") if a.strip()]
 
+    # Strong validation: verify artifacts exist on disk
+    warnings = []
+    features_dir = h / "features" / epic_id
+    for art_path in artifacts:
+        full_path = features_dir / art_path if not art_path.startswith("specs/") else h / art_path
+        # Handle directory references (e.g. "tasks/")
+        if art_path.endswith("/"):
+            if not full_path.exists():
+                warnings.append(f"artifact directory '{art_path}' does not exist")
+        else:
+            if not full_path.exists():
+                # Also check under h directly
+                alt_path = h / art_path
+                if not alt_path.exists():
+                    warnings.append(f"artifact '{art_path}' not found")
+
+    # Strong validation: check artifact-status shows current (not stale)
+    art_status_data = load_artifact_status(h, epic_id)
+    stale_artifacts = []
+    for art_entry in art_status_data.get("artifacts", []):
+        art_entry_path = art_entry.get("path", "")
+        entry_status = art_entry.get("status", "")
+        # Check if any listed artifact is still stale
+        for art_path in artifacts:
+            if art_path in art_entry_path or art_entry_path in art_path:
+                if entry_status in ("stale", "invalidated", "needs_amendment"):
+                    stale_artifacts.append(f"'{art_entry_path}' is still '{entry_status}'")
+
+    if stale_artifacts:
+        warnings.extend(stale_artifacts)
+
     completion = {
         "feedback_id": feedback_id,
         "epic_id": epic_id,
@@ -7920,6 +7951,8 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
         "completed_at": now_iso(),
         "revision_diff_path": str(rdiff_path.relative_to(h)),
         "canonical_artifacts_updated": artifacts,
+        "validation_warnings": warnings,
+        "validated": len(warnings) == 0,
     }
 
     completion_path = _feedback_dir(h, epic_id) / f"{feedback_id}.re-completion.json"
@@ -7935,6 +7968,149 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
         print(f"Re-{stage.lower()} completion marked for {feedback_id}")
         if artifacts:
             print(f"  Canonical artifacts updated: {', '.join(artifacts)}")
+        if warnings:
+            print(f"  Validation warnings ({len(warnings)}):")
+            for w in warnings:
+                print(f"    - {w}")
+
+
+def _auto_discover_related_gaps(h: Path, epic_id: str, feedback_id: str,
+                                primary_gap: str, categories: list[dict]) -> list[dict]:
+    """Auto-discover related gaps by analyzing source-probe, coverage, tasks, and spec."""
+    import re as _re
+    gaps: list[dict] = []
+    features_dir = h / "features" / epic_id
+
+    # Extract keywords from primary gap
+    cn_kw = _re.findall(r'[\u4e00-\u9fff]{2,4}', primary_gap)[:5]
+    en_kw = _re.findall(r'[A-Za-z_][A-Za-z0-9_]{2,}', primary_gap)[:5]
+    keywords = set(k.lower() for k in cn_kw + en_kw)
+
+    if not keywords:
+        return gaps
+
+    # 1. Analyze source-probe results: find categories with matching files
+    probe_path = _feedback_dir(h, epic_id) / f"{feedback_id}.source-probe.json"
+    if probe_path.exists():
+        try:
+            probe = json.loads(probe_path.read_text(encoding="utf-8"))
+            candidate_paths = [c.get("path", "") for c in probe.get("candidates", [])]
+
+            # Classify candidate paths into categories
+            category_map = {
+                "frontend": ["src/pages", "src/components", "src/views", "ui/", "frontend/", ".tsx", ".vue", ".jsx"],
+                "backend": ["src/service", "src/api", "src/controller", "server/", "backend/", "handler"],
+                "data": ["migration", "schema", "seed", "sql/", "database/"],
+                "test": ["test/", "tests/", "spec/", "__tests__", ".test.", ".spec."],
+                "config": ["config/", ".env", "settings", "constants"],
+                "docs": ["docs/", "README", "CHANGELOG", ".md"],
+            }
+
+            found_categories: dict[str, list[str]] = {}
+            for cp in candidate_paths:
+                cp_lower = cp.lower()
+                for cat, patterns in category_map.items():
+                    if any(p in cp_lower for p in patterns):
+                        found_categories.setdefault(cat, []).append(cp)
+
+            # If primary gap is in one category, flag other categories with matches as related
+            primary_cat = ""
+            for cat, patterns in category_map.items():
+                if any(p in primary_gap.lower() for p in patterns):
+                    primary_cat = cat
+                    break
+
+            for cat, paths in found_categories.items():
+                if cat != primary_cat and len(paths) > 0:
+                    gaps.append({
+                        "category": cat,
+                        "description": f"Source probe found {len(paths)} related file(s) in '{cat}' category",
+                        "confidence": min(0.5 + 0.1 * len(paths), 0.9),
+                        "evidence": paths[:3],
+                        "source": "source_probe",
+                    })
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 2. Analyze coverage-matrix: find uncovered acceptance criteria related to keywords
+    coverage_path = features_dir / "coverage-matrix.json"
+    if coverage_path.exists():
+        try:
+            coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+            uncovered = []
+            for item in coverage.get("criteria", coverage.get("tasks", [])):
+                criterion = item.get("criterion", item.get("title", ""))
+                covered = item.get("covered", item.get("status", "")) in ("covered", "done")
+                if not covered and any(kw in criterion.lower() for kw in keywords):
+                    uncovered.append(criterion)
+
+            if uncovered:
+                gaps.append({
+                    "category": "test",
+                    "description": f"{len(uncovered)} acceptance criteria related to feedback are uncovered",
+                    "confidence": 0.8,
+                    "evidence": uncovered[:3],
+                    "source": "coverage_matrix",
+                })
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 3. Analyze tasks: find if related tasks are missing
+    tasks_dir = h / "tasks"
+    task_surfaces: set[str] = set()
+    if tasks_dir.exists():
+        for tf in tasks_dir.glob(f"{epic_id}.*.json"):
+            try:
+                task = json.loads(tf.read_text(encoding="utf-8"))
+                surface = task.get("surface", "")
+                title = task.get("title", "")
+                if any(kw in title.lower() for kw in keywords):
+                    task_surfaces.add(surface)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    # Check if feedback keywords appear in surfaces but no task covers them
+    sr_path = features_dir / "surface-routing.json"
+    if sr_path.exists():
+        try:
+            sr = json.loads(sr_path.read_text(encoding="utf-8"))
+            surfaces = sr.get("surfaces", [])
+            if isinstance(surfaces, dict):
+                surfaces = list(surfaces.values())
+            for s in surfaces:
+                s_path = s.get("path", "")
+                s_name = s.get("name", s_path)
+                if any(kw in s_name.lower() or kw in s_path.lower() for kw in keywords):
+                    if s_path not in task_surfaces and s_name not in task_surfaces:
+                        gaps.append({
+                            "category": _classify_surface(s_path),
+                            "description": f"Surface '{s_name}' matches feedback keywords but has no task",
+                            "confidence": 0.7,
+                            "evidence": [s_path],
+                            "source": "surface_routing",
+                        })
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return gaps
+
+
+def _classify_surface(path: str) -> str:
+    """Classify a surface path into a category."""
+    p = path.lower()
+    if any(x in p for x in ["ui/", "frontend/", "pages/", "components/", ".tsx", ".vue", ".jsx"]):
+        return "frontend"
+    if any(x in p for x in ["api/", "service/", "controller/", "server/", "handler"]):
+        return "backend"
+    if any(x in p for x in ["test/", "tests/", "spec/", "__tests__"]):
+        return "test"
+    if any(x in p for x in ["config/", ".env", "settings"]):
+        return "config"
+    if any(x in p for x in ["docs/", "README"]):
+        return "docs"
+    if any(x in p for x in ["migration", "schema", "sql/"]):
+        return "data"
+    return "infra"
 
 
 def cmd_feedback_related_gap_scan(args, h: Path) -> None:
@@ -7950,8 +8126,8 @@ def cmd_feedback_related_gap_scan(args, h: Path) -> None:
     # Extract primary gap from feedback text
     primary_gap = fb.get("text", "")
 
-    # Standard sibling categories
-    sibling_categories = [
+    # Load custom dimensions from project-profile.yaml if configured
+    default_categories = [
         {"category": "frontend", "check": "Pages, components, routes, menus, state management"},
         {"category": "backend", "check": "APIs, services, repositories, models, middleware"},
         {"category": "data", "check": "Schema, migrations, seed data, indexes"},
@@ -7963,6 +8139,26 @@ def cmd_feedback_related_gap_scan(args, h: Path) -> None:
         {"category": "infra", "check": "Deployment, CI/CD, monitoring, alerting"},
     ]
 
+    sibling_categories = default_categories
+    profile_path = h / PROFILE_FILE
+    if profile_path.exists():
+        try:
+            profile = _parse_simple_yaml(profile_path.read_text(encoding="utf-8"))
+            custom_dims = profile.get("related_gap_dimensions", [])
+            if custom_dims and isinstance(custom_dims, list):
+                # Custom dimensions override defaults
+                sibling_categories = []
+                for dim in custom_dims:
+                    if isinstance(dim, str):
+                        sibling_categories.append({"category": dim, "check": ""})
+                    elif isinstance(dim, dict):
+                        sibling_categories.append(dim)
+        except OSError:
+            pass
+
+    # Auto-discovery: analyze existing artifacts to find related gaps
+    related_gaps = _auto_discover_related_gaps(h, epic_id, feedback_id, primary_gap, sibling_categories)
+
     scan_result = {
         "feedback_id": feedback_id,
         "epic_id": epic_id,
@@ -7970,9 +8166,10 @@ def cmd_feedback_related_gap_scan(args, h: Path) -> None:
         "scan_phase": args.phase if hasattr(args, "phase") and args.phase else "pre",
         "primary_gap": primary_gap,
         "sibling_categories": sibling_categories,
-        "related_gaps": [],
+        "related_gaps": related_gaps,
+        "auto_discovered": len(related_gaps) > 0,
         "scanned_at": now_iso(),
-        "recommendation": "Agents should fill related_gaps based on sibling_categories analysis",
+        "recommendation": "Review auto-discovered gaps and fill remaining sibling_categories manually" if related_gaps else "Agents should fill related_gaps based on sibling_categories analysis",
     }
 
     scan_path = _feedback_dir(h, epic_id) / f"{feedback_id}.related-gap-scan.json"
@@ -8502,6 +8699,128 @@ def cmd_feedback_coverage_check(args, h: Path) -> None:
             for g in gaps:
                 print(f"  {g['feedback_id']} [{g['status']}]: {', '.join(g['gaps'])}")
             sys.exit(1)
+
+
+def cmd_feedback_reopen_stats(args, h: Path) -> None:
+    """Generate reopen root-cause statistics and pitfall patterns across all epics or a specific epic."""
+    epic_filter = getattr(args, "epic_id", None)
+
+    features_dir = h / "features"
+    if not features_dir.exists():
+        if args.json:
+            out_json({"status": "ok", "total_reopens": 0, "patterns": [], "pitfalls": []})
+        else:
+            print("No features directory found")
+        return
+
+    # Collect all triage data
+    reopen_records: list[dict] = []
+
+    epic_dirs = [features_dir / epic_filter] if epic_filter else sorted(features_dir.iterdir())
+    for epic_dir in epic_dirs:
+        if not epic_dir.is_dir():
+            continue
+        fb_dir = epic_dir / "feedback"
+        if not fb_dir.exists():
+            continue
+
+        for triage_file in sorted(fb_dir.glob("HFB-*.triage.json")):
+            try:
+                triage = json.loads(triage_file.read_text(encoding="utf-8"))
+                decision = triage.get("decision", "")
+                if not decision.upper().startswith("REOPEN"):
+                    continue
+
+                # Load the feedback text
+                fb_id = triage.get("feedback_id", triage_file.stem.replace(".triage", ""))
+                fb_file = fb_dir / f"{fb_id}.json"
+                fb_text = ""
+                if fb_file.exists():
+                    fb_data = json.loads(fb_file.read_text(encoding="utf-8"))
+                    fb_text = fb_data.get("text", "")
+
+                reopen_records.append({
+                    "epic_id": epic_dir.name,
+                    "feedback_id": fb_id,
+                    "decision": decision.upper(),
+                    "classification": triage.get("classification", ""),
+                    "target_stage": triage.get("target_stage", ""),
+                    "confidence": triage.get("confidence", 0),
+                    "reason": triage.get("reason", ""),
+                    "text": fb_text,
+                })
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    # Aggregate statistics
+    by_classification: dict[str, int] = {}
+    by_target_stage: dict[str, int] = {}
+    by_decision: dict[str, int] = {}
+
+    for r in reopen_records:
+        cls = r["classification"] or "unknown"
+        by_classification[cls] = by_classification.get(cls, 0) + 1
+        stage = r["target_stage"] or "unknown"
+        by_target_stage[stage] = by_target_stage.get(stage, 0) + 1
+        dec = r["decision"]
+        by_decision[dec] = by_decision.get(dec, 0) + 1
+
+    # Generate pitfall patterns from repeated classifications
+    pitfalls: list[dict] = []
+    for cls, count in sorted(by_classification.items(), key=lambda x: x[1], reverse=True):
+        if count >= 2:
+            # Find example reasons
+            examples = [r["reason"][:80] for r in reopen_records if r["classification"] == cls][:3]
+            pitfalls.append({
+                "pattern": cls,
+                "occurrences": count,
+                "severity": "high" if count >= 3 else "medium",
+                "examples": examples,
+                "recommendation": _pitfall_recommendation(cls),
+            })
+
+    result = {
+        "total_reopens": len(reopen_records),
+        "by_classification": by_classification,
+        "by_target_stage": by_target_stage,
+        "by_decision": by_decision,
+        "pitfalls": pitfalls,
+        "records": reopen_records if not args.json else reopen_records[:20],
+    }
+
+    # Write stats file
+    stats_path = h / "metrics" / "reopen-stats.json"
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(stats_path, {**result, "generated_at": now_iso()})
+
+    if args.json:
+        out_json({"status": "ok", "path": str(stats_path), **result})
+    else:
+        print(f"Reopen statistics ({len(reopen_records)} total reopens):")
+        print(f"  By classification:")
+        for cls, count in sorted(by_classification.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {cls}: {count}")
+        print(f"  By target stage:")
+        for stage, count in sorted(by_target_stage.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {stage}: {count}")
+        if pitfalls:
+            print(f"  Pitfall patterns ({len(pitfalls)}):")
+            for p in pitfalls:
+                print(f"    [{p['severity']}] {p['pattern']} ({p['occurrences']}x): {p['recommendation']}")
+        print(f"  Output: {stats_path}")
+
+
+def _pitfall_recommendation(classification: str) -> str:
+    """Generate a recommendation based on reopen classification pattern."""
+    recommendations = {
+        "scope_gap": "Add explicit scope checklist to CLARIFY stage; verify all surfaces are enumerated",
+        "scope_gap_question": "Strengthen surface-routing coverage; add frontend/backend/config cross-check",
+        "requirement_gap": "Improve requirements elicitation; add domain expert review step",
+        "correction": "Add peer review for CLARIFY conclusions; cross-validate with code evidence",
+        "scope_change": "Establish scope freeze point; require explicit user confirmation for scope items",
+        "blocker": "Add risk assessment to PLAN stage; identify blockers earlier",
+    }
+    return recommendations.get(classification, "Review CLARIFY/SPEC process for this pattern")
 
 
 # ---------------------------------------------------------------------------
@@ -9063,6 +9382,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_sprobe.add_argument("--feedback-id", dest="feedback_id", required=True)
     p_fb_sprobe.add_argument("--json", action="store_true")
 
+    p_fb_rstats = fb_sub.add_parser("reopen-stats", help="Generate reopen root-cause statistics and pitfall patterns")
+    p_fb_rstats.add_argument("--epic-id", dest="epic_id", default=None, help="Filter by epic (optional)")
+    p_fb_rstats.add_argument("--json", action="store_true")
+
     # ---- reopen ----
     p_reopen = sub.add_parser("reopen", help="Controlled stage reopen via approved feedback")
     p_reopen.add_argument("--epic-id", dest="epic_id", required=True)
@@ -9386,6 +9709,8 @@ def main() -> None:
             cmd_feedback_related_gap_scan(args, h)
         elif args.feedback_action == "source-probe":
             cmd_feedback_source_probe(args, h)
+        elif args.feedback_action == "reopen-stats":
+            cmd_feedback_reopen_stats(args, h)
 
     elif args.command == "reopen":
         cmd_reopen(args, h)
