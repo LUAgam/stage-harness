@@ -400,5 +400,252 @@ class TestTaskGraphMerge(unittest.TestCase):
             self.assertEqual(new_task["added_by_feedback"], "HFB-001")
 
 
+class TestFeedbackEvidencePack(unittest.TestCase):
+    def test_evidence_pack_collects_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "OMS前端页面不需要调整吗", "--json")
+
+            result = run_harnessctl(tmp_path, "feedback", "evidence-pack",
+                                    "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["feedback_id"], "HFB-001")
+            self.assertIn("artifacts", data)
+            self.assertIn("source_evidence_hints", data)
+            self.assertIn("keywords", data["source_evidence_hints"])
+            # Should extract Chinese keywords from feedback text
+            self.assertTrue(len(data["source_evidence_hints"]["keywords"]) > 0)
+
+    def test_evidence_pack_missing_feedback_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            result = run_harnessctl(tmp_path, "feedback", "evidence-pack",
+                                    "--epic-id", epic_id, "--feedback-id", "HFB-999", "--json")
+            self.assertNotEqual(result.returncode, 0)
+
+
+class TestFeedbackCouncilTriage(unittest.TestCase):
+    def test_council_triage_requires_evidence_pack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "test", "--json")
+            # No evidence-pack collected
+            result = run_harnessctl(tmp_path, "feedback", "council-triage",
+                                    "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_council_triage_creates_votes_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "test", "--json")
+            run_harnessctl(tmp_path, "feedback", "evidence-pack",
+                           "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+
+            result = run_harnessctl(tmp_path, "feedback", "council-triage",
+                                    "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["council_type"], "feedback_triage_council")
+            self.assertEqual(len(data["agents"]), 6)
+            # Verify votes dir exists
+            votes_dir = Path(data["votes_dir"])
+            self.assertTrue(votes_dir.exists())
+
+
+class TestFeedbackAggregateTriage(unittest.TestCase):
+    def _setup_council(self, tmp_path: Path):
+        epic_id = setup_harness_with_epic(tmp_path)
+        run_harnessctl(tmp_path, "feedback", "submit",
+                       "--epic-id", epic_id, "--text", "test gap", "--json")
+        run_harnessctl(tmp_path, "feedback", "evidence-pack",
+                       "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+        r = run_harnessctl(tmp_path, "feedback", "council-triage",
+                           "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+        config = json.loads(r.stdout)
+        return epic_id, Path(config["votes_dir"])
+
+    def test_aggregate_reopen_clarify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id, votes_dir = self._setup_council(tmp_path)
+
+            # Write votes: majority says REOPEN_CLARIFY
+            for agent in ["requirement-analyst", "impact-analyst", "challenger"]:
+                vote = {
+                    "agent": agent, "feedback_id": "HFB-001",
+                    "decision": "REOPEN_CLARIFY",
+                    "classification": "requirement_gap",
+                    "confidence": 0.85, "evidence": ["missing impact"]
+                }
+                (votes_dir / f"{agent}.json").write_text(json.dumps(vote))
+            for agent in ["plan-reviewer", "test-reviewer", "code-reviewer"]:
+                vote = {
+                    "agent": agent, "feedback_id": "HFB-001",
+                    "decision": "REOPEN_PLAN",
+                    "classification": "plan_defect",
+                    "confidence": 0.7, "evidence": ["tasks missing"]
+                }
+                (votes_dir / f"{agent}.json").write_text(json.dumps(vote))
+
+            result = run_harnessctl(tmp_path, "feedback", "aggregate-triage",
+                                    "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["decision"], "REOPEN_CLARIFY")
+            self.assertTrue(data["requires_reopen"])
+            self.assertEqual(data["target_stage"], "CLARIFY")
+
+    def test_aggregate_no_reopen_with_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id, votes_dir = self._setup_council(tmp_path)
+
+            # All agents say NO_REOPEN with evidence
+            for agent in ["requirement-analyst", "impact-analyst", "challenger",
+                          "plan-reviewer", "test-reviewer", "code-reviewer"]:
+                vote = {
+                    "agent": agent, "feedback_id": "HFB-001",
+                    "decision": "NO_REOPEN_WITH_EVIDENCE",
+                    "classification": "",
+                    "confidence": 0.9, "evidence": ["checked, no gap"]
+                }
+                (votes_dir / f"{agent}.json").write_text(json.dumps(vote))
+
+            result = run_harnessctl(tmp_path, "feedback", "aggregate-triage",
+                                    "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["decision"], "NO_REOPEN_WITH_EVIDENCE")
+            self.assertFalse(data["requires_reopen"])
+
+    def test_aggregate_insufficient_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id, votes_dir = self._setup_council(tmp_path)
+
+            # All say NO_REOPEN but without evidence
+            for agent in ["requirement-analyst", "impact-analyst", "challenger",
+                          "plan-reviewer", "test-reviewer", "code-reviewer"]:
+                vote = {
+                    "agent": agent, "feedback_id": "HFB-001",
+                    "decision": "NO_REOPEN_WITH_EVIDENCE",
+                    "classification": "",
+                    "confidence": 0.5, "evidence": []  # empty!
+                }
+                (votes_dir / f"{agent}.json").write_text(json.dumps(vote))
+
+            result = run_harnessctl(tmp_path, "feedback", "aggregate-triage",
+                                    "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["decision"], "INSUFFICIENT_EVIDENCE")
+
+    def test_aggregate_writes_triage_json_always(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id, votes_dir = self._setup_council(tmp_path)
+
+            # NO_REOPEN with evidence
+            for agent in ["requirement-analyst", "impact-analyst", "challenger",
+                          "plan-reviewer", "test-reviewer", "code-reviewer"]:
+                vote = {
+                    "agent": agent, "feedback_id": "HFB-001",
+                    "decision": "NO_REOPEN_WITH_EVIDENCE",
+                    "classification": "",
+                    "confidence": 0.9, "evidence": ["verified ok"]
+                }
+                (votes_dir / f"{agent}.json").write_text(json.dumps(vote))
+
+            run_harnessctl(tmp_path, "feedback", "aggregate-triage",
+                           "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+
+            # Verify triage.json was written even for NO_REOPEN
+            triage_path = tmp_path / ".harness" / "features" / epic_id / "feedback" / "HFB-001.triage.json"
+            self.assertTrue(triage_path.exists())
+            triage = json.loads(triage_path.read_text())
+            self.assertEqual(triage["decision"], "NO_REOPEN_WITH_EVIDENCE")
+            self.assertEqual(triage["triaged_by"], "feedback_triage_council")
+
+    def test_aggregate_picks_earliest_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id, votes_dir = self._setup_council(tmp_path)
+
+            # Mix of REOPEN_SPEC and REOPEN_PLAN
+            vote1 = {"agent": "impact-analyst", "feedback_id": "HFB-001",
+                     "decision": "REOPEN_SPEC", "classification": "spec_gap",
+                     "confidence": 0.8, "evidence": ["spec missing"]}
+            vote2 = {"agent": "plan-reviewer", "feedback_id": "HFB-001",
+                     "decision": "REOPEN_PLAN", "classification": "plan_defect",
+                     "confidence": 0.9, "evidence": ["tasks missing"]}
+            vote3 = {"agent": "code-reviewer", "feedback_id": "HFB-001",
+                     "decision": "STAY_EXECUTE", "classification": "implementation_bug",
+                     "confidence": 0.7, "evidence": ["code gap"]}
+            (votes_dir / "impact-analyst.json").write_text(json.dumps(vote1))
+            (votes_dir / "plan-reviewer.json").write_text(json.dumps(vote2))
+            (votes_dir / "code-reviewer.json").write_text(json.dumps(vote3))
+
+            result = run_harnessctl(tmp_path, "feedback", "aggregate-triage",
+                                    "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            # SPEC is earlier than PLAN, so should pick SPEC
+            self.assertEqual(data["decision"], "REOPEN_SPEC")
+            self.assertEqual(data["target_stage"], "SPEC")
+
+    def test_votes_dir_is_feedback_scoped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+
+            # Submit two feedbacks
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "fb1", "--json")
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "fb2", "--json")
+
+            # Evidence-pack + council-triage for both
+            for fb_id in ["HFB-001", "HFB-002"]:
+                run_harnessctl(tmp_path, "feedback", "evidence-pack",
+                               "--epic-id", epic_id, "--feedback-id", fb_id, "--json")
+                r = run_harnessctl(tmp_path, "feedback", "council-triage",
+                                   "--epic-id", epic_id, "--feedback-id", fb_id, "--json")
+                config = json.loads(r.stdout)
+                # Verify paths are different
+                self.assertIn(fb_id, config["votes_dir"])
+
+            # Verify directories are separate
+            base = tmp_path / ".harness" / "features" / epic_id / "councils" / "feedback_triage_council"
+            self.assertTrue((base / "HFB-001" / "votes").exists())
+            self.assertTrue((base / "HFB-002" / "votes").exists())
+
+
+class TestGuardBlocksSubmittedFeedback(unittest.TestCase):
+    def test_guard_blocks_submitted_feedback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+
+            # Submit feedback (status=submitted, not yet triaged)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--stage", "EXECUTE",
+                           "--text", "test question", "--json")
+
+            # Guard check should block
+            result = run_harnessctl(tmp_path, "guard", "check",
+                                    "--epic-id", epic_id, "--stage", "EXECUTE", "--json")
+            data = json.loads(result.stdout)
+            feedback_issues = [i for i in data["issues"] if "unresolved feedback" in i]
+            self.assertGreater(len(feedback_issues), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

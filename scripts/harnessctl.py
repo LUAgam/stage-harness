@@ -5817,7 +5817,7 @@ def cmd_guard_check(args, h: Path, project_root: Path) -> None:
                         continue
                     try:
                         fb = json.loads(fb_file.read_text(encoding="utf-8"))
-                        if fb.get("status") in ("approved", "reopened", "amending"):
+                        if fb.get("status") in ("submitted", "approved", "reopened", "amending"):
                             issues.append(
                                 f"unresolved feedback {fb['feedback_id']} "
                                 f"(status: {fb['status']})"
@@ -6770,6 +6770,26 @@ FEEDBACK_CLASSIFICATIONS = [
 
 ARTIFACT_STATUSES = ["current", "stale", "invalidated", "needs_amendment", "superseded"]
 
+FEEDBACK_TRIAGE_OUTCOMES = [
+    "REOPEN_CLARIFY",
+    "REOPEN_SPEC",
+    "REOPEN_PLAN",
+    "STAY_EXECUTE",
+    "NO_REOPEN_WITH_EVIDENCE",
+    "INSUFFICIENT_EVIDENCE",
+    "REJECT",
+    "DEFER",
+]
+
+FEEDBACK_TRIAGE_COUNCIL_AGENTS = [
+    "requirement-analyst",
+    "impact-analyst",
+    "challenger",
+    "plan-reviewer",
+    "test-reviewer",
+    "code-reviewer",
+]
+
 
 def _feedback_dir(h: Path, epic_id: str) -> Path:
     """Return the feedback directory for an epic, creating if needed."""
@@ -7240,6 +7260,303 @@ def cmd_feedback_close(args, h: Path) -> None:
         out_json({"status": "ok", "feedback_id": feedback_id, "final_status": final_status})
     else:
         print(f"Feedback {feedback_id} -> {final_status}")
+
+
+def cmd_feedback_evidence_pack(args, h: Path) -> None:
+    """Collect evidence pack for feedback triage council."""
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    features_dir = h / "features" / epic_id
+
+    # 1. Feedback metadata
+    feedback_text = fb.get("text", "")
+    feedback_stage = fb.get("submitted_in_stage", "")
+
+    # 2. Impact scan
+    impact_scan_path = features_dir / "impact-scan.md"
+    impact_scan_exists = impact_scan_path.exists()
+
+    # 3. Surface routing (兼容 list 和 dict 格式)
+    surface_routing_path = features_dir / "surface-routing.json"
+    surfaces = []
+    if surface_routing_path.exists():
+        sr_data = load_json(surface_routing_path)
+        surfaces_raw = sr_data.get("surfaces", [])
+        if isinstance(surfaces_raw, list):
+            surfaces = [s for s in surfaces_raw if isinstance(s, dict)]
+        elif isinstance(surfaces_raw, dict):
+            surfaces = [
+                {"name": k, **(v if isinstance(v, dict) else {"value": v})}
+                for k, v in surfaces_raw.items()
+            ]
+
+    # 4. Spec
+    spec_path = h / "specs" / f"{epic_id}.md"
+    spec_exists = spec_path.exists()
+
+    # 5. Coverage matrix
+    coverage_path = features_dir / "coverage-matrix.json"
+    coverage = load_json(coverage_path) if coverage_path.exists() else {}
+
+    # 6. Tasks
+    tasks_dir = h / "tasks"
+    tasks = []
+    for tf in sorted(tasks_dir.glob(f"{epic_id}.*.json")):
+        tasks.append(load_json(tf))
+
+    # 7. Source evidence hints — 从 feedback text 提取关键词
+    import re as _re
+    cn_keywords = _re.findall(r'[\u4e00-\u9fff]{2,4}', feedback_text)[:10]
+    en_keywords = _re.findall(r'[A-Za-z_]{3,}', feedback_text)[:10]
+    keywords = list(set(cn_keywords + en_keywords))
+
+    # 匹配 candidate surfaces
+    candidate_surfaces = []
+    candidate_paths = []
+    for surface in surfaces:
+        surface_name = surface.get("path", "") or surface.get("name", "")
+        for kw in keywords:
+            if kw.lower() in surface_name.lower():
+                candidate_surfaces.append(surface)
+                candidate_paths.append(surface_name)
+                break
+
+    evidence_pack = {
+        "feedback_id": feedback_id,
+        "epic_id": epic_id,
+        "collected_at": now_iso(),
+        "feedback": {
+            "text": feedback_text,
+            "stage": feedback_stage,
+            "status": fb.get("status", ""),
+        },
+        "artifacts": {
+            "impact_scan": {
+                "exists": impact_scan_exists,
+                "path": str(impact_scan_path),
+            },
+            "surface_routing": {
+                "exists": surface_routing_path.exists(),
+                "surfaces": surfaces,
+            },
+            "spec": {
+                "exists": spec_exists,
+                "path": str(spec_path),
+            },
+            "coverage_matrix": {
+                "exists": coverage_path.exists(),
+                "task_count": len(coverage.get("tasks", [])) if coverage else 0,
+            },
+            "tasks": {
+                "total": len(tasks),
+                "titles": [t.get("title", "") for t in tasks],
+                "surfaces": list(set(t.get("surface", "") for t in tasks if t.get("surface"))),
+            },
+        },
+        "source_evidence_hints": {
+            "keywords": keywords,
+            "candidate_surfaces": candidate_surfaces,
+            "candidate_paths": candidate_paths,
+            "repo_ids": list(set(
+                s.get("repo_id", "") for s in candidate_surfaces if s.get("repo_id")
+            )),
+        },
+    }
+
+    pack_path = _feedback_dir(h, epic_id) / f"{feedback_id}.evidence-pack.json"
+    atomic_write_json(pack_path, evidence_pack)
+
+    if args.json:
+        out_json({"status": "ok", "path": str(pack_path), **evidence_pack})
+    else:
+        print(f"Evidence pack collected for {feedback_id}")
+        print(f"  Impact scan: {'found' if impact_scan_exists else 'MISSING'}")
+        print(f"  Surface routing: {len(surfaces)} surfaces ({len(candidate_surfaces)} matched)")
+        print(f"  Spec: {'found' if spec_exists else 'MISSING'}")
+        print(f"  Tasks: {len(tasks)} total")
+        print(f"  Keywords: {', '.join(keywords[:5])}")
+
+
+def cmd_feedback_council_triage(args, h: Path) -> None:
+    """Initialize feedback triage council for multi-agent review."""
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    _load_feedback(h, epic_id, feedback_id)  # validate exists
+
+    # Verify evidence-pack exists
+    pack_path = _feedback_dir(h, epic_id) / f"{feedback_id}.evidence-pack.json"
+    if not pack_path.exists():
+        err(f"Evidence pack not found for {feedback_id}. Run: feedback evidence-pack first")
+
+    # Initialize votes directory (scoped by feedback-id)
+    councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council" / feedback_id
+    votes_dir = councils_dir / "votes"
+    votes_dir.mkdir(parents=True, exist_ok=True)
+
+    config = {
+        "status": "ok",
+        "council_type": "feedback_triage_council",
+        "epic_id": epic_id,
+        "feedback_id": feedback_id,
+        "evidence_pack_path": str(pack_path),
+        "votes_dir": str(votes_dir),
+        "agents": FEEDBACK_TRIAGE_COUNCIL_AGENTS,
+        "valid_decisions": FEEDBACK_TRIAGE_OUTCOMES,
+    }
+
+    # Write council metadata
+    meta_path = councils_dir / "metadata.json"
+    atomic_write_json(meta_path, {
+        "council_type": "feedback_triage_council",
+        "feedback_id": feedback_id,
+        "epic_id": epic_id,
+        "evidence_pack_path": str(pack_path),
+        "votes_dir": str(votes_dir),
+        "initialized_at": now_iso(),
+        "status": "initialized",
+    })
+
+    if args.json:
+        out_json(config)
+    else:
+        print(f"Feedback triage council initialized for {feedback_id}")
+        print(f"  Agents: {', '.join(FEEDBACK_TRIAGE_COUNCIL_AGENTS)}")
+        print(f"  Votes dir: {votes_dir}")
+        print(f"  Evidence pack: {pack_path}")
+        print(f"\n  Next: dispatch each agent, then run:")
+        print(f"    harnessctl feedback aggregate-triage --epic-id {epic_id} --feedback-id {feedback_id}")
+
+
+def cmd_feedback_aggregate_triage(args, h: Path) -> None:
+    """Aggregate feedback triage council votes into routing decision."""
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    _load_feedback(h, epic_id, feedback_id)  # validate exists
+
+    # Load votes
+    councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council" / feedback_id
+    votes_dir = councils_dir / "votes"
+    if not votes_dir.exists() or not any(votes_dir.glob("*.json")):
+        err(f"No vote files in {votes_dir}")
+
+    votes = []
+    for vf in sorted(votes_dir.glob("*.json")):
+        try:
+            votes.append(load_json(vf))
+        except SystemExit:
+            pass
+
+    total = len(votes)
+    if total == 0:
+        err("No valid votes found")
+
+    # Categorize votes
+    stage_priority = {"CLARIFY": 0, "SPEC": 1, "PLAN": 2, "EXECUTE": 3}
+    reopen_votes = [v for v in votes if v.get("decision", "").startswith("REOPEN_")]
+    no_reopen_votes = [v for v in votes if v.get("decision", "") in (
+        "NO_REOPEN_WITH_EVIDENCE", "STAY_EXECUTE")]
+
+    # Determine final decision
+    if reopen_votes:
+        # Pick earliest (most upstream) stage
+        def _stage_from_decision(d):
+            return d.get("decision", "").replace("REOPEN_", "")
+
+        earliest = min(reopen_votes,
+                       key=lambda v: stage_priority.get(_stage_from_decision(v), 99))
+        final_decision = earliest["decision"]
+        target_stage = _stage_from_decision(earliest)
+
+        # Classification from highest-confidence vote at that stage
+        same_stage = [v for v in reopen_votes if v.get("decision") == final_decision]
+        best = max(same_stage, key=lambda v: v.get("confidence", 0))
+        classification = best.get("classification", "requirement_gap")
+        max_confidence = best.get("confidence", 0)
+    elif len(no_reopen_votes) == total:
+        # Check evidence sufficiency
+        empty_evidence = [v for v in votes if not v.get("evidence")]
+        if empty_evidence:
+            final_decision = "INSUFFICIENT_EVIDENCE"
+            target_stage = ""
+            classification = ""
+            max_confidence = 0
+        else:
+            final_decision = "NO_REOPEN_WITH_EVIDENCE"
+            target_stage = ""
+            classification = ""
+            max_confidence = max((v.get("confidence", 0) for v in votes), default=0)
+    else:
+        # Mixed: some no_reopen, some other (REJECT, DEFER, etc.)
+        final_decision = "INSUFFICIENT_EVIDENCE"
+        target_stage = ""
+        classification = ""
+        max_confidence = 0
+
+    requires_reopen = final_decision.startswith("REOPEN_")
+
+    # Build vote summary
+    vote_summary = {
+        "total": total,
+        "reopen": len(reopen_votes),
+        "no_reopen": len(no_reopen_votes),
+        "other": total - len(reopen_votes) - len(no_reopen_votes),
+        "votes": [
+            {"agent": v.get("agent", ""), "decision": v.get("decision", ""),
+             "confidence": v.get("confidence", 0)}
+            for v in votes
+        ],
+    }
+
+    # Write triage.json (always, regardless of decision)
+    triage_data = {
+        "feedback_id": feedback_id,
+        "decision": final_decision,
+        "classification": classification,
+        "target_stage": target_stage,
+        "requires_reopen": requires_reopen,
+        "confidence": max_confidence,
+        "reason": f"Council: {len(reopen_votes)}/{total} reopen, decision={final_decision}",
+        "triaged_at": now_iso(),
+        "triaged_by": "feedback_triage_council",
+        "vote_summary": vote_summary,
+    }
+    triage_path = _feedback_dir(h, epic_id) / f"{feedback_id}.triage.json"
+    atomic_write_json(triage_path, triage_data)
+
+    # Update feedback status to triaged
+    fb = _load_feedback(h, epic_id, feedback_id)
+    fb["status"] = "triaged"
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    # Write verdict file
+    verdict = {
+        "council_type": "feedback_triage_council",
+        "epic_id": epic_id,
+        "feedback_id": feedback_id,
+        "decision": final_decision,
+        "requires_reopen": requires_reopen,
+        "target_stage": target_stage,
+        "classification": classification,
+        "confidence": max_confidence,
+        "timestamp": now_iso(),
+        "vote_summary": vote_summary,
+    }
+    verdict_path = councils_dir / "verdict.json"
+    atomic_write_json(verdict_path, verdict)
+
+    if args.json:
+        out_json({"status": "ok", **verdict})
+    else:
+        print(f"Feedback triage verdict: {final_decision}")
+        print(f"  Votes: {len(reopen_votes)}/{total} reopen")
+        if requires_reopen:
+            print(f"  Target stage: {target_stage}")
+            print(f"  Classification: {classification}")
+        elif final_decision == "INSUFFICIENT_EVIDENCE":
+            print(f"  ⚠ Evidence insufficient — cannot close, require supplemental evidence")
+        print(f"  Triage written: {triage_path}")
 
 
 def cmd_artifact_status_init(args, h: Path) -> None:
@@ -8031,6 +8348,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_close.add_argument("--force", action="store_true", help="Force close despite validation errors")
     p_fb_close.add_argument("--json", action="store_true")
 
+    p_fb_epack = fb_sub.add_parser("evidence-pack", help="Collect evidence pack for triage council")
+    p_fb_epack.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_epack.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_epack.add_argument("--json", action="store_true")
+
+    p_fb_ctriage = fb_sub.add_parser("council-triage", help="Initialize feedback triage council")
+    p_fb_ctriage.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_ctriage.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_ctriage.add_argument("--json", action="store_true")
+
+    p_fb_agg = fb_sub.add_parser("aggregate-triage", help="Aggregate feedback triage council votes")
+    p_fb_agg.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_agg.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_agg.add_argument("--json", action="store_true")
+
     # ---- reopen ----
     p_reopen = sub.add_parser("reopen", help="Controlled stage reopen via approved feedback")
     p_reopen.add_argument("--epic-id", dest="epic_id", required=True)
@@ -8316,6 +8648,12 @@ def main() -> None:
             cmd_feedback_approve_amendment(args, h)
         elif args.feedback_action == "close":
             cmd_feedback_close(args, h)
+        elif args.feedback_action == "evidence-pack":
+            cmd_feedback_evidence_pack(args, h)
+        elif args.feedback_action == "council-triage":
+            cmd_feedback_council_triage(args, h)
+        elif args.feedback_action == "aggregate-triage":
+            cmd_feedback_aggregate_triage(args, h)
 
     elif args.command == "reopen":
         cmd_reopen(args, h)

@@ -275,12 +275,32 @@ print(json.dumps({
 }))
 " 2>/dev/null)
   [[ -n "$EVENT" ]] && "$HARNESSCTL" patch trace --event-json "$EVENT" 2>/dev/null || true
+
+  # 自动提交 feedback（系统动作，不依赖 AI 自觉）
+  AUTO_FB_RESULT=$("$HARNESSCTL" feedback submit \
+    --epic-id "$ACTIVE_EPIC_ID" \
+    --stage "$ACTIVE_STAGE" \
+    --text "$EXCERPT" \
+    --json 2>/dev/null)
+  AUTO_FB_ID=$(echo "$AUTO_FB_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('feedback_id',''))" 2>/dev/null)
 fi
 
 # 注入 feedback_candidate 提示到 REMINDER
 if [[ -n "$FEEDBACK_CANDIDATE_TYPE" ]]; then
-  REMINDER+="\n  [Feedback Candidate] 检测到用户反馈候选 (type: ${FEEDBACK_CANDIDATE_TYPE})。"
-  REMINDER+="\n     如需正式记录，使用: harnessctl feedback submit --epic-id <epic-id> --stage ${ACTIVE_STAGE} --text \"...\""
+  if [[ -n "$AUTO_FB_ID" ]]; then
+    REMINDER+="\n  [Feedback - AUTO SUBMITTED] 系统已自动提交 ${AUTO_FB_ID} (type: ${FEEDBACK_CANDIDATE_TYPE})。"
+    REMINDER+="\n     该 feedback 未完成 triage 前，禁止直接回答用户问题。"
+    REMINDER+="\n     必须执行："
+    REMINDER+="\n     1. harnessctl feedback evidence-pack --epic-id ${ACTIVE_EPIC_ID} --feedback-id ${AUTO_FB_ID}"
+    REMINDER+="\n     2. harnessctl feedback council-triage --epic-id ${ACTIVE_EPIC_ID} --feedback-id ${AUTO_FB_ID}"
+    REMINDER+="\n     3. 并行调度 feedback_triage_council 6 agent 评审（使用 Agent 工具）"
+    REMINDER+="\n     4. harnessctl feedback aggregate-triage --epic-id ${ACTIVE_EPIC_ID} --feedback-id ${AUTO_FB_ID}"
+    REMINDER+="\n     5. 根据 verdict 的 decision 决定：reopen 或 evidence answer + close"
+    REMINDER+="\n     完成以上流程后，再基于 verdict 结论回答用户。"
+  else
+    REMINDER+="\n  [Feedback Candidate] 检测到用户反馈候选 (type: ${FEEDBACK_CANDIDATE_TYPE})，自动提交失败。"
+    REMINDER+="\n     请手动执行: harnessctl feedback submit --epic-id ${ACTIVE_EPIC_ID} --stage ${ACTIVE_STAGE} --text \"...\""
+  fi
 fi
 
 python3 -c "
