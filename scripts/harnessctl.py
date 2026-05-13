@@ -5785,6 +5785,46 @@ def cmd_guard_check(args, h: Path, project_root: Path) -> None:
                     issues.append(f"prev stage gate {prev_stage}: missing {path_str}")
                     break  # Report first missing artifact only
 
+        # EXECUTE_ENTRY_CHECKS: block if stale upstream or unresolved feedback
+        if stage == "EXECUTE":
+            # Check upstream artifact freshness
+            art_data = load_artifact_status(h, epic_id)
+            stale_upstream = [
+                a for a in art_data.get("artifacts", [])
+                if a.get("status") in ("stale", "invalidated", "needs_amendment")
+                and a.get("stage", "") in ("CLARIFY", "SPEC", "PLAN")
+            ]
+            if stale_upstream:
+                # Check if revision-diff waivers exist
+                features_dir = h / "features" / epic_id
+                for art in stale_upstream:
+                    inv_by = art.get("invalidated_by", "")
+                    if inv_by:
+                        rdiff = features_dir / f"revision-diff-{inv_by}.md"
+                        if not rdiff.exists():
+                            issues.append(
+                                f"stale upstream artifact '{art['path']}' "
+                                f"(invalidated by {inv_by}, no revision-diff)"
+                            )
+                    else:
+                        issues.append(f"stale upstream artifact '{art['path']}' without waiver")
+
+            # Check open accepted feedback
+            fb_dir = features_dir / "feedback" if 'features_dir' in dir() else h / "features" / epic_id / "feedback"
+            if fb_dir.exists():
+                for fb_file in fb_dir.glob("HFB-*.json"):
+                    if fb_file.stem.endswith(".triage") or fb_file.stem.endswith(".closure"):
+                        continue
+                    try:
+                        fb = json.loads(fb_file.read_text(encoding="utf-8"))
+                        if fb.get("status") in ("approved", "reopened", "amending"):
+                            issues.append(
+                                f"unresolved feedback {fb['feedback_id']} "
+                                f"(status: {fb['status']})"
+                            )
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
     append_trace_event(h, _make_trace_event(
         epic_id, "guard_checked",
         stage=stage or state.get("current_stage", ""),
@@ -6714,6 +6754,760 @@ def _update_rules_index(h: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Feedback-driven Reopen & Amendment Loop
+# ---------------------------------------------------------------------------
+
+FEEDBACK_STATUSES = [
+    "submitted", "triaged", "amendment_planned", "approved",
+    "reopened", "amending", "implemented", "verified",
+    "closed", "rejected", "deferred",
+]
+
+FEEDBACK_CLASSIFICATIONS = [
+    "question", "correction", "scope_change", "requirement_gap",
+    "spec_gap", "plan_defect", "implementation_bug", "risk_warning", "blocker",
+]
+
+ARTIFACT_STATUSES = ["current", "stale", "invalidated", "needs_amendment", "superseded"]
+
+
+def _feedback_dir(h: Path, epic_id: str) -> Path:
+    """Return the feedback directory for an epic, creating if needed."""
+    d = h / "features" / epic_id / "feedback"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _next_feedback_id(h: Path, epic_id: str) -> str:
+    """Generate next HFB-NNN id for an epic."""
+    d = _feedback_dir(h, epic_id)
+    existing = [f.stem for f in d.glob("HFB-*.json") if not f.stem.endswith((".triage", ".closure"))]
+    nums = []
+    for name in existing:
+        m = re.match(r"HFB-(\d+)", name)
+        if m:
+            nums.append(int(m.group(1)))
+    return f"HFB-{max(nums, default=0) + 1:03d}"
+
+
+def _load_feedback(h: Path, epic_id: str, feedback_id: str) -> dict:
+    """Load a feedback JSON file."""
+    path = _feedback_dir(h, epic_id) / f"{feedback_id}.json"
+    if not path.exists():
+        err(f"Feedback not found: {feedback_id} in epic {epic_id}")
+    return load_json(path)
+
+
+def _save_feedback(h: Path, epic_id: str, feedback_id: str, data: dict) -> None:
+    """Save a feedback JSON file atomically."""
+    path = _feedback_dir(h, epic_id) / f"{feedback_id}.json"
+    atomic_write_json(path, data)
+
+
+def _artifact_status_path(h: Path, epic_id: str) -> Path:
+    """Return path to artifact-status.json for an epic."""
+    return h / "features" / epic_id / "artifact-status.json"
+
+
+def load_artifact_status(h: Path, epic_id: str) -> dict:
+    """Load artifact-status.json, returning empty structure if not exists."""
+    path = _artifact_status_path(h, epic_id)
+    if path.exists():
+        return load_json(path)
+    return {"artifacts": [], "updated_at": now_iso()}
+
+
+def save_artifact_status(h: Path, epic_id: str, data: dict) -> None:
+    """Save artifact-status.json atomically."""
+    data["updated_at"] = now_iso()
+    path = _artifact_status_path(h, epic_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, data)
+
+
+def _set_artifact_status(h: Path, epic_id: str, path_pattern: str, status: str,
+                         reason: str = "", invalidated_by: str = "") -> None:
+    """Set status for artifacts matching path_pattern."""
+    if status not in ARTIFACT_STATUSES:
+        err(f"Invalid artifact status: {status}")
+    data = load_artifact_status(h, epic_id)
+    found = False
+    for art in data["artifacts"]:
+        if path_pattern in art["path"] or art["path"] == path_pattern:
+            art["status"] = status
+            if reason:
+                art["reason"] = reason
+            if invalidated_by:
+                art["invalidated_by"] = invalidated_by
+                art["invalidated_at"] = now_iso()
+            found = True
+    if not found:
+        data["artifacts"].append({
+            "path": path_pattern,
+            "stage": "",
+            "status": status,
+            "reason": reason,
+            "invalidated_by": invalidated_by,
+            "invalidated_at": now_iso() if invalidated_by else "",
+            "last_valid_at": now_iso() if status == "current" else "",
+        })
+    save_artifact_status(h, epic_id, data)
+
+
+def cmd_feedback_submit(args, h: Path) -> None:
+    """Submit a new feedback item for an epic."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)  # validate epic exists
+
+    feedback_id = _next_feedback_id(h, epic_id)
+    data = {
+        "feedback_id": feedback_id,
+        "epic_id": epic_id,
+        "submitted_at": now_iso(),
+        "submitted_in_stage": args.stage or "",
+        "text": args.text,
+        "status": "submitted",
+    }
+    _save_feedback(h, epic_id, feedback_id, data)
+
+    payload = {"status": "ok", "feedback_id": feedback_id, "epic_id": epic_id}
+    if args.json:
+        out_json(payload)
+    else:
+        print(f"Feedback {feedback_id} submitted for epic {epic_id}")
+
+
+def cmd_feedback_list(args, h: Path) -> None:
+    """List feedback items for an epic."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)
+
+    d = _feedback_dir(h, epic_id)
+    items = []
+    for f in sorted(d.glob("HFB-*.json")):
+        if f.stem.endswith(".triage") or f.stem.endswith(".closure"):
+            continue
+        item = load_json(f)
+        # Filter by status if requested
+        status_filter = getattr(args, "status_filter", "open")
+        if status_filter == "open" and item.get("status") in ("closed", "rejected", "deferred"):
+            continue
+        elif status_filter == "closed" and item.get("status") not in ("closed", "rejected", "deferred"):
+            continue
+        items.append(item)
+
+    if args.json:
+        out_json({"epic_id": epic_id, "feedback": items})
+    else:
+        if not items:
+            print(f"No feedback for epic {epic_id} (filter: {status_filter})")
+            return
+        for item in items:
+            print(f"  {item['feedback_id']}  [{item['status']}]  {item.get('text', '')[:60]}")
+
+
+def cmd_feedback_triage(args, h: Path) -> None:
+    """Triage a feedback item — classify and determine target stage."""
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    if fb["status"] not in ("submitted",):
+        err(f"Feedback {feedback_id} is in status '{fb['status']}', expected 'submitted'")
+
+    classification = args.classification
+    if classification not in FEEDBACK_CLASSIFICATIONS:
+        err(f"Invalid classification: {classification}. Valid: {', '.join(FEEDBACK_CLASSIFICATIONS)}")
+
+    target_stage = args.target_stage or ""
+    if target_stage and target_stage not in STAGES:
+        err(f"Invalid target stage: {target_stage}. Valid: {', '.join(STAGES)}")
+
+    requires_reopen = args.requires_reopen
+
+    triage_data = {
+        "feedback_id": feedback_id,
+        "classification": classification,
+        "target_stage": target_stage,
+        "confidence": float(args.confidence) if args.confidence else 0.0,
+        "requires_reopen": requires_reopen,
+        "reason": args.reason or "",
+        "triaged_at": now_iso(),
+    }
+
+    triage_path = _feedback_dir(h, epic_id) / f"{feedback_id}.triage.json"
+    atomic_write_json(triage_path, triage_data)
+
+    # Update main feedback status
+    fb["status"] = "triaged"
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    if args.json:
+        out_json({"status": "ok", **triage_data})
+    else:
+        print(f"Feedback {feedback_id} triaged: {classification} -> {target_stage or 'N/A'} (reopen={requires_reopen})")
+
+
+def cmd_feedback_plan_amendment(args, h: Path) -> None:
+    """Generate an amendment plan for a triaged feedback item."""
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    if fb["status"] not in ("triaged",):
+        err(f"Feedback {feedback_id} is in status '{fb['status']}', expected 'triaged'")
+
+    # Load triage
+    triage_path = _feedback_dir(h, epic_id) / f"{feedback_id}.triage.json"
+    if not triage_path.exists():
+        err(f"Triage file not found for {feedback_id}")
+    triage = load_json(triage_path)
+
+    # Write amendment plan template
+    plan_path = _feedback_dir(h, epic_id) / f"{feedback_id}.amendment-plan.md"
+    plan_content = f"""# Amendment Plan — {feedback_id}
+
+## Feedback
+- ID: {feedback_id}
+- Text: {fb.get('text', '')}
+- Classification: {triage.get('classification', '')}
+- Target Stage: {triage.get('target_stage', '')}
+- Requires Reopen: {triage.get('requires_reopen', False)}
+
+## Preserve
+<!-- List conclusions/artifacts that remain valid -->
+
+## Amend
+<!-- List artifacts to modify -->
+
+## Invalidate
+<!-- List downstream artifacts to mark stale/invalidated -->
+
+## Impact on Completed Tasks
+<!-- none | list affected tasks -->
+
+## Requires User Confirmation
+{str(triage.get('requires_reopen', False)).lower()}
+
+## Risk
+medium
+"""
+    atomic_write(plan_path, plan_content)
+
+    # Update status
+    fb["status"] = "amendment_planned"
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    if args.json:
+        out_json({"status": "ok", "feedback_id": feedback_id, "plan_path": str(plan_path)})
+    else:
+        print(f"Amendment plan created: {plan_path}")
+
+
+def cmd_feedback_approve_amendment(args, h: Path) -> None:
+    """Approve an amendment plan, allowing reopen to proceed."""
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    if fb["status"] not in ("amendment_planned",):
+        err(f"Feedback {feedback_id} is in status '{fb['status']}', expected 'amendment_planned'")
+
+    plan_path = _feedback_dir(h, epic_id) / f"{feedback_id}.amendment-plan.md"
+    if not plan_path.exists():
+        err(f"Amendment plan not found for {feedback_id}")
+
+    fb["status"] = "approved"
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    if args.json:
+        out_json({"status": "ok", "feedback_id": feedback_id, "new_status": "approved"})
+    else:
+        print(f"Feedback {feedback_id} amendment approved. Ready for reopen.")
+
+
+def cmd_reopen(args, h: Path) -> None:
+    """Controlled stage reopen driven by approved feedback."""
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    target_stage = args.to
+
+    if target_stage not in STAGES:
+        err(f"Invalid target stage: {target_stage}")
+
+    # Validate feedback is approved
+    fb = _load_feedback(h, epic_id, feedback_id)
+    if fb["status"] not in ("approved",):
+        err(f"Feedback {feedback_id} is in status '{fb['status']}', must be 'approved' before reopen")
+
+    # Validate triage exists and requires_reopen
+    triage_path = _feedback_dir(h, epic_id) / f"{feedback_id}.triage.json"
+    if not triage_path.exists():
+        err(f"Triage file not found for {feedback_id}")
+    triage = load_json(triage_path)
+    if not triage.get("requires_reopen"):
+        err(f"Triage for {feedback_id} does not require reopen")
+
+    # Load state and update
+    state_path = h / "features" / epic_id / "state.json"
+    if not state_path.exists():
+        err(f"State file not found for epic {epic_id}")
+    state = load_json(state_path)
+
+    old_stage = state.get("current_stage", state.get("stage", ""))
+    target_idx = STAGES.index(target_stage)
+    current_idx = STAGES.index(old_stage) if old_stage in STAGES else 0
+
+    if target_idx >= current_idx:
+        err(f"Reopen target {target_stage} must be earlier than current stage {old_stage}")
+
+    # Record reopen in state
+    reopen_entry = {
+        "from_stage": old_stage,
+        "to_stage": target_stage,
+        "feedback_id": feedback_id,
+        "reopened_at": now_iso(),
+    }
+    state.setdefault("reopen_history", []).append(reopen_entry)
+    state["current_stage"] = target_stage
+    if "stage" in state:
+        state["stage"] = target_stage
+    atomic_write_json(state_path, state)
+
+    # Artifact invalidation: mark downstream stages as stale
+    _invalidate_downstream(h, epic_id, target_stage, feedback_id)
+
+    # Update feedback status
+    fb["status"] = "reopened"
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    # Write reopen summary
+    summary_path = h / "features" / epic_id / f"reopen-summary-{feedback_id}.md"
+    summary_content = f"""# Reopen Summary — {feedback_id}
+
+- Epic: {epic_id}
+- From: {old_stage}
+- To: {target_stage}
+- Feedback: {fb.get('text', '')}
+- Classification: {triage.get('classification', '')}
+- Reopened at: {now_iso()}
+
+## Downstream Artifacts Invalidated
+All artifacts from stages after {target_stage} marked as stale.
+"""
+    atomic_write(summary_path, summary_content)
+
+    if args.json:
+        out_json({"status": "ok", "epic_id": epic_id, "reopened_to": target_stage,
+                  "feedback_id": feedback_id, "previous_stage": old_stage})
+    else:
+        print(f"Epic {epic_id} reopened: {old_stage} -> {target_stage} (feedback: {feedback_id})")
+
+
+def _invalidate_downstream(h: Path, epic_id: str, target_stage: str, feedback_id: str) -> None:
+    """Mark artifacts from stages after target_stage as stale."""
+    target_idx = STAGES.index(target_stage)
+    downstream_stages = STAGES[target_idx + 1:]
+
+    # Map stages to typical artifact paths
+    stage_artifact_patterns = {
+        "CLARIFY": ["clarify/", "impact-scan", "surface-routing", "domain-frame"],
+        "SPEC": ["specs/", "epic-spec"],
+        "PLAN": ["tasks/", "coverage-matrix"],
+        "EXECUTE": ["receipts/"],
+        "VERIFY": ["verification"],
+    }
+
+    data = load_artifact_status(h, epic_id)
+    for art in data["artifacts"]:
+        art_stage = art.get("stage", "")
+        if art_stage in downstream_stages:
+            art["status"] = "stale"
+            art["invalidated_by"] = feedback_id
+            art["invalidated_at"] = now_iso()
+            art["reason"] = f"Upstream stage {target_stage} reopened via {feedback_id}"
+
+    # Also add entries for known downstream patterns if not already tracked
+    for stage in downstream_stages:
+        patterns = stage_artifact_patterns.get(stage, [])
+        for pat in patterns:
+            existing = [a for a in data["artifacts"] if pat in a.get("path", "")]
+            if not existing:
+                data["artifacts"].append({
+                    "path": f"features/{epic_id}/{pat}",
+                    "stage": stage,
+                    "status": "stale",
+                    "invalidated_by": feedback_id,
+                    "invalidated_at": now_iso(),
+                    "reason": f"Upstream stage {target_stage} reopened via {feedback_id}",
+                    "last_valid_at": "",
+                })
+
+    save_artifact_status(h, epic_id, data)
+
+
+def cmd_feedback_close(args, h: Path) -> None:
+    """Close a feedback item with validation checks."""
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    # Allow closing from various states
+    closeable = ("triaged", "approved", "reopened", "amending", "implemented", "verified")
+    if fb["status"] not in closeable and fb["status"] != "submitted":
+        err(f"Feedback {feedback_id} is in status '{fb['status']}', cannot close")
+
+    # 6-point validation
+    errors = []
+    d = _feedback_dir(h, epic_id)
+
+    # 1. Triage file exists (unless rejecting from submitted)
+    triage_path = d / f"{feedback_id}.triage.json"
+    if fb["status"] != "submitted" and not triage_path.exists():
+        errors.append("Triage file missing")
+
+    triage = load_json(triage_path) if triage_path.exists() else {}
+
+    # 2. Amendment plan exists (unless rejected/deferred)
+    if fb["status"] not in ("submitted", "triaged") and not args.reject and not args.defer:
+        plan_path = d / f"{feedback_id}.amendment-plan.md"
+        if not plan_path.exists():
+            errors.append("Amendment plan missing")
+
+    # 3. If requires_reopen, check reopen history
+    if triage.get("requires_reopen") and not args.reject and not args.defer:
+        state_path = h / "features" / epic_id / "state.json"
+        if state_path.exists():
+            state = load_json(state_path)
+            reopen_history = state.get("reopen_history", [])
+            has_reopen = any(r.get("feedback_id") == feedback_id for r in reopen_history)
+            if not has_reopen:
+                errors.append("Reopen required but not recorded in state history")
+
+    # 4. Revision-diff exists if reopened
+    if fb["status"] in ("reopened", "amending", "implemented", "verified"):
+        rdiff = h / "features" / epic_id / f"revision-diff-{feedback_id}.md"
+        if not rdiff.exists():
+            errors.append("Revision-diff missing")
+
+    # 5. Closure evidence
+    evidence = args.evidence or []
+    if not evidence and not args.reject and not args.defer:
+        errors.append("Closure evidence required (--evidence)")
+
+    # 6. No blocking stale artifacts from this feedback
+    if not args.reject and not args.defer:
+        art_data = load_artifact_status(h, epic_id)
+        blocking = [a for a in art_data.get("artifacts", [])
+                    if a.get("invalidated_by") == feedback_id
+                    and a.get("status") in ("stale", "invalidated", "needs_amendment")]
+        if blocking:
+            errors.append(f"Blocking stale artifacts remain: {[a['path'] for a in blocking]}")
+
+    if errors and not args.force:
+        if args.json:
+            out_json({"status": "error", "errors": errors})
+        else:
+            print(f"Cannot close {feedback_id}:", file=sys.stderr)
+            for e in errors:
+                print(f"  - {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Determine final status
+    if args.reject:
+        final_status = "rejected"
+    elif args.defer:
+        final_status = "deferred"
+    else:
+        final_status = "closed"
+
+    # Write closure file
+    closure_data = {
+        "feedback_id": feedback_id,
+        "closed_at": now_iso(),
+        "final_status": final_status,
+        "closure_evidence": evidence,
+        "forced": bool(errors and args.force),
+    }
+    closure_path = d / f"{feedback_id}.closure.json"
+    atomic_write_json(closure_path, closure_data)
+
+    # Update main feedback
+    fb["status"] = final_status
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    if args.json:
+        out_json({"status": "ok", "feedback_id": feedback_id, "final_status": final_status})
+    else:
+        print(f"Feedback {feedback_id} -> {final_status}")
+
+
+def cmd_artifact_status_init(args, h: Path) -> None:
+    """Initialize or show artifact-status.json for an epic."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)
+    data = load_artifact_status(h, epic_id)
+    if args.json:
+        out_json(data)
+    else:
+        if not data["artifacts"]:
+            print(f"No artifacts tracked for {epic_id}")
+        else:
+            for a in data["artifacts"]:
+                print(f"  [{a['status']:16s}] {a['path']}")
+
+
+def cmd_artifact_status_set(args, h: Path) -> None:
+    """Set status for an artifact."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)
+    status = args.artifact_status
+    if status not in ARTIFACT_STATUSES:
+        err(f"Invalid status: {status}. Valid: {', '.join(ARTIFACT_STATUSES)}")
+    _set_artifact_status(h, epic_id, args.path, status,
+                         reason=args.reason or "", invalidated_by=args.invalidated_by or "")
+    if args.json:
+        out_json({"status": "ok", "path": args.path, "new_status": status})
+    else:
+        print(f"Artifact '{args.path}' -> {status}")
+
+
+def cmd_artifact_status_waiver(args, h: Path) -> None:
+    """Mark a stale artifact as current via revision-diff waiver."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)
+    data = load_artifact_status(h, epic_id)
+    found = False
+    for art in data["artifacts"]:
+        if art["path"] == args.path or args.path in art["path"]:
+            if art["status"] not in ("stale",):
+                err(f"Artifact '{art['path']}' is '{art['status']}', waiver only applies to 'stale'")
+            art["status"] = "current"
+            art["waiver_reason"] = args.reason or "Confirmed not affected via revision-diff"
+            art["waiver_at"] = now_iso()
+            found = True
+    if not found:
+        err(f"Artifact not found: {args.path}")
+    save_artifact_status(h, epic_id, data)
+    if args.json:
+        out_json({"status": "ok", "path": args.path, "new_status": "current"})
+    else:
+        print(f"Waiver applied: '{args.path}' -> current")
+
+
+def cmd_task_graph_merge(args, h: Path) -> None:
+    """Merge new tasks into existing task graph with dependency analysis."""
+    epic_id = args.epic_id
+    epic = load_epic(h, epic_id)
+
+    # Load existing tasks
+    tasks_dir = h / "tasks"
+    existing_tasks = []
+    for tf in sorted(tasks_dir.glob(f"{epic_id}.*.json")):
+        existing_tasks.append(load_json(tf))
+
+    # Parse --new-tasks JSON if provided
+    new_task_specs = []
+    if getattr(args, "new_tasks", "") and args.new_tasks.strip():
+        try:
+            new_task_specs = json.loads(args.new_tasks)
+            if not isinstance(new_task_specs, list):
+                _err("--new-tasks must be a JSON array")
+        except json.JSONDecodeError as e:
+            _err(f"--new-tasks JSON parse error: {e}")
+
+    if not existing_tasks and not new_task_specs:
+        if args.json:
+            out_json({"status": "ok", "message": "no existing tasks", "merged": 0})
+        else:
+            print("No existing tasks to merge with")
+        return
+
+    # Build task-id lookup for dependency resolution
+    task_id_set = {t.get("id", "") for t in existing_tasks}
+
+    # Analyze completed tasks that may need amendment
+    amended = []
+    feedback_id = args.feedback_id or ""
+
+    if args.check_done:
+        for task in existing_tasks:
+            if task.get("status") == "done":
+                task_spec = task.get("acceptance_criteria", [])
+                if not task_spec:
+                    continue
+                state_path = h / "features" / epic_id / "state.json"
+                if state_path.exists():
+                    state = load_json(state_path)
+                    reopen_history = state.get("reopen_history", [])
+                    for reopen in reopen_history:
+                        if reopen.get("feedback_id") == feedback_id:
+                            amended.append({
+                                "task_id": task.get("id", ""),
+                                "title": task.get("title", ""),
+                                "reason": f"Completed before reopen triggered by {feedback_id}",
+                            })
+                            break
+
+    # Create new tasks from --new-tasks
+    created_tasks = []
+    if new_task_specs:
+        for spec in new_task_specs:
+            if not isinstance(spec, dict) or "title" not in spec:
+                continue
+            n = next_task_number(h, epic_id)
+            task_id = make_task_id(epic_id, n)
+
+            # Resolve depends_on — validate references exist
+            depends_on = spec.get("depends_on", [])
+            if isinstance(depends_on, str):
+                depends_on = [depends_on] if depends_on else []
+            valid_deps = [d for d in depends_on if d in task_id_set]
+
+            task = {
+                "id": task_id,
+                "epic_id": epic_id,
+                "title": spec["title"],
+                "status": "pending",
+                "surface": spec.get("surface", ""),
+                "dependencies": valid_deps,
+                "acceptance_criteria": spec.get("acceptance_criteria", []),
+                "evidence": {},
+                "receipts": [],
+            }
+            if feedback_id:
+                task["added_by_feedback"] = feedback_id
+
+            task_path = tasks_dir / f"{epic_id}.{n}.json"
+            atomic_write_json(task_path, task)
+
+            # Update epic task list
+            updated_epic = dict(epic)
+            updated_epic["tasks"] = list(epic.get("tasks", [])) + [task_id]
+            save_epic(h, updated_epic)
+            epic = updated_epic  # keep in sync for next iteration
+
+            # Add to lookup so subsequent new tasks can depend on this one
+            task_id_set.add(task_id)
+            created_tasks.append(task)
+
+    # Report results
+    result = {
+        "epic_id": epic_id,
+        "total_tasks": len(existing_tasks) + len(created_tasks),
+        "done_tasks": len([t for t in existing_tasks if t.get("status") == "done"]),
+        "pending_tasks": len([t for t in existing_tasks if t.get("status") == "pending"]) + len(created_tasks),
+        "tasks_needing_amendment": amended,
+        "merged": len(created_tasks),
+        "created_task_ids": [t["id"] for t in created_tasks],
+    }
+
+    if args.json:
+        out_json({"status": "ok", **result})
+    else:
+        print(f"Task graph analysis for {epic_id}:")
+        print(f"  Total: {result['total_tasks']}, Done: {result['done_tasks']}, Pending: {result['pending_tasks']}")
+        if created_tasks:
+            print(f"  Created {len(created_tasks)} new task(s):")
+            for t in created_tasks:
+                deps_str = f" (depends: {', '.join(t['dependencies'])})" if t['dependencies'] else ""
+                print(f"    - {t['id']}: {t['title']}{deps_str}")
+        if amended:
+            print(f"  Tasks needing amendment review ({len(amended)}):")
+            for a in amended:
+                print(f"    - {a['task_id']}: {a['title']} ({a['reason']})")
+        else:
+            print("  No completed tasks need amendment")
+
+
+def cmd_feedback_coverage_check(args, h: Path) -> None:
+    """Check that all accepted feedback is covered by requirements, spec, tasks, and tests."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)
+
+    fb_dir = h / "features" / epic_id / "feedback"
+    if not fb_dir.exists():
+        if args.json:
+            out_json({"status": "ok", "epic_id": epic_id, "feedback_count": 0, "gaps": []})
+        else:
+            print(f"No feedback for {epic_id}")
+        return
+
+    gaps = []
+    feedback_items = []
+
+    for fb_file in sorted(fb_dir.glob("HFB-*.json")):
+        if fb_file.stem.endswith(".triage") or fb_file.stem.endswith(".closure"):
+            continue
+        fb = load_json(fb_file)
+        # Only check non-rejected, non-deferred feedback
+        if fb.get("status") in ("rejected", "deferred", "submitted"):
+            continue
+        feedback_items.append(fb)
+
+        feedback_id = fb["feedback_id"]
+        fb_gaps = []
+
+        # Check 1: triage exists
+        triage_path = fb_dir / f"{feedback_id}.triage.json"
+        if not triage_path.exists():
+            fb_gaps.append("missing triage")
+
+        # Check 2: revision-diff exists (if reopened)
+        if fb.get("status") in ("reopened", "amending", "implemented", "verified", "closed"):
+            rdiff = h / "features" / epic_id / f"revision-diff-{feedback_id}.md"
+            if not rdiff.exists():
+                fb_gaps.append("missing revision-diff")
+
+        # Check 3: closure evidence (if closed)
+        if fb.get("status") == "closed":
+            closure_path = fb_dir / f"{feedback_id}.closure.json"
+            if closure_path.exists():
+                closure = load_json(closure_path)
+                if not closure.get("closure_evidence"):
+                    fb_gaps.append("closure has no evidence")
+            else:
+                fb_gaps.append("missing closure file")
+
+        # Check 4: no remaining stale artifacts from this feedback
+        art_data = load_artifact_status(h, epic_id)
+        stale_from_fb = [
+            a for a in art_data.get("artifacts", [])
+            if a.get("invalidated_by") == feedback_id
+            and a.get("status") in ("stale", "invalidated", "needs_amendment")
+        ]
+        if stale_from_fb:
+            fb_gaps.append(f"{len(stale_from_fb)} stale artifacts remain")
+
+        if fb_gaps:
+            gaps.append({
+                "feedback_id": feedback_id,
+                "status": fb.get("status"),
+                "text": fb.get("text", "")[:60],
+                "gaps": fb_gaps,
+            })
+
+    passed = len(gaps) == 0
+    result = {
+        "epic_id": epic_id,
+        "feedback_count": len(feedback_items),
+        "passed": passed,
+        "gaps": gaps,
+    }
+
+    if args.json:
+        out_json({"status": "ok" if passed else "fail", **result})
+    else:
+        if passed:
+            print(f"Feedback coverage PASSED for {epic_id} ({len(feedback_items)} items)")
+        else:
+            print(f"Feedback coverage FAILED for {epic_id}:")
+            for g in gaps:
+                print(f"  {g['feedback_id']} [{g['status']}]: {', '.join(g['gaps'])}")
+            sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -7190,6 +7984,103 @@ def build_parser() -> argparse.ArgumentParser:
     p_ptrace.add_argument("--event-json", dest="event_json", required=True)
     p_ptrace.add_argument("--json", action="store_true")
 
+    # ---- feedback ----
+    p_fb = sub.add_parser("feedback", help="Feedback-driven reopen & amendment loop")
+    fb_sub = p_fb.add_subparsers(dest="feedback_action", metavar="ACTION")
+    fb_sub.required = True
+
+    p_fb_submit = fb_sub.add_parser("submit", help="Submit a new feedback item")
+    p_fb_submit.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_submit.add_argument("--stage", default="", help="Stage where feedback was given")
+    p_fb_submit.add_argument("--text", required=True, help="Feedback text")
+    p_fb_submit.add_argument("--json", action="store_true")
+
+    p_fb_list = fb_sub.add_parser("list", help="List feedback items")
+    p_fb_list.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_list.add_argument("--status", dest="status_filter", default="open",
+                           choices=["open", "closed", "all"])
+    p_fb_list.add_argument("--json", action="store_true")
+
+    p_fb_triage = fb_sub.add_parser("triage", help="Triage a feedback item")
+    p_fb_triage.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_triage.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_triage.add_argument("--classification", required=True,
+                             choices=FEEDBACK_CLASSIFICATIONS)
+    p_fb_triage.add_argument("--target-stage", dest="target_stage", default="")
+    p_fb_triage.add_argument("--requires-reopen", dest="requires_reopen", action="store_true")
+    p_fb_triage.add_argument("--confidence", default="")
+    p_fb_triage.add_argument("--reason", default="")
+    p_fb_triage.add_argument("--json", action="store_true")
+
+    p_fb_plan = fb_sub.add_parser("plan-amendment", help="Generate amendment plan")
+    p_fb_plan.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_plan.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_plan.add_argument("--json", action="store_true")
+
+    p_fb_approve = fb_sub.add_parser("approve-amendment", help="Approve amendment plan")
+    p_fb_approve.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_approve.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_approve.add_argument("--json", action="store_true")
+
+    p_fb_close = fb_sub.add_parser("close", help="Close a feedback item")
+    p_fb_close.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_close.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_close.add_argument("--evidence", nargs="*", default=[], help="Closure evidence paths")
+    p_fb_close.add_argument("--reject", action="store_true", help="Reject feedback")
+    p_fb_close.add_argument("--defer", action="store_true", help="Defer feedback")
+    p_fb_close.add_argument("--force", action="store_true", help="Force close despite validation errors")
+    p_fb_close.add_argument("--json", action="store_true")
+
+    # ---- reopen ----
+    p_reopen = sub.add_parser("reopen", help="Controlled stage reopen via approved feedback")
+    p_reopen.add_argument("--epic-id", dest="epic_id", required=True)
+    p_reopen.add_argument("--to", required=True, help="Target stage to reopen to")
+    p_reopen.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_reopen.add_argument("--json", action="store_true")
+
+    # ---- artifact-status ----
+    p_artstatus = sub.add_parser("artifact-status", help="Track artifact freshness")
+    artstatus_sub = p_artstatus.add_subparsers(dest="artstatus_action", metavar="ACTION")
+    artstatus_sub.required = True
+
+    p_art_show = artstatus_sub.add_parser("show", help="Show artifact status")
+    p_art_show.add_argument("--epic-id", dest="epic_id", required=True)
+    p_art_show.add_argument("--json", action="store_true")
+
+    p_art_set = artstatus_sub.add_parser("set", help="Set artifact status")
+    p_art_set.add_argument("--epic-id", dest="epic_id", required=True)
+    p_art_set.add_argument("--path", required=True, help="Artifact path (relative to .harness/)")
+    p_art_set.add_argument("--status", dest="artifact_status", required=True,
+                           choices=ARTIFACT_STATUSES)
+    p_art_set.add_argument("--reason", default="")
+    p_art_set.add_argument("--invalidated-by", dest="invalidated_by", default="")
+    p_art_set.add_argument("--json", action="store_true")
+
+    p_art_waiver = artstatus_sub.add_parser("waiver", help="Waive stale status via revision-diff")
+    p_art_waiver.add_argument("--epic-id", dest="epic_id", required=True)
+    p_art_waiver.add_argument("--path", required=True)
+    p_art_waiver.add_argument("--reason", default="")
+    p_art_waiver.add_argument("--json", action="store_true")
+
+    # ---- task-graph ----
+    p_tgraph = sub.add_parser("task-graph", help="Task graph merge and analysis")
+    tgraph_sub = p_tgraph.add_subparsers(dest="tgraph_action", metavar="ACTION")
+    tgraph_sub.required = True
+
+    p_tg_merge = tgraph_sub.add_parser("merge", help="Analyze task graph for merge after reopen")
+    p_tg_merge.add_argument("--epic-id", dest="epic_id", required=True)
+    p_tg_merge.add_argument("--feedback-id", dest="feedback_id", default="")
+    p_tg_merge.add_argument("--check-done", dest="check_done", action="store_true",
+                            help="Check if completed tasks need amendment")
+    p_tg_merge.add_argument("--new-tasks", dest="new_tasks", default="",
+                            help="JSON array of new tasks to create: [{title, depends_on?, acceptance_criteria?, surface?}]")
+    p_tg_merge.add_argument("--json", action="store_true")
+
+    # ---- feedback-coverage ----
+    p_fbcov = sub.add_parser("feedback-coverage", help="Check feedback coverage chain")
+    p_fbcov.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fbcov.add_argument("--json", action="store_true")
+
     # ---- validate ----
     p_validate = sub.add_parser("validate", help="Validate .harness/ directory integrity")
     p_validate.add_argument("--json", action="store_true")
@@ -7411,6 +8302,38 @@ def main() -> None:
 
     elif args.command == "validate":
         cmd_validate(args, h)
+
+    elif args.command == "feedback":
+        if args.feedback_action == "submit":
+            cmd_feedback_submit(args, h)
+        elif args.feedback_action == "list":
+            cmd_feedback_list(args, h)
+        elif args.feedback_action == "triage":
+            cmd_feedback_triage(args, h)
+        elif args.feedback_action == "plan-amendment":
+            cmd_feedback_plan_amendment(args, h)
+        elif args.feedback_action == "approve-amendment":
+            cmd_feedback_approve_amendment(args, h)
+        elif args.feedback_action == "close":
+            cmd_feedback_close(args, h)
+
+    elif args.command == "reopen":
+        cmd_reopen(args, h)
+
+    elif args.command == "artifact-status":
+        if args.artstatus_action == "show":
+            cmd_artifact_status_init(args, h)
+        elif args.artstatus_action == "set":
+            cmd_artifact_status_set(args, h)
+        elif args.artstatus_action == "waiver":
+            cmd_artifact_status_waiver(args, h)
+
+    elif args.command == "task-graph":
+        if args.tgraph_action == "merge":
+            cmd_task_graph_merge(args, h)
+
+    elif args.command == "feedback-coverage":
+        cmd_feedback_coverage_check(args, h)
 
     else:
         parser.print_help()
