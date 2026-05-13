@@ -41,6 +41,16 @@ Feedback Triage Council 调度技能。当 stage-reminder hook 自动提交 feed
 
 ---
 
+## 硬性规则（绝对禁止）
+
+1. **禁止手工复刻 feedback 流程**：禁止用 Bash/Write/Edit 工具手动创建 `evidence-pack.json`、`votes/*.json`、`verdict.json` 文件。必须通过 `harnessctl` 标准命令完成每一步。
+2. **禁止使用旧版 vote schema**：`decision` 字段仅接受以下值：`REOPEN_CLARIFY`、`REOPEN_SPEC`、`REOPEN_PLAN`、`STAY_EXECUTE`、`NO_REOPEN_WITH_EVIDENCE`、`INSUFFICIENT_EVIDENCE`、`REJECT`、`DEFER`。旧版值（如 `agree_reopen`、`conditional`、`reopen` 等）会被 aggregate-triage 拒绝。
+3. **confirmed in-scope 后自动继续**：triage 裁决后，若 verdict 为 low/medium risk 的 REOPEN_* 或 STAY_EXECUTE，必须自动执行后续步骤（plan-amendment → approve → reopen/create-task），不得询问用户"要不要修"。仅 `scope_change` 或 `high risk` 需人工确认。
+4. **confirmed feedback 必须立即处理**：feedback 提交后不得跳过 triage 直接回答用户，也不得 idle 等待。
+5. **related-gap-scan 必须在 scope_gap 裁决后执行**：verdict 为 REOPEN_* 或 STAY_EXECUTE + scope_gap 时，必须运行 `related-gap-scan`，结果送入 amendment-plan。
+
+---
+
 ## 前置条件
 
 - 存在活跃 epic（ACTIVE_EPIC_ID 非空）
@@ -199,9 +209,13 @@ $HARNESSCTL feedback aggregate-triage \
 4. 全部 `NO_REOPEN_WITH_EVIDENCE` 且证据充分 → 不 reopen
 5. 证据不足 → `INSUFFICIENT_EVIDENCE`（阻断，要求补证据）
 
-### Step 5.5: Related-Gap Scan (v2)
+### Step 5.5: Related-Gap Scan (v2 — MANDATORY)
 
-After aggregation, if verdict is `REOPEN_*` or `STAY_EXECUTE` with `scope_gap` classification, run related-gap scan:
+After aggregation, **必须**检查是否需要 related-gap-scan。以下条件触发（任一即可）：
+
+- verdict 为 `REOPEN_*`（任意 reopen 决策）
+- verdict 为 `STAY_EXECUTE` 且 classification 含 `scope_gap`
+- 任意 vote 的 `related_gaps` 非空
 
 ```bash
 $HARNESSCTL feedback related-gap-scan \
@@ -212,7 +226,13 @@ $HARNESSCTL feedback related-gap-scan \
 ```
 
 This generates `HFB-xxx.related-gap-scan.json` with sibling categories to check.
+
+> **⛔ 禁止行为**：scope_gap 类型的 verdict 不得跳过 related-gap-scan 直接进入 amendment。
+> scan 结果必须合入 amendment-plan，确保兄弟缺口同批修复。
+
 The scan results feed into the amendment-plan to ensure sibling gaps are addressed together.
+If scan discovers high-confidence sibling gaps (confidence ≥ 0.7), they must be included
+in the amendment plan as additional tasks.
 
 ### Step 6: 根据 Verdict 执行后续
 
@@ -245,7 +265,10 @@ $HARNESSCTL feedback plan-amendment --epic-id ${EPIC_ID} --feedback-id ${FEEDBAC
 1. 读取 epic state 中的 `risk_level`（默认 low）
 2. 如果 classification 为 `scope_change` 或 `blocker`：始终人工确认
 3. 如果 risk_level=high 且 verdict 为 REOPEN_*：人工确认
-4. 否则：自动 approve 并执行
+4. 否则：**自动 approve 并立即执行，不得询问用户确认**
+
+> **⛔ 禁止行为**：verdict 确认 in-scope 后，禁止输出类似"要我现在创建任务并实施吗？"的询问。
+> 应当直接执行 approve-amendment → reopen → re-* skill 或 task-graph merge。
 
 ```bash
 $HARNESSCTL feedback approve-amendment --epic-id ${EPIC_ID} --feedback-id ${FEEDBACK_ID}
@@ -256,6 +279,17 @@ $HARNESSCTL reopen --epic-id ${EPIC_ID} --to ${TARGET_STAGE} --feedback-id ${FEE
 - CLARIFY → re-clarify skill
 - SPEC → re-spec skill
 - PLAN → re-plan skill
+
+**REOPEN 回退后必须重新完成对应阶段门禁**：
+- REOPEN_PLAN → 重新执行 PLAN 阶段（更新 task graph），然后从 PLAN 出口门禁重新进入 EXECUTE
+- REOPEN_SPEC → 重新执行 SPEC，然后重新执行 PLAN，然后进入 EXECUTE
+- REOPEN_CLARIFY → 重新执行 CLARIFY → SPEC → PLAN → EXECUTE
+
+使用 `harnessctl feedback re-complete` 标记每个回退阶段的完成：
+```bash
+$HARNESSCTL feedback re-complete --epic-id ${EPIC_ID} --feedback-id ${FEEDBACK_ID} \
+  --stage ${COMPLETED_STAGE} --artifacts "tasks/,coverage-matrix.json"
+```
 
 #### 6b. NO_REOPEN_WITH_EVIDENCE 路径
 
@@ -280,7 +314,7 @@ $HARNESSCTL feedback close \
 
 #### 6d. STAY_EXECUTE 路径
 
-留在当前阶段修复（不 reopen），创建补充任务：
+留在当前阶段修复（不 reopen），**自动**创建补充任务并立即通过 `/harness:work` 执行：
 
 ```bash
 $HARNESSCTL task-graph merge \
@@ -289,6 +323,9 @@ $HARNESSCTL task-graph merge \
   --new-tasks '[{"title": "...", "surface": "..."}]' \
   --json
 ```
+
+> **⛔ 禁止行为**：STAY_EXECUTE 裁决后，禁止询问用户"是否需要创建任务"。
+> 必须直接创建补充任务并用 `/harness:work` 执行。
 
 修复完成后关闭 feedback。
 
@@ -299,14 +336,25 @@ $HARNESSCTL task-graph merge \
 ```
 feedback_candidate 检测
   → hook 自动 submit HFB-xxx
-  → Guard 阻断（submitted feedback 存在）
-  → evidence-pack 收集
-  → council-triage 初始化
-  → 6 agent 并行评审
-  → aggregate-triage 聚合
-  → verdict:
-      REOPEN_*         → plan-amendment → risk-based approve → reopen → re-* skill
+  → Guard 阻断（submitted feedback 存在，禁止 idle）
+  → harnessctl feedback run-triage（自动执行 evidence-pack + council-triage init）
+  → 6 agent 并行评审（必须使用 Agent 工具，禁止手工生成 vote JSON）
+  → harnessctl feedback aggregate-triage（v2 严格 schema 校验）
+  → harnessctl feedback continue（自动执行后续）：
+      REOPEN_*         → plan-amendment → risk-based auto-approve → reopen → re-* skill → re-complete gate
       NO_REOPEN        → evidence answer → close
       INSUFFICIENT     → 阻断，要求补证据
-      STAY_EXECUTE     → 补充任务 → 修复 → close
+      STAY_EXECUTE     → 自动补充任务 → /harness:work 执行 → close
+      scope_gap 类型   → mandatory related-gap-scan → 兄弟缺口合入 amendment
 ```
+
+### 硬性约束速查
+
+| 约束 | 说明 |
+|------|------|
+| 禁止手工复刻 | 不得用 Bash/Write 创建 evidence-pack/votes/verdict 文件 |
+| v2 schema only | decision 仅限 8 个标准值，旧值被 aggregate 拒绝 |
+| 自动继续 | low/medium risk 确认后自动执行，不问用户 |
+| feedback 不得 idle | submitted/triaged 状态的 feedback 必须立即处理 |
+| related-gap-scan | scope_gap 类型必须执行，结果送入 amendment |
+| REOPEN 门禁 | 回退阶段必须重新完成门禁，使用 re-complete 标记 |

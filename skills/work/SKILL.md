@@ -187,11 +187,45 @@ Receipt 格式（参考模板）：
     "files_changed": 0
   },
   "smoke": {"passed": true, "commands": []},
+  "build": {
+    "executed": true,
+    "command": "<build-command>",
+    "exit_code": 0,
+    "passed": true
+  },
   "evidence": {},
   "new_risks": [],
   "timestamp": "<iso8601>"
 }
 ```
+
+---
+
+## Phase 5.5 — Build & Deploy（项目运行时适配）
+
+在 Phase 5 commit 之后执行项目构建验证。
+
+```bash
+# 读取项目 profile 获取构建信息
+$HARNESSCTL profile show --json
+```
+
+根据 `project-profile.yaml` 中的 `build_tool` 自动选择：
+
+| build_tool | 构建命令 |
+|-----------|---------|
+| npm | `npm run build` 或 `npx tsc --noEmit` |
+| maven | `mvn compile -q` |
+| gradle | `./gradlew build` |
+| go | `go build ./...` |
+| cargo | `cargo build` |
+
+```bash
+# 使用 harnessctl build（如可用）
+$HARNESSCTL build --epic-id <epic-id> --task-id <task-id> --json
+```
+
+构建结果写入 receipt 的 `build` 字段。构建失败视为 smoke 失败，消耗重试预算。
 
 ---
 
@@ -259,12 +293,24 @@ $HARNESSCTL state transition <epic-id> PLAN
 
 ## EXECUTE 出口
 
-所有 tasks 状态均为 `done` 时，进入 VERIFY：
+所有 tasks 状态均为 `done` 时，验证出口门禁后进入 VERIFY：
 
 ```bash
 # 验证所有 tasks 完成
 $HARNESSCTL task list <epic-id> --json | jq '.[] | select(.status != "done")'
 
+# 验证所有 receipt 包含 build 结果
+$HARNESSCTL receipt list <epic-id> --json
+```
+
+出口门禁检查清单：
+- [ ] 所有 tasks 状态为 `done`
+- [ ] 每个 task 有对应的 receipt 文件
+- [ ] 每个 receipt 的 `smoke.passed` 为 `true`
+- [ ] 每个 receipt 的 `build.passed` 为 `true`（如 `build.executed` 为 `true`）
+- [ ] 无未处理的 feedback（status 非 closed/rejected/deferred）
+
+```bash
 # 触发状态转换
 $HARNESSCTL state transition <epic-id> VERIFY
 ```

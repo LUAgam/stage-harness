@@ -293,15 +293,60 @@ if [[ -n "$FEEDBACK_CANDIDATE_TYPE" ]]; then
     REMINDER+="\n  [Feedback - AUTO SUBMITTED] 系统已自动提交 ${AUTO_FB_ID} (type: ${FEEDBACK_CANDIDATE_TYPE})。"
     REMINDER+="\n     该 feedback 未完成 triage 前，禁止直接回答用户问题。"
     REMINDER+="\n     必须执行："
-    REMINDER+="\n     1. harnessctl feedback evidence-pack --epic-id ${ACTIVE_EPIC_ID} --feedback-id ${AUTO_FB_ID}"
-    REMINDER+="\n     2. harnessctl feedback council-triage --epic-id ${ACTIVE_EPIC_ID} --feedback-id ${AUTO_FB_ID}"
-    REMINDER+="\n     3. 并行调度 feedback_triage_council 6 agent 评审（使用 Agent 工具）"
-    REMINDER+="\n     4. harnessctl feedback aggregate-triage --epic-id ${ACTIVE_EPIC_ID} --feedback-id ${AUTO_FB_ID}"
-    REMINDER+="\n     5. 根据 verdict 的 decision 决定：reopen 或 evidence answer + close"
+    REMINDER+="\n     1. harnessctl feedback run-triage --epic-id ${ACTIVE_EPIC_ID} --feedback-id ${AUTO_FB_ID} --json"
+    REMINDER+="\n        （此命令自动完成：evidence-pack → council-triage → 6 agent 并行评审 → aggregate-triage）"
+    REMINDER+="\n     2. 并行调度 feedback_triage_council 6 agent 评审（使用 Agent 工具）"
+    REMINDER+="\n     3. harnessctl feedback aggregate-triage --epic-id ${ACTIVE_EPIC_ID} --feedback-id ${AUTO_FB_ID}"
+    REMINDER+="\n     4. harnessctl feedback continue --epic-id ${ACTIVE_EPIC_ID} --feedback-id ${AUTO_FB_ID}"
+    REMINDER+="\n        （根据 verdict 自动执行后续：reopen/close/create-task，无需人工确认）"
+    REMINDER+="\n"
+    REMINDER+="\n     ⛔ 硬性规则："
+    REMINDER+="\n     - 禁止手工创建 evidence-pack.json / votes/*.json / verdict.json 文件"
+    REMINDER+="\n     - 禁止用 Bash/Write 工具模拟 triage 流程，必须使用 harnessctl 标准命令"
+    REMINDER+="\n     - 禁止使用旧版 vote schema（agree_reopen/conditional 等已废弃值）"
+    REMINDER+="\n     - 有效 decision 值仅限：REOPEN_CLARIFY/REOPEN_SPEC/REOPEN_PLAN/STAY_EXECUTE/"
+    REMINDER+="\n       NO_REOPEN_WITH_EVIDENCE/INSUFFICIENT_EVIDENCE/REJECT/DEFER"
     REMINDER+="\n     完成以上流程后，再基于 verdict 结论回答用户。"
   else
     REMINDER+="\n  [Feedback Candidate] 检测到用户反馈候选 (type: ${FEEDBACK_CANDIDATE_TYPE})，自动提交失败。"
     REMINDER+="\n     请手动执行: harnessctl feedback submit --epic-id ${ACTIVE_EPIC_ID} --stage ${ACTIVE_STAGE} --text \"...\""
+  fi
+fi
+
+# Guard: Check for existing feedback items that are idle (submitted/triaged but not acted on)
+if [[ -n "$ACTIVE_EPIC_ID" && -x "$HARNESSCTL" && -z "$FEEDBACK_CANDIDATE_TYPE" ]]; then
+  IDLE_FB=$("$HARNESSCTL" feedback list --epic-id "$ACTIVE_EPIC_ID" --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    items = data if isinstance(data, list) else data.get('feedbacks', data.get('items', []))
+    idle = [f for f in items if f.get('status') in ('submitted', 'triaging')]
+    triaged = [f for f in items if f.get('status') == 'triaged']
+    result = {'idle': idle, 'triaged': triaged}
+    if idle or triaged:
+        print(json.dumps(result))
+except:
+    pass
+" 2>/dev/null || true)
+
+  if [[ -n "$IDLE_FB" ]]; then
+    IDLE_IDS=$(echo "$IDLE_FB" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+parts = []
+for f in data.get('idle', []):
+    parts.append(f.get('feedback_id', f.get('id', '?')) + ' (status: ' + f.get('status', '?') + ')')
+for f in data.get('triaged', []):
+    parts.append(f.get('feedback_id', f.get('id', '?')) + ' (status: triaged, needs continue)')
+print('; '.join(parts))
+" 2>/dev/null || true)
+    if [[ -n "$IDLE_IDS" ]]; then
+      REMINDER+="\n  ⚠️  [Feedback IDLE Guard] 存在未处理的 feedback: ${IDLE_IDS}"
+      REMINDER+="\n     禁止在 feedback 完成 triage + continue 之前进行其他开发工作。"
+      REMINDER+="\n     立即处理："
+      REMINDER+="\n     - submitted 状态: 执行 harnessctl feedback run-triage --epic-id ${ACTIVE_EPIC_ID} --feedback-id <id>"
+      REMINDER+="\n     - triaged 状态: 执行 harnessctl feedback continue --epic-id ${ACTIVE_EPIC_ID} --feedback-id <id>"
+    fi
   fi
 fi
 

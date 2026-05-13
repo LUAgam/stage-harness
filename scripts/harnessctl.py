@@ -4818,6 +4818,54 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
         for msg in _plan_multi_repo_repo_fanin_summary_gate_errors(features_dir, h):
             missing.append(msg)
 
+    if stage == "EXECUTE":
+        # Validate all task receipts exist and contain build results
+        receipts_dir = features_dir / "receipts"
+        tasks_dir = h / "tasks"
+        if tasks_dir.exists():
+            import glob as _glob
+            task_files = sorted(_glob.glob(str(tasks_dir / f"{epic_id}.*.json")))
+            for tf in task_files:
+                try:
+                    task_data = json.loads(Path(tf).read_text(encoding="utf-8"))
+                    task_id = task_data.get("id", "")
+                    task_status = task_data.get("status", "")
+                    if task_status != "done":
+                        continue
+                    receipt_path = receipts_dir / f"{task_id}.json"
+                    if not receipt_path.exists():
+                        missing.append(f"{receipt_path} (task {task_id} done but no receipt)")
+                    else:
+                        try:
+                            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                            smoke = receipt.get("smoke", {})
+                            if isinstance(smoke, dict) and not smoke.get("passed", True):
+                                missing.append(f"{receipt_path} (smoke.passed=false for {task_id})")
+                            build = receipt.get("build", {})
+                            if isinstance(build, dict) and build.get("executed"):
+                                if not build.get("passed", True):
+                                    missing.append(f"{receipt_path} (build.passed=false for {task_id})")
+                        except (json.JSONDecodeError, OSError):
+                            warnings.append(f"{receipt_path} (invalid JSON)")
+                except (json.JSONDecodeError, OSError):
+                    continue
+        # Check no unresolved feedback
+        fb_dir = features_dir / "feedback"
+        if fb_dir.exists():
+            for fb_file in sorted(fb_dir.glob("HFB-*.json")):
+                if fb_file.name.endswith(".triage.json") or fb_file.name.endswith(".evidence-pack.json"):
+                    continue
+                if ".re-completion" in fb_file.name or ".related-gap-scan" in fb_file.name:
+                    continue
+                try:
+                    fb_data = json.loads(fb_file.read_text(encoding="utf-8"))
+                    fb_status = fb_data.get("status", "")
+                    if fb_status in ("submitted", "triaging", "triaged", "reopened", "amending"):
+                        fb_id = fb_data.get("feedback_id", fb_file.stem)
+                        warnings.append(f"Feedback {fb_id} still in status '{fb_status}' — resolve before VERIFY")
+                except (json.JSONDecodeError, OSError):
+                    continue
+
     if stage == "VERIFY":
         verification_path = features_dir / "verification.json"
         if verification_path.exists():
@@ -7583,9 +7631,27 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
         err("No valid votes found")
 
     # Normalize vote decisions: accept legacy "reopen" + target_stage format
+    # but REJECT truly invalid decisions (v2 strict mode)
+    LEGACY_REJECT_VALUES = {
+        "AGREE_REOPEN", "CONDITIONAL", "AGREE", "DISAGREE",
+        "NO_REOPEN", "NEEDS_DISCUSSION", "ABSTAIN",
+    }
+    rejected_votes = []
     for v in votes:
         decision = v.get("decision", "")
         decision_upper = decision.upper().replace("-", "_")
+
+        # Reject explicitly invalid legacy values
+        if decision_upper in LEGACY_REJECT_VALUES:
+            agent_name = v.get("agent", "unknown")
+            rejected_votes.append({
+                "agent": agent_name,
+                "invalid_decision": decision,
+                "reason": f"Legacy decision value '{decision}' is not in v2 schema. "
+                          f"Valid values: {', '.join(FEEDBACK_TRIAGE_OUTCOMES)}"
+            })
+            continue
+
         # Legacy format: "reopen" with separate target_stage
         if decision_upper == "REOPEN" and v.get("target_stage"):
             v["decision"] = f"REOPEN_{v['target_stage'].upper()}"
@@ -7596,6 +7662,34 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
         elif decision_upper in ("NO_REOPEN_WITH_EVIDENCE", "STAY_EXECUTE",
                                 "INSUFFICIENT_EVIDENCE", "REJECT", "DEFER"):
             v["decision"] = decision_upper
+        # Final check: reject anything not in valid set after normalization
+        elif decision_upper not in [d.upper() for d in FEEDBACK_TRIAGE_OUTCOMES]:
+            agent_name = v.get("agent", "unknown")
+            rejected_votes.append({
+                "agent": agent_name,
+                "invalid_decision": decision,
+                "reason": f"Decision '{decision}' not in valid set: {', '.join(FEEDBACK_TRIAGE_OUTCOMES)}"
+            })
+
+    # Remove rejected votes from processing
+    if rejected_votes:
+        valid_agents = {v.get("agent") for v in votes} - {r["agent"] for r in rejected_votes}
+        votes = [v for v in votes if v.get("agent") in valid_agents]
+        total = len(votes)
+        if total == 0:
+            # Write rejection report
+            rejection_report = {
+                "feedback_id": feedback_id,
+                "status": "error",
+                "error": "All votes rejected due to invalid decision values",
+                "rejected_votes": rejected_votes,
+                "valid_decisions": FEEDBACK_TRIAGE_OUTCOMES,
+                "timestamp": now_iso(),
+            }
+            rejection_path = councils_dir / "rejection-report.json"
+            atomic_write_json(rejection_path, rejection_report)
+            err(f"All {len(rejected_votes)} votes rejected (invalid schema). "
+                f"See {rejection_path}. Valid decisions: {', '.join(FEEDBACK_TRIAGE_OUTCOMES)}")
 
     # Categorize votes
     stage_priority = {"CLARIFY": 0, "SPEC": 1, "PLAN": 2, "EXECUTE": 3}
@@ -7674,6 +7768,7 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
         "triaged_by": "feedback_triage_council",
         "vote_summary": vote_summary,
         "related_gaps": all_related_gaps,
+        "rejected_votes": rejected_votes,
     }
     triage_path = _feedback_dir(h, epic_id) / f"{feedback_id}.triage.json"
     atomic_write_json(triage_path, triage_data)
@@ -7695,6 +7790,7 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
         "confidence": max_confidence,
         "timestamp": now_iso(),
         "vote_summary": vote_summary,
+        "rejected_votes": rejected_votes,
     }
     verdict_path = councils_dir / "verdict.json"
     atomic_write_json(verdict_path, verdict)
@@ -7704,6 +7800,10 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
     else:
         print(f"Feedback triage verdict: {final_decision}")
         print(f"  Votes: {len(reopen_votes)}/{total} reopen")
+        if rejected_votes:
+            print(f"  ⚠ Rejected {len(rejected_votes)} vote(s) with invalid schema:")
+            for rv in rejected_votes:
+                print(f"    - {rv['agent']}: '{rv['invalid_decision']}' → {rv['reason']}")
         if requires_reopen:
             print(f"  Target stage: {target_stage}")
             print(f"  Classification: {classification}")
@@ -8810,6 +8910,197 @@ def cmd_feedback_reopen_stats(args, h: Path) -> None:
         print(f"  Output: {stats_path}")
 
 
+def cmd_feedback_run_triage(args, h: Path) -> None:
+    """Orchestrate the full feedback triage pipeline: evidence-pack → council-triage → (agents dispatched externally) → aggregate-triage.
+
+    This command runs the preparatory steps automatically. The caller (AI agent)
+    must still dispatch the 6 council agents in parallel between council-triage
+    and aggregate-triage. This command handles steps 1-3 and outputs instructions
+    for the agent dispatch step.
+    """
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    if fb["status"] not in ("submitted", "triaging"):
+        err(f"Feedback {feedback_id} is in status '{fb['status']}', expected 'submitted' or 'triaging'")
+
+    # Step 1: evidence-pack
+    pack_path = _feedback_dir(h, epic_id) / f"{feedback_id}.evidence-pack.json"
+    if not pack_path.exists():
+        # Build a minimal args namespace for evidence-pack
+        ep_args = argparse.Namespace(
+            epic_id=epic_id, feedback_id=feedback_id, json=True,
+            project_root=getattr(args, 'project_root', None))
+        cmd_feedback_evidence_pack(ep_args, h)
+
+    # Step 2: council-triage init
+    councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council" / feedback_id
+    votes_dir = councils_dir / "votes"
+    if not votes_dir.exists() or not any(votes_dir.glob("*.json")):
+        ct_args = argparse.Namespace(
+            epic_id=epic_id, feedback_id=feedback_id, json=True,
+            project_root=getattr(args, 'project_root', None))
+        cmd_feedback_council_triage(ct_args, h)
+
+    # Update status to triaging
+    fb["status"] = "triaging"
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    result = {
+        "status": "ok",
+        "phase": "council_dispatch_required",
+        "feedback_id": feedback_id,
+        "epic_id": epic_id,
+        "evidence_pack_path": str(pack_path),
+        "votes_dir": str(votes_dir),
+        "agents": FEEDBACK_TRIAGE_COUNCIL_AGENTS,
+        "valid_decisions": FEEDBACK_TRIAGE_OUTCOMES,
+        "next_step": f"Dispatch 6 agents in parallel, then run: "
+                     f"harnessctl feedback aggregate-triage --epic-id {epic_id} --feedback-id {feedback_id}",
+        "instructions": [
+            "1. Evidence pack collected ✓",
+            "2. Council triage initialized ✓",
+            "3. NOW: Dispatch 6 reviewer agents in parallel (use Agent tool)",
+            f"4. THEN: harnessctl feedback aggregate-triage --epic-id {epic_id} --feedback-id {feedback_id}",
+            f"5. THEN: harnessctl feedback continue --epic-id {epic_id} --feedback-id {feedback_id}",
+        ],
+    }
+
+    if args.json:
+        out_json(result)
+    else:
+        print(f"Feedback run-triage pipeline for {feedback_id}:")
+        for inst in result["instructions"]:
+            print(f"  {inst}")
+
+
+def cmd_feedback_continue(args, h: Path) -> None:
+    """Auto-execute post-triage actions based on verdict. Implements the auto-continue
+    logic: for low/medium risk non-scope-change verdicts, automatically approve and
+    execute without asking the user.
+    """
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    if fb["status"] not in ("triaged", "amending"):
+        err(f"Feedback {feedback_id} is in status '{fb['status']}', expected 'triaged'")
+
+    # Load verdict
+    councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council" / feedback_id
+    verdict_path = councils_dir / "verdict.json"
+    if not verdict_path.exists():
+        err(f"No verdict found for {feedback_id}. Run aggregate-triage first.")
+    verdict = load_json(verdict_path)
+
+    decision = verdict.get("decision", "")
+    classification = verdict.get("classification", "")
+    target_stage = verdict.get("target_stage", "")
+    requires_reopen = verdict.get("requires_reopen", False)
+
+    # Load epic risk level
+    state_file = h / "features" / epic_id / "state.json"
+    risk_level = "low"
+    if state_file.exists():
+        state = load_json(state_file)
+        risk_level = state.get("risk_level", "low")
+
+    # Determine if auto-approve or human-confirm required
+    needs_human_confirm = False
+    confirm_reason = ""
+
+    if classification in ("scope_change", "blocker"):
+        needs_human_confirm = True
+        confirm_reason = f"classification={classification} always requires human confirmation"
+    elif risk_level == "high" and requires_reopen:
+        needs_human_confirm = True
+        confirm_reason = f"risk_level=high with REOPEN requires human confirmation"
+
+    # Check for related-gap-scan requirement (mandatory for scope_gap)
+    gap_scan_required = False
+    if classification in ("scope_gap", "scope_gap_question") or requires_reopen:
+        gap_scan_required = True
+        gap_scan_path = _feedback_dir(h, epic_id) / f"{feedback_id}.related-gap-scan.json"
+        if not gap_scan_path.exists():
+            # Auto-run related-gap-scan
+            rgs_args = argparse.Namespace(
+                epic_id=epic_id, feedback_id=feedback_id, phase="pre", json=True,
+                project_root=getattr(args, 'project_root', None))
+            cmd_feedback_related_gap_scan(rgs_args, h)
+
+    action_plan = {
+        "feedback_id": feedback_id,
+        "decision": decision,
+        "classification": classification,
+        "target_stage": target_stage,
+        "risk_level": risk_level,
+        "needs_human_confirm": needs_human_confirm,
+        "confirm_reason": confirm_reason,
+        "gap_scan_required": gap_scan_required,
+    }
+
+    if needs_human_confirm:
+        action_plan["status"] = "awaiting_human_confirm"
+        action_plan["message"] = (
+            f"Verdict {decision} with {confirm_reason}. "
+            "Human confirmation required before proceeding."
+        )
+        action_plan["next_steps"] = [
+            f"User must confirm, then run: harnessctl feedback approve-amendment "
+            f"--epic-id {epic_id} --feedback-id {feedback_id}",
+        ]
+    elif decision == "NO_REOPEN_WITH_EVIDENCE":
+        action_plan["status"] = "auto_close"
+        action_plan["message"] = "No reopen needed. Close feedback with evidence."
+        action_plan["next_steps"] = [
+            f"Close: harnessctl feedback close --epic-id {epic_id} --feedback-id {feedback_id} "
+            f"--evidence 'Council verdict: {decision}'",
+        ]
+    elif decision == "INSUFFICIENT_EVIDENCE":
+        action_plan["status"] = "blocked_insufficient_evidence"
+        action_plan["message"] = "Evidence insufficient. Cannot proceed — supplemental evidence required."
+        action_plan["next_steps"] = ["Collect additional evidence and re-run triage"]
+    elif requires_reopen:
+        action_plan["status"] = "auto_reopen"
+        action_plan["message"] = (
+            f"Auto-approved: REOPEN to {target_stage} "
+            f"(risk={risk_level}, classification={classification})"
+        )
+        action_plan["next_steps"] = [
+            f"1. harnessctl feedback plan-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+            f"2. harnessctl feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+            f"3. harnessctl reopen --epic-id {epic_id} --to {target_stage} --feedback-id {feedback_id}",
+            f"4. Execute re-{target_stage.lower()} skill",
+        ]
+    elif decision == "STAY_EXECUTE":
+        action_plan["status"] = "auto_create_task"
+        action_plan["message"] = (
+            "Stay in EXECUTE — auto-create supplemental task and execute via /harness:work"
+        )
+        action_plan["next_steps"] = [
+            f"1. harnessctl task-graph merge --epic-id {epic_id} --feedback-id {feedback_id} "
+            f"--new-tasks '[{{\"title\": \"<补充任务>\", \"surface\": \"<surface>\"}}]'",
+            "2. Execute new task via /harness:work skill",
+            f"3. harnessctl feedback close --epic-id {epic_id} --feedback-id {feedback_id}",
+        ]
+    else:
+        action_plan["status"] = "unknown_decision"
+        action_plan["message"] = f"Unhandled decision: {decision}"
+
+    if args.json:
+        out_json({"status": "ok", **action_plan})
+    else:
+        print(f"Feedback continue for {feedback_id}:")
+        print(f"  Decision: {decision}")
+        print(f"  Status: {action_plan['status']}")
+        print(f"  Message: {action_plan['message']}")
+        if action_plan.get("next_steps"):
+            print(f"  Next steps:")
+            for step in action_plan["next_steps"]:
+                print(f"    {step}")
+
+
 def _pitfall_recommendation(classification: str) -> str:
     """Generate a recommendation based on reopen classification pattern."""
     recommendations = {
@@ -9386,6 +9677,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_rstats.add_argument("--epic-id", dest="epic_id", default=None, help="Filter by epic (optional)")
     p_fb_rstats.add_argument("--json", action="store_true")
 
+    p_fb_runtriage = fb_sub.add_parser("run-triage", help="Run full triage pipeline (evidence-pack + council-triage init)")
+    p_fb_runtriage.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_runtriage.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_runtriage.add_argument("--json", action="store_true")
+
+    p_fb_continue = fb_sub.add_parser("continue", help="Auto-execute post-triage actions based on verdict")
+    p_fb_continue.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_continue.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_continue.add_argument("--json", action="store_true")
+
     # ---- reopen ----
     p_reopen = sub.add_parser("reopen", help="Controlled stage reopen via approved feedback")
     p_reopen.add_argument("--epic-id", dest="epic_id", required=True)
@@ -9711,6 +10012,10 @@ def main() -> None:
             cmd_feedback_source_probe(args, h)
         elif args.feedback_action == "reopen-stats":
             cmd_feedback_reopen_stats(args, h)
+        elif args.feedback_action == "run-triage":
+            cmd_feedback_run_triage(args, h)
+        elif args.feedback_action == "continue":
+            cmd_feedback_continue(args, h)
 
     elif args.command == "reopen":
         cmd_reopen(args, h)

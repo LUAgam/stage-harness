@@ -84,6 +84,7 @@ skill 内部执行 Worker 5 Phase 循环：
 | 3 | TDD | 先写测试（RED），再写实现（GREEN），重构（IMPROVE） |
 | 4 | smoke | 运行 smoke 测试验证基本功能可用 |
 | 5 | commit + receipt | 提交代码，生成 task receipt |
+| 5.5 | build & deploy | 根据 project-profile 自动构建验证，结果写入 receipt.build |
 
 ### 循环控制
 
@@ -116,6 +117,7 @@ $HARNESSCTL task next --epic-id <epic-id>
 - `task_id`
 - `started_at` / `completed_at`
 - `smoke_result`: `PASS` 或 `FAIL`
+- `build`: `{ executed, command, exit_code, passed }` （Phase 5.5 产出）
 - `test_coverage_pct`
 - `files_changed`: 变更文件列表
 - `commit_sha`
@@ -125,7 +127,9 @@ $HARNESSCTL task next --epic-id <epic-id>
 当前批次任务全部完成后：
 - 所有任务均有对应 receipt 文件
 - 所有 smoke 测试结果为 `PASS`
+- 所有 build 结果为 `PASS`（如 build.executed 为 true）
 - 无 preflight 失败未处理
+- 无未解决的 feedback（status 非 closed/rejected/deferred）
 
 ## 错误处理
 

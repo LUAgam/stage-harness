@@ -144,6 +144,70 @@ harnessctl task done <task-id>
 
 ---
 
+## Phase 5.5 — Build & Deploy（项目运行时适配）
+
+在 Phase 5 commit 之后、报告完成之前，执行项目级别的构建和部署验证。
+
+### 项目运行时适配器
+
+通过 `project-profile.yaml` 中的 `build_tool` 和 `test_framework` 自动检测项目构建方式：
+
+```bash
+# 读取项目 profile 获取构建信息
+harnessctl profile show --json
+```
+
+根据 profile 自动选择构建命令：
+
+| build_tool | 构建命令 | 类型检查 |
+|-----------|---------|---------|
+| npm | `npm run build` 或 `npx tsc --noEmit` | `npx tsc --noEmit` |
+| maven | `mvn compile -q` | N/A |
+| gradle | `./gradlew build` | N/A |
+| go | `go build ./...` | `go vet ./...` |
+| cargo | `cargo build` | `cargo clippy` |
+| pip/poetry | `python -m py_compile` | `mypy` (如存在) |
+
+如果 profile 中 `build_tool` 为 `unknown`，则尝试以下自动检测：
+1. 存在 `package.json` → npm
+2. 存在 `pom.xml` → maven
+3. 存在 `go.mod` → go
+4. 存在 `Cargo.toml` → cargo
+
+### 构建执行
+
+```bash
+# 使用 harnessctl build 命令（会根据 profile 自动选择构建方式）
+harnessctl build --epic-id <epic-id> --task-id <task-id> --json
+```
+
+如果 `harnessctl build` 不可用，直接执行对应的构建命令。
+
+### 构建结果写入 receipt
+
+构建结果必须写入 task receipt 的 `build` 字段：
+
+```json
+{
+  "task_id": "<task-id>",
+  "build": {
+    "executed": true,
+    "command": "<actual-command-run>",
+    "exit_code": 0,
+    "passed": true,
+    "output_excerpt": "<last 20 lines if failed>"
+  }
+}
+```
+
+### 构建失败处理
+
+- 构建失败 → 视为 smoke 失败，消耗重试预算
+- 类型检查失败 → 必须修复后再 commit（回到 Phase 3 IMPROVE）
+- 连续构建失败 3 次 → 标记 task 为 blocked
+
+---
+
 ## 完成后回答
 
 在写 receipt 前，明确回答：
