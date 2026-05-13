@@ -124,7 +124,7 @@ Agent 6 (code-reviewer):
   输出 vote JSON 到 votes_dir/code-reviewer.json
 ```
 
-### Vote JSON 格式
+### Vote JSON 格式 (v2 Unified Schema)
 
 每个 agent 必须输出：
 
@@ -134,11 +134,26 @@ Agent 6 (code-reviewer):
   "feedback_id": "<feedback-id>",
   "decision": "<FEEDBACK_TRIAGE_OUTCOME>",
   "classification": "<feedback-classification>",
+  "target_stage": "<CLARIFY|SPEC|PLAN|EXECUTE>",
   "confidence": 0.86,
   "evidence": ["具体证据描述1", "具体证据描述2"],
-  "reasoning": "判断理由简述"
+  "reasoning": "判断理由简述",
+  "related_gaps": [
+    {
+      "category": "test|docs|config|frontend|backend|auth|i18n|infra|data",
+      "description": "同类遗漏描述",
+      "confidence": 0.7
+    }
+  ]
 }
 ```
+
+强校验规则：
+- `decision=REOPEN_PLAN` → `target_stage` 必须是 `PLAN`
+- `decision=REOPEN_SPEC` → `target_stage` 必须是 `SPEC`
+- `decision=REOPEN_CLARIFY` → `target_stage` 必须是 `CLARIFY`
+- `decision=STAY_EXECUTE` → `target_stage` 必须是 `EXECUTE`
+- `decision=NO_REOPEN_WITH_EVIDENCE` → `evidence` 非空
 
 有效 decision 值：
 - `REOPEN_CLARIFY` — 需求澄清阶段遗漏，需回退到 CLARIFY
@@ -177,6 +192,21 @@ $HARNESSCTL feedback aggregate-triage \
 4. 全部 `NO_REOPEN_WITH_EVIDENCE` 且证据充分 → 不 reopen
 5. 证据不足 → `INSUFFICIENT_EVIDENCE`（阻断，要求补证据）
 
+### Step 5.5: Related-Gap Scan (v2)
+
+After aggregation, if verdict is `REOPEN_*` or `STAY_EXECUTE` with `scope_gap` classification, run related-gap scan:
+
+```bash
+$HARNESSCTL feedback related-gap-scan \
+  --epic-id ${EPIC_ID} \
+  --feedback-id ${FEEDBACK_ID} \
+  --phase pre \
+  --json
+```
+
+This generates `HFB-xxx.related-gap-scan.json` with sibling categories to check.
+The scan results feed into the amendment-plan to ensure sibling gaps are addressed together.
+
 ### Step 6: 根据 Verdict 执行后续
 
 读取 verdict：
@@ -192,10 +222,23 @@ cat .harness/features/${EPIC_ID}/councils/feedback_triage_council/${FEEDBACK_ID}
 $HARNESSCTL feedback plan-amendment --epic-id ${EPIC_ID} --feedback-id ${FEEDBACK_ID}
 ```
 
-**Risk-based approve**：
-- 如果 classification 为 `scope_change` 或 `blocker`，或项目 risk_level=high：
-  输出 amendment-plan 内容，等待用户确认后再 approve。
-- 否则（low/medium risk）：自动 approve。
+**Auto-Execute Matrix (v2)**：
+
+| Verdict | Low Risk | Medium Risk | High Risk |
+|---------|----------|-------------|-----------|
+| `REOPEN_PLAN` | 自动 | 自动 + revision-diff gate | 人工确认 |
+| `REOPEN_SPEC` | 自动 | 自动 + revision-diff gate | 人工确认 |
+| `REOPEN_CLARIFY` | 自动 | 自动 + revision-diff gate | 人工确认 |
+| `STAY_EXECUTE` | 自动 | 自动 + review gate | 非破坏性自动；破坏性人工确认 |
+| `scope_change` | 人工确认 | 人工确认 | 人工确认 |
+
+核心原则：`当前范围内 + 非破坏性 + 可验证 = 自动修`
+
+**Risk-based approve 判断**：
+1. 读取 epic state 中的 `risk_level`（默认 low）
+2. 如果 classification 为 `scope_change` 或 `blocker`：始终人工确认
+3. 如果 risk_level=high 且 verdict 为 REOPEN_*：人工确认
+4. 否则：自动 approve 并执行
 
 ```bash
 $HARNESSCTL feedback approve-amendment --epic-id ${EPIC_ID} --feedback-id ${FEEDBACK_ID}

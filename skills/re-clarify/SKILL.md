@@ -125,14 +125,18 @@ $HARNESSCTL stage-gate check CLARIFY --epic-id <epic-id>
 
 Must pass before proceeding.
 
-### Step 8 — Feedback Status Update
+### Step 8 — Feedback Status Update & Completion Marker
 
-Update feedback status to `amending` → `implemented`:
+Update feedback status to `amending` → `implemented` and register re-completion:
 
 ```bash
-# After amendments complete:
-# Manually update HFB status or via future automation
+# Mark re-clarify as completed (REQUIRED — guard will block EXECUTE without this)
+$HARNESSCTL feedback re-complete --epic-id <epic-id> \
+  --feedback-id <HFB-xxx> --stage CLARIFY \
+  --artifacts "impact-scan.md,surface-routing.json"
 ```
+
+This creates `HFB-xxx.re-completion.json` which the reopen guard checks before allowing EXECUTE entry.
 
 ## Output
 

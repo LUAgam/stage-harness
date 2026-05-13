@@ -105,7 +105,16 @@ $HARNESSCTL artifact-status set --epic-id <epic-id> \
   --status current --reason "Re-planned via HFB-001"
 ```
 
-### Step 6 — Stage Gate
+### Step 6 — Completion Marker
+
+```bash
+# Mark re-plan as completed (REQUIRED — guard will block EXECUTE without this)
+$HARNESSCTL feedback re-complete --epic-id <epic-id> \
+  --feedback-id <HFB-xxx> --stage PLAN \
+  --artifacts "tasks/,coverage-matrix.json"
+```
+
+### Step 7 — Stage Gate
 
 ```bash
 $HARNESSCTL stage-gate check PLAN --epic-id <epic-id>

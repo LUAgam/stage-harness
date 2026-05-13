@@ -93,7 +93,16 @@ Determine if PLAN/tasks need changes:
 - New acceptance criteria that require new tasks → leave PLAN as `stale`
 - Existing tasks already cover the new criteria → waiver
 
-### Step 6 — Stage Gate
+### Step 6 — Completion Marker
+
+```bash
+# Mark re-spec as completed (REQUIRED — guard will block EXECUTE without this)
+$HARNESSCTL feedback re-complete --epic-id <epic-id> \
+  --feedback-id <HFB-xxx> --stage SPEC \
+  --artifacts "specs/<epic-id>.md,coverage-matrix.json"
+```
+
+### Step 7 — Stage Gate
 
 ```bash
 $HARNESSCTL stage-gate check SPEC --epic-id <epic-id>

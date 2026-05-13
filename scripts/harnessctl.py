@@ -5825,6 +5825,30 @@ def cmd_guard_check(args, h: Path, project_root: Path) -> None:
                     except (json.JSONDecodeError, KeyError):
                         pass
 
+            # Check reopened feedback without re-completion (v2 reopen guard)
+            fb_dir2 = h / "features" / epic_id / "feedback"
+            if fb_dir2.exists():
+                for fb_file in fb_dir2.glob("HFB-*.json"):
+                    if "." in fb_file.stem[4:]:  # skip .triage, .closure, etc.
+                        continue
+                    try:
+                        fb = json.loads(fb_file.read_text(encoding="utf-8"))
+                        fb_status = fb.get("status", "")
+                        fb_decision = fb.get("decision", "")
+                        if fb_status in ("reopened", "amending") and fb_decision.startswith("REOPEN_"):
+                            # Check for re-completion marker
+                            fb_id = fb.get("feedback_id", fb_file.stem)
+                            rc_file = fb_dir2 / f"{fb_id}.re-completion.json"
+                            if not rc_file.exists():
+                                target = fb_decision.replace("REOPEN_", "")
+                                issues.append(
+                                    f"feedback {fb_id} reopened ({fb_decision}) "
+                                    f"but re-{target.lower()} not completed — "
+                                    f"must run re-* before EXECUTE"
+                                )
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
     append_trace_event(h, _make_trace_event(
         epic_id, "guard_checked",
         stage=stage or state.get("current_stage", ""),
@@ -6824,6 +6848,72 @@ def _save_feedback(h: Path, epic_id: str, feedback_id: str, data: dict) -> None:
     atomic_write_json(path, data)
 
 
+def _feedback_dedup_check(h: Path, epic_id: str, new_text: str) -> str:
+    """Check if new feedback text is a duplicate of an existing open feedback.
+
+    Returns the feedback_id of the existing item if similarity > 0.85, else empty string.
+    On merge, appends the new text as an observation to the existing feedback.
+    """
+    fb_dir = _feedback_dir(h, epic_id)
+    if not fb_dir.exists():
+        return ""
+
+    new_words = set(new_text.lower().split())
+    if not new_words:
+        return ""
+
+    best_match = ""
+    best_score = 0.0
+
+    for fb_file in sorted(fb_dir.glob("HFB-*.json")):
+        if "." in fb_file.stem[4:]:  # skip .triage, .closure, etc.
+            continue
+        try:
+            fb = json.loads(fb_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        # Only dedup against open feedback
+        if fb.get("status") in ("closed", "rejected", "deferred"):
+            continue
+
+        existing_text = fb.get("text", "")
+        existing_words = set(existing_text.lower().split())
+        if not existing_words:
+            continue
+
+        # Keyword overlap ratio (Jaccard-like)
+        intersection = new_words & existing_words
+        union = new_words | existing_words
+        score = len(intersection) / len(union) if union else 0.0
+
+        if score > best_score:
+            best_score = score
+            best_match = fb.get("feedback_id", fb_file.stem)
+
+    if best_score > 0.85 and best_match:
+        # Merge: append as observation
+        fb = _load_feedback(h, epic_id, best_match)
+        observations = fb.get("observations", [])
+        # Add original text as first observation if not yet tracked
+        if not observations and fb.get("text"):
+            observations.append({
+                "text": fb["text"],
+                "submitted_at": fb.get("submitted_at", ""),
+                "source": fb.get("source", "user"),
+            })
+        observations.append({
+            "text": new_text,
+            "submitted_at": now_iso(),
+            "source": "user",
+            "merged": True,
+        })
+        fb["observations"] = observations
+        _save_feedback(h, epic_id, best_match, fb)
+        return best_match
+
+    return ""
+
+
 def _artifact_status_path(h: Path, epic_id: str) -> Path:
     """Return path to artifact-status.json for an epic."""
     return h / "features" / epic_id / "artifact-status.json"
@@ -6878,6 +6968,17 @@ def cmd_feedback_submit(args, h: Path) -> None:
     """Submit a new feedback item for an epic."""
     epic_id = args.epic_id
     load_epic(h, epic_id)  # validate epic exists
+
+    # --- Dedup check: merge into existing open feedback if highly similar ---
+    merged_into = _feedback_dedup_check(h, epic_id, args.text)
+    if merged_into:
+        payload = {"status": "merged", "feedback_id": merged_into, "epic_id": epic_id,
+                   "message": f"Merged into existing feedback {merged_into}"}
+        if args.json:
+            out_json(payload)
+        else:
+            print(f"Feedback merged into existing {merged_into} for epic {epic_id}")
+        return
 
     feedback_id = _next_feedback_id(h, epic_id)
     data = {
@@ -7459,6 +7560,21 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
     if total == 0:
         err("No valid votes found")
 
+    # Normalize vote decisions: accept legacy "reopen" + target_stage format
+    for v in votes:
+        decision = v.get("decision", "")
+        decision_upper = decision.upper().replace("-", "_")
+        # Legacy format: "reopen" with separate target_stage
+        if decision_upper == "REOPEN" and v.get("target_stage"):
+            v["decision"] = f"REOPEN_{v['target_stage'].upper()}"
+        # Normalize case: "reopen_plan" -> "REOPEN_PLAN"
+        elif decision_upper.startswith("REOPEN_") and decision != decision_upper:
+            v["decision"] = decision_upper
+        # Normalize other known decisions
+        elif decision_upper in ("NO_REOPEN_WITH_EVIDENCE", "STAY_EXECUTE",
+                                "INSUFFICIENT_EVIDENCE", "REJECT", "DEFER"):
+            v["decision"] = decision_upper
+
     # Categorize votes
     stage_priority = {"CLARIFY": 0, "SPEC": 1, "PLAN": 2, "EXECUTE": 3}
     reopen_votes = [v for v in votes if v.get("decision", "").startswith("REOPEN_")]
@@ -7503,6 +7619,13 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
 
     requires_reopen = final_decision.startswith("REOPEN_")
 
+    # Collect related_gaps from all votes
+    all_related_gaps = []
+    for v in votes:
+        for gap in v.get("related_gaps", []):
+            if gap not in all_related_gaps:
+                all_related_gaps.append(gap)
+
     # Build vote summary
     vote_summary = {
         "total": total,
@@ -7528,6 +7651,7 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
         "triaged_at": now_iso(),
         "triaged_by": "feedback_triage_council",
         "vote_summary": vote_summary,
+        "related_gaps": all_related_gaps,
     }
     triage_path = _feedback_dir(h, epic_id) / f"{feedback_id}.triage.json"
     atomic_write_json(triage_path, triage_data)
@@ -7742,6 +7866,238 @@ def cmd_task_graph_merge(args, h: Path) -> None:
                 print(f"    - {a['task_id']}: {a['title']} ({a['reason']})")
         else:
             print("  No completed tasks need amendment")
+
+
+def cmd_feedback_re_complete(args, h: Path) -> None:
+    """Mark a re-* stage as completed for a reopened feedback."""
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    stage = args.stage.upper()
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    if fb["status"] not in ("reopened", "amending"):
+        err(f"Feedback {feedback_id} is in status '{fb['status']}', expected 'reopened' or 'amending'")
+
+    if stage not in ("CLARIFY", "SPEC", "PLAN"):
+        err(f"Invalid re-* stage: {stage}. Must be CLARIFY, SPEC, or PLAN")
+
+    # Check revision-diff exists
+    rdiff_path = h / "features" / epic_id / f"revision-diff-{feedback_id}.md"
+    if not rdiff_path.exists():
+        err(f"revision-diff-{feedback_id}.md not found. Write it before marking re-* complete.")
+
+    # Parse canonical artifacts from args
+    artifacts = []
+    if args.artifacts:
+        artifacts = [a.strip() for a in args.artifacts.split(",") if a.strip()]
+
+    completion = {
+        "feedback_id": feedback_id,
+        "epic_id": epic_id,
+        "stage": stage,
+        "completed_at": now_iso(),
+        "revision_diff_path": str(rdiff_path.relative_to(h)),
+        "canonical_artifacts_updated": artifacts,
+    }
+
+    completion_path = _feedback_dir(h, epic_id) / f"{feedback_id}.re-completion.json"
+    atomic_write_json(completion_path, completion)
+
+    # Update feedback status
+    fb["status"] = "amending"
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    if args.json:
+        out_json({"status": "ok", **completion})
+    else:
+        print(f"Re-{stage.lower()} completion marked for {feedback_id}")
+        if artifacts:
+            print(f"  Canonical artifacts updated: {', '.join(artifacts)}")
+
+
+def cmd_feedback_related_gap_scan(args, h: Path) -> None:
+    """Generate a related-gap scan template for sibling issue discovery."""
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    # Load evidence pack if available
+    pack_path = _feedback_dir(h, epic_id) / f"{feedback_id}.evidence-pack.json"
+    evidence_pack = load_json(pack_path) if pack_path.exists() else {}
+
+    # Extract primary gap from feedback text
+    primary_gap = fb.get("text", "")
+
+    # Standard sibling categories
+    sibling_categories = [
+        {"category": "frontend", "check": "Pages, components, routes, menus, state management"},
+        {"category": "backend", "check": "APIs, services, repositories, models, middleware"},
+        {"category": "data", "check": "Schema, migrations, seed data, indexes"},
+        {"category": "auth", "check": "Permissions, roles, access control, policies"},
+        {"category": "config", "check": "Environment vars, feature flags, deployment config"},
+        {"category": "i18n", "check": "Translations, locale files, RTL support"},
+        {"category": "test", "check": "Unit, integration, E2E coverage for new paths"},
+        {"category": "docs", "check": "API docs, user guides, changelogs, README"},
+        {"category": "infra", "check": "Deployment, CI/CD, monitoring, alerting"},
+    ]
+
+    scan_result = {
+        "feedback_id": feedback_id,
+        "epic_id": epic_id,
+        "scan_trigger": fb.get("candidate_type", "scope_gap_question"),
+        "scan_phase": args.phase if hasattr(args, "phase") and args.phase else "pre",
+        "primary_gap": primary_gap,
+        "sibling_categories": sibling_categories,
+        "related_gaps": [],
+        "scanned_at": now_iso(),
+        "recommendation": "Agents should fill related_gaps based on sibling_categories analysis",
+    }
+
+    scan_path = _feedback_dir(h, epic_id) / f"{feedback_id}.related-gap-scan.json"
+    atomic_write_json(scan_path, scan_result)
+
+    if args.json:
+        out_json({"status": "ok", "path": str(scan_path), **scan_result})
+    else:
+        print(f"Related-gap scan template created for {feedback_id}")
+        print(f"  Primary gap: {primary_gap[:60]}")
+        print(f"  Sibling categories: {len(sibling_categories)}")
+        print(f"  Output: {scan_path}")
+
+
+# ---------------------------------------------------------------------------
+# Decisions Ledger
+# ---------------------------------------------------------------------------
+
+DECISION_AUTHORITIES = ("user_confirmed", "council_inferred", "agent_assumed")
+
+
+def _decisions_ledger_path(h: Path, epic_id: str) -> Path:
+    return h / "features" / epic_id / "decisions-ledger.json"
+
+
+def _load_decisions_ledger(h: Path, epic_id: str) -> dict:
+    path = _decisions_ledger_path(h, epic_id)
+    if path.exists():
+        return load_json(path)
+    return {"epic_id": epic_id, "decisions": [], "updated_at": now_iso()}
+
+
+def _save_decisions_ledger(h: Path, epic_id: str, data: dict) -> None:
+    data["updated_at"] = now_iso()
+    path = _decisions_ledger_path(h, epic_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, data)
+
+
+def _next_decision_id(data: dict) -> str:
+    nums = []
+    for d in data.get("decisions", []):
+        m = re.match(r"D-(\d+)", d.get("id", ""))
+        if m:
+            nums.append(int(m.group(1)))
+    return f"D-{max(nums, default=0) + 1:03d}"
+
+
+def cmd_decisions_add(args, h: Path) -> None:
+    """Add a decision to the ledger."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)
+
+    authority = args.authority
+    if authority not in DECISION_AUTHORITIES:
+        err(f"Invalid authority: {authority}. Valid: {', '.join(DECISION_AUTHORITIES)}")
+
+    override_map = {
+        "user_confirmed": "user_only",
+        "council_inferred": "new_evidence",
+        "agent_assumed": "re_stage",
+    }
+
+    data = _load_decisions_ledger(h, epic_id)
+    decision_id = _next_decision_id(data)
+
+    entry = {
+        "id": decision_id,
+        "stage": args.stage.upper() if args.stage else "",
+        "topic": args.topic,
+        "decision": args.decision,
+        "status": "active",
+        "authority": authority,
+        "can_override_by": override_map[authority],
+        "source_feedback_id": getattr(args, "source_feedback_id", "") or "",
+        "created_at": now_iso(),
+    }
+    data["decisions"].append(entry)
+    _save_decisions_ledger(h, epic_id, data)
+
+    if args.json:
+        out_json({"status": "ok", **entry})
+    else:
+        print(f"Decision {decision_id} added: [{authority}] {args.decision[:60]}")
+
+
+def cmd_decisions_list(args, h: Path) -> None:
+    """List decisions in the ledger."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)
+
+    data = _load_decisions_ledger(h, epic_id)
+    decisions = data.get("decisions", [])
+
+    # Filter by stage if specified
+    if hasattr(args, "stage") and args.stage:
+        decisions = [d for d in decisions if d.get("stage") == args.stage.upper()]
+
+    # Filter by status
+    if hasattr(args, "active_only") and args.active_only:
+        decisions = [d for d in decisions if d.get("status") == "active"]
+
+    if args.json:
+        out_json({"epic_id": epic_id, "decisions": decisions})
+    else:
+        if not decisions:
+            print(f"No decisions for epic {epic_id}")
+            return
+        for d in decisions:
+            status_mark = "✓" if d["status"] == "active" else "✗"
+            print(f"  {status_mark} {d['id']} [{d['authority']}] {d['stage']}: {d['decision'][:50]}")
+
+
+def cmd_decisions_check_override(args, h: Path) -> None:
+    """Check if a decision can be overridden by the current context."""
+    epic_id = args.epic_id
+    decision_id = args.decision_id
+    load_epic(h, epic_id)
+
+    data = _load_decisions_ledger(h, epic_id)
+    target = None
+    for d in data.get("decisions", []):
+        if d["id"] == decision_id:
+            target = d
+            break
+
+    if not target:
+        err(f"Decision {decision_id} not found")
+
+    can_override = target.get("can_override_by", "user_only")
+    authority = target.get("authority", "user_confirmed")
+
+    result = {
+        "decision_id": decision_id,
+        "authority": authority,
+        "can_override_by": can_override,
+        "is_overridable_by_system": can_override != "user_only",
+        "requires_user_confirmation": can_override == "user_only",
+    }
+
+    if args.json:
+        out_json({"status": "ok", **result})
+    else:
+        if can_override == "user_only":
+            print(f"Decision {decision_id} [{authority}]: NOT overridable by system. Requires user confirmation.")
+        else:
+            print(f"Decision {decision_id} [{authority}]: Overridable by {can_override}")
 
 
 def cmd_feedback_coverage_check(args, h: Path) -> None:
@@ -8372,6 +8728,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_agg.add_argument("--feedback-id", dest="feedback_id", required=True)
     p_fb_agg.add_argument("--json", action="store_true")
 
+    p_fb_recomplete = fb_sub.add_parser("re-complete", help="Mark re-* stage as completed for a feedback item")
+    p_fb_recomplete.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_recomplete.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_recomplete.add_argument("--stage", required=True, help="Stage that was re-run (CLARIFY, SPEC, PLAN)")
+    p_fb_recomplete.add_argument("--artifacts", default="", help="Comma-separated list of canonical artifacts updated")
+    p_fb_recomplete.add_argument("--json", action="store_true")
+
+    p_fb_rgap = fb_sub.add_parser("related-gap-scan", help="Generate related-gap scan template for a feedback item")
+    p_fb_rgap.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_rgap.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_rgap.add_argument("--phase", default="pre", choices=["pre", "stage"], help="Scan phase (pre or stage)")
+    p_fb_rgap.add_argument("--json", action="store_true")
+
     # ---- reopen ----
     p_reopen = sub.add_parser("reopen", help="Controlled stage reopen via approved feedback")
     p_reopen.add_argument("--epic-id", dest="epic_id", required=True)
@@ -8421,6 +8790,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_fbcov = sub.add_parser("feedback-coverage", help="Check feedback coverage chain")
     p_fbcov.add_argument("--epic-id", dest="epic_id", required=True)
     p_fbcov.add_argument("--json", action="store_true")
+
+    # ---- decisions ----
+    p_decisions = sub.add_parser("decisions", help="Decisions ledger management")
+    decisions_sub = p_decisions.add_subparsers(dest="decisions_action", metavar="ACTION")
+    decisions_sub.required = True
+
+    p_dec_add = decisions_sub.add_parser("add", help="Add a decision to the ledger")
+    p_dec_add.add_argument("--epic-id", dest="epic_id", required=True)
+    p_dec_add.add_argument("--stage", required=True, help="Stage (CLARIFY, SPEC, PLAN, EXECUTE)")
+    p_dec_add.add_argument("--topic", required=True, help="Decision topic")
+    p_dec_add.add_argument("--decision", required=True, help="Decision text")
+    p_dec_add.add_argument("--authority", required=True,
+                           choices=["user_confirmed", "council_inferred", "agent_assumed"],
+                           help="Authority level")
+    p_dec_add.add_argument("--source-feedback-id", dest="source_feedback_id", default="")
+    p_dec_add.add_argument("--json", action="store_true")
+
+    p_dec_list = decisions_sub.add_parser("list", help="List decisions in the ledger")
+    p_dec_list.add_argument("--epic-id", dest="epic_id", required=True)
+    p_dec_list.add_argument("--stage", default=None, help="Filter by stage")
+    p_dec_list.add_argument("--json", action="store_true")
+
+    p_dec_check = decisions_sub.add_parser("check-override", help="Check if a decision can be overridden")
+    p_dec_check.add_argument("--epic-id", dest="epic_id", required=True)
+    p_dec_check.add_argument("--decision-id", dest="decision_id", required=True)
+    p_dec_check.add_argument("--json", action="store_true")
 
     # ---- validate ----
     p_validate = sub.add_parser("validate", help="Validate .harness/ directory integrity")
@@ -8663,6 +9058,10 @@ def main() -> None:
             cmd_feedback_council_triage(args, h)
         elif args.feedback_action == "aggregate-triage":
             cmd_feedback_aggregate_triage(args, h)
+        elif args.feedback_action == "re-complete":
+            cmd_feedback_re_complete(args, h)
+        elif args.feedback_action == "related-gap-scan":
+            cmd_feedback_related_gap_scan(args, h)
 
     elif args.command == "reopen":
         cmd_reopen(args, h)
@@ -8681,6 +9080,14 @@ def main() -> None:
 
     elif args.command == "feedback-coverage":
         cmd_feedback_coverage_check(args, h)
+
+    elif args.command == "decisions":
+        if args.decisions_action == "add":
+            cmd_decisions_add(args, h)
+        elif args.decisions_action == "list":
+            cmd_decisions_list(args, h)
+        elif args.decisions_action == "check-override":
+            cmd_decisions_check_override(args, h)
 
     else:
         parser.print_help()
