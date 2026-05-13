@@ -4044,6 +4044,37 @@ def cmd_state_transition(args, h: Path) -> None:
             f"Allowed from {current}: {allowed}"
         )
 
+    # Re-completion gate: if a reopen is pending, verify the current stage
+    # has been re-completed before allowing forward transition
+    pending_rc = state.get("pending_re_completion")
+    if pending_rc and isinstance(pending_rc, dict):
+        rc_stages = pending_rc.get("stages", [])
+        rc_completed = pending_rc.get("completed_stages", [])
+        rc_fb_id = pending_rc.get("feedback_id", "")
+        if current in rc_stages and current not in rc_completed:
+            # Check if re-complete has been filed for this stage
+            fb_dir = h / "features" / epic_id / "feedback"
+            rc_file = fb_dir / f"{rc_fb_id}.re-completion.json"
+            if rc_file.exists():
+                try:
+                    rc_data = json.loads(rc_file.read_text(encoding="utf-8"))
+                    if rc_data.get("stage", "").upper() == current:
+                        # Auto-mark as completed
+                        rc_completed.append(current)
+                        pending_rc["completed_stages"] = rc_completed
+                except (json.JSONDecodeError, OSError):
+                    pass
+            if current not in rc_completed:
+                err(
+                    f"Re-completion gate: stage {current} was reopened via {rc_fb_id} "
+                    f"and must be re-completed before transitioning to {new_stage}. "
+                    f"Run: harnessctl feedback re-complete --epic-id {epic_id} "
+                    f"--feedback-id {rc_fb_id} --stage {current} --artifacts <list>"
+                )
+        # Clear pending_re_completion if all stages are done
+        if all(s in rc_completed for s in rc_stages):
+            state.pop("pending_re_completion", None)
+
     # Build transition log entry
     log_entry = {
         "from": current,
@@ -5120,6 +5151,153 @@ def _find_epic_for_task(h: Path, task_id: str) -> str:
     task, _ = load_task(h, task_id)
     return task.get("epic_id", "")
 
+
+# ---------------------------------------------------------------------------
+# build command — project runtime adapter
+# ---------------------------------------------------------------------------
+
+_BUILD_TOOL_COMMANDS = {
+    "npm": {"build": "npm run build", "typecheck": "npx tsc --noEmit"},
+    "yarn": {"build": "yarn build", "typecheck": "npx tsc --noEmit"},
+    "pnpm": {"build": "pnpm build", "typecheck": "npx tsc --noEmit"},
+    "maven": {"build": "mvn compile -q", "typecheck": None},
+    "gradle": {"build": "./gradlew build", "typecheck": None},
+    "go": {"build": "go build ./...", "typecheck": "go vet ./..."},
+    "cargo": {"build": "cargo build", "typecheck": "cargo clippy"},
+    "pip": {"build": "python -m py_compile", "typecheck": None},
+    "poetry": {"build": "poetry build", "typecheck": None},
+}
+
+_BUILD_TOOL_MARKERS = [
+    ("package.json", "npm"),
+    ("pom.xml", "maven"),
+    ("build.gradle", "gradle"),
+    ("go.mod", "go"),
+    ("Cargo.toml", "cargo"),
+    ("pyproject.toml", "poetry"),
+]
+
+
+def _detect_build_tool(project_root: Path) -> str:
+    """Auto-detect build tool from project markers."""
+    for marker, tool in _BUILD_TOOL_MARKERS:
+        if (project_root / marker).exists():
+            return tool
+    return "unknown"
+
+
+def cmd_build(args, h: Path, project_root: Path) -> None:
+    """Run project build based on project-profile or auto-detection."""
+    epic_id = args.epic_id
+    task_id = getattr(args, "task_id", "")
+
+    # Determine build tool from profile or auto-detect
+    profile_path = h / PROFILE_FILE
+    build_tool = "unknown"
+    if profile_path.exists():
+        try:
+            profile = _parse_simple_yaml(profile_path.read_text(encoding="utf-8"))
+            build_tool = profile.get("build_tool", "unknown")
+        except OSError:
+            pass
+    if build_tool == "unknown":
+        build_tool = _detect_build_tool(project_root)
+
+    if build_tool == "unknown":
+        result = {
+            "status": "skipped",
+            "reason": "No build tool detected in project-profile or project markers",
+            "build_tool": "unknown",
+            "executed": False,
+        }
+        if args.json:
+            out_json(result)
+        else:
+            print("Build skipped: no build tool detected")
+        return
+
+    commands_spec = _BUILD_TOOL_COMMANDS.get(build_tool, {})
+    build_cmd = commands_spec.get("build")
+    typecheck_cmd = commands_spec.get("typecheck")
+
+    results = []
+
+    # Run typecheck first (if available)
+    if typecheck_cmd:
+        tc_result = _run_build_command(typecheck_cmd, project_root, "typecheck")
+        results.append(tc_result)
+
+    # Run build
+    if build_cmd:
+        build_result = _run_build_command(build_cmd, project_root, "build")
+        results.append(build_result)
+
+    all_passed = all(r["passed"] for r in results)
+    output = {
+        "status": "ok" if all_passed else "failed",
+        "build_tool": build_tool,
+        "executed": True,
+        "passed": all_passed,
+        "steps": results,
+        "epic_id": epic_id,
+        "task_id": task_id,
+        "timestamp": now_iso(),
+    }
+
+    # Write build result to receipts dir if task_id provided
+    if task_id:
+        receipts_dir = h / "features" / epic_id / "receipts"
+        receipts_dir.mkdir(parents=True, exist_ok=True)
+        build_receipt_path = receipts_dir / f"{task_id}.build.json"
+        atomic_write_json(build_receipt_path, output)
+
+    if args.json:
+        out_json(output)
+    else:
+        for r in results:
+            status = "✓" if r["passed"] else "✗"
+            print(f"  {status} {r['phase']}: {r['command']} (exit={r['exit_code']})")
+        if not all_passed:
+            # Print last 20 lines of failed output
+            for r in results:
+                if not r["passed"] and r.get("output_tail"):
+                    print(f"\n  --- {r['phase']} output (last 20 lines) ---")
+                    print(r["output_tail"])
+
+
+def _run_build_command(cmd: str, cwd: Path, phase: str) -> dict:
+    """Execute a build command and return result dict."""
+    try:
+        proc = subprocess.run(
+            cmd, shell=True, cwd=str(cwd),
+            capture_output=True, text=True, timeout=300,
+        )
+        output_text = proc.stdout + proc.stderr
+        output_lines = output_text.strip().splitlines()
+        tail = "\n".join(output_lines[-20:]) if output_lines else ""
+        return {
+            "phase": phase,
+            "command": cmd,
+            "exit_code": proc.returncode,
+            "passed": proc.returncode == 0,
+            "output_tail": tail,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "phase": phase,
+            "command": cmd,
+            "exit_code": -1,
+            "passed": False,
+            "output_tail": "TIMEOUT: command exceeded 300s",
+        }
+    except OSError as e:
+        return {
+            "phase": phase,
+            "command": cmd,
+            "exit_code": -1,
+            "passed": False,
+            "output_tail": f"OSError: {e}",
+        }
 
 def cmd_receipt_write(args, h: Path) -> None:
     task_id = args.task_id
@@ -7248,6 +7426,20 @@ def cmd_reopen(args, h: Path) -> None:
     state["current_stage"] = target_stage
     if "stage" in state:
         state["stage"] = target_stage
+
+    # Record pending re-completion gates: all stages from target to old_stage (exclusive)
+    # must be re-completed before the epic can progress past them again.
+    stages_to_repass = []
+    for s in STAGES:
+        s_idx = STAGES.index(s)
+        if s_idx >= target_idx and s_idx < current_idx:
+            stages_to_repass.append(s)
+    state["pending_re_completion"] = {
+        "feedback_id": feedback_id,
+        "stages": stages_to_repass,
+        "completed_stages": [],
+        "created_at": now_iso(),
+    }
     atomic_write_json(state_path, state)
 
     # Artifact invalidation: mark downstream stages as stale
@@ -9767,6 +9959,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_validate = sub.add_parser("validate", help="Validate .harness/ directory integrity")
     p_validate.add_argument("--json", action="store_true")
 
+    # ---- build ----
+    p_build = sub.add_parser("build", help="Run project build based on project-profile")
+    p_build.add_argument("--epic-id", dest="epic_id", required=True)
+    p_build.add_argument("--task-id", dest="task_id", default="", help="Task ID (for receipt)")
+    p_build.add_argument("--json", action="store_true")
+
     return parser
 
 
@@ -9984,6 +10182,9 @@ def main() -> None:
 
     elif args.command == "validate":
         cmd_validate(args, h)
+
+    elif args.command == "build":
+        cmd_build(args, h, project_root)
 
     elif args.command == "feedback":
         if args.feedback_action == "submit":
