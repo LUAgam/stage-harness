@@ -9293,6 +9293,96 @@ def cmd_feedback_continue(args, h: Path) -> None:
                 print(f"    {step}")
 
 
+def cmd_feedback_close_all(args, h: Path) -> None:
+    """Close all open feedback items for an epic."""
+    epic_id = args.epic_id
+    load_epic(h, epic_id)
+    reason = args.reason or "Batch closed"
+
+    d = _feedback_dir(h, epic_id)
+    closed_ids = []
+    skipped_ids = []
+    for f in sorted(d.glob("HFB-*.json")):
+        if f.stem.endswith((".triage", ".closure", ".evidence-pack",
+                           ".amendment-plan", ".related-gap-scan")):
+            continue
+        item = load_json(f)
+        if item.get("status") in ("closed", "rejected", "deferred"):
+            skipped_ids.append(item.get("feedback_id", f.stem))
+            continue
+        fb_id = item.get("feedback_id", f.stem)
+        item["status"] = "closed"
+        item["resolution"] = reason
+        item["closed_at"] = now_iso()
+        atomic_write_json(f, item)
+        # Write closure file
+        closure_data = {
+            "feedback_id": fb_id,
+            "closed_at": now_iso(),
+            "final_status": "closed",
+            "closure_evidence": [reason],
+            "forced": True,
+        }
+        closure_path = d / f"{fb_id}.closure.json"
+        atomic_write_json(closure_path, closure_data)
+        closed_ids.append(fb_id)
+
+    if args.json:
+        out_json({"status": "ok", "closed": closed_ids, "skipped": skipped_ids})
+    else:
+        if closed_ids:
+            print(f"Closed {len(closed_ids)} feedback items: {', '.join(closed_ids)}")
+        if skipped_ids:
+            print(f"Skipped {len(skipped_ids)} already closed: {', '.join(skipped_ids)}")
+        if not closed_ids and not skipped_ids:
+            print(f"No feedback items found for epic {epic_id}")
+
+
+def cmd_feedback_clean(args, h: Path) -> None:
+    """Remove all feedback files and council records for an epic."""
+    import shutil
+    epic_id = args.epic_id
+    load_epic(h, epic_id)
+
+    removed_files = 0
+    removed_dirs = 0
+
+    # Remove feedback directory
+    fb_dir = h / "features" / epic_id / "feedback"
+    if fb_dir.exists():
+        for f in fb_dir.iterdir():
+            if f.is_file():
+                f.unlink()
+                removed_files += 1
+            elif f.is_dir():
+                shutil.rmtree(f)
+                removed_dirs += 1
+        # Remove the directory itself if empty
+        if not any(fb_dir.iterdir()):
+            fb_dir.rmdir()
+            removed_dirs += 1
+
+    # Remove feedback triage council records
+    council_dir = h / "features" / epic_id / "councils" / "feedback_triage_council"
+    if council_dir.exists():
+        shutil.rmtree(council_dir)
+        removed_dirs += 1
+
+    # Update execution summary to clear latest_pause_reason if it references feedback
+    summary_path = h / "logs" / "epics" / epic_id / "execution-summary.json"
+    if summary_path.exists():
+        summary = load_json(summary_path)
+        pause = summary.get("latest_pause_reason", "")
+        if "feedback" in pause.lower() or "HFB" in pause:
+            summary["latest_pause_reason"] = ""
+            atomic_write_json(summary_path, summary)
+
+    if args.json:
+        out_json({"status": "ok", "removed_files": removed_files, "removed_dirs": removed_dirs})
+    else:
+        print(f"Cleaned feedback for epic {epic_id}: {removed_files} files, {removed_dirs} directories removed")
+
+
 def _pitfall_recommendation(classification: str) -> str:
     """Generate a recommendation based on reopen classification pattern."""
     recommendations = {
@@ -9879,6 +9969,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_continue.add_argument("--feedback-id", dest="feedback_id", required=True)
     p_fb_continue.add_argument("--json", action="store_true")
 
+    p_fb_close_all = fb_sub.add_parser("close-all", help="Close all open feedback items for an epic")
+    p_fb_close_all.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_close_all.add_argument("--reason", default="Batch closed", help="Closure reason")
+    p_fb_close_all.add_argument("--json", action="store_true")
+
+    p_fb_clean = fb_sub.add_parser("clean", help="Remove all feedback files and council records for an epic")
+    p_fb_clean.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_clean.add_argument("--json", action="store_true")
+
     # ---- reopen ----
     p_reopen = sub.add_parser("reopen", help="Controlled stage reopen via approved feedback")
     p_reopen.add_argument("--epic-id", dest="epic_id", required=True)
@@ -10217,6 +10316,10 @@ def main() -> None:
             cmd_feedback_run_triage(args, h)
         elif args.feedback_action == "continue":
             cmd_feedback_continue(args, h)
+        elif args.feedback_action == "close-all":
+            cmd_feedback_close_all(args, h)
+        elif args.feedback_action == "clean":
+            cmd_feedback_clean(args, h)
 
     elif args.command == "reopen":
         cmd_reopen(args, h)
