@@ -6,22 +6,30 @@
 
 ```bash
 if [ -z "${HARNESSCTL:-}" ]; then
-  candidates=(
-    "./stage-harness/scripts/harnessctl"
-    "../stage-harness/scripts/harnessctl"
-    "$(git rev-parse --show-toplevel 2>/dev/null)/stage-harness/scripts/harnessctl"
-  )
+  # 1. Read from .harness/config.json if available
+  if [ -f ".harness/config.json" ]; then
+    _cfg_path=$(python3 -c "import json,sys;print(json.load(open('.harness/config.json')).get('harnessctl_path',''))" 2>/dev/null)
+    [ -n "$_cfg_path" ] && [ -x "$_cfg_path" ] && HARNESSCTL="$_cfg_path"
+  fi
 
-  for candidate in "${candidates[@]}"; do
-    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-      HARNESSCTL="$candidate"
-      break
-    fi
-  done
+  # 2. Fallback: search common locations
+  if [ -z "${HARNESSCTL:-}" ]; then
+    candidates=(
+      "./stage-harness/scripts/harnessctl"
+      "../stage-harness/scripts/harnessctl"
+      "$(git rev-parse --show-toplevel 2>/dev/null)/stage-harness/scripts/harnessctl"
+    )
+    for candidate in "${candidates[@]}"; do
+      if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        HARNESSCTL="$candidate"
+        break
+      fi
+    done
+  fi
 fi
 
 test -n "${HARNESSCTL:-}" && test -x "$HARNESSCTL" || {
-  echo "harnessctl not found. Set HARNESSCTL=/abs/path/to/stage-harness/scripts/harnessctl" >&2
+  echo "harnessctl not found. Set HARNESSCTL or add harnessctl_path to .harness/config.json" >&2
   exit 1
 }
 ```

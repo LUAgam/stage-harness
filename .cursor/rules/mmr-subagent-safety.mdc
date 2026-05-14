@@ -21,21 +21,25 @@ alwaysApply: true
 本套流程分为以下阶段：
 
 1. 方案制定：由 mmr-planner 负责
-2. 方案复审：由 mmr-plan-reviewer 负责
-3. 执行落地：由 mmr-executor 负责
-4. 代码复审 A：由 mmr-code-reviewer-gpt 负责
-5. 代码复审 B：由 mmr-code-reviewer-gemini 负责
+2. 方案复审 GPT 视角：由 mmr-plan-reviewer-gpt-5-5 负责
+3. 方案复审 Gemini 视角：由 mmr-plan-reviewer-gemini-3-1-pro-preview 负责
+4. 方案复审 Claude 视角：由 mmr-plan-reviewer-claude-opus-4-6-thinking 负责
+5. 执行落地：由 mmr-executor 负责
+6. 代码复审 GPT 视角：由 mmr-code-reviewer-gpt-5-5 负责
+7. 代码复审 Gemini 视角：由 mmr-code-reviewer-gemini-3-1-pro-preview 负责
+8. 代码复审 Claude 视角：由 mmr-code-reviewer-claude-opus-4-6-thinking 负责
+
+说明：Claude Code 插件内这些 reviewer 使用 `model: inherit` 以保证插件可加载；上述名称表达目标模型与复审视角。若宿主或外部模型网关不支持对应模型标识，按规则第 5 条回退执行并明确说明。
 
 # 单次任务默认执行流程
 
 当用户请求“修复 bug / 修复问题 / 一次性完成修复和 review / 不要频繁交互”时，主 Agent 默认按以下顺序自动执行，不需要逐步等待用户确认：
 
 1. 调用 mmr-planner，分析问题并给出最小修复方案
-2. 调用 mmr-plan-reviewer，对方案进行复审
-3. 如果方案没有 P0 阻塞，则调用 mmr-executor 执行代码修改
-4. 执行完成后，调用 mmr-code-reviewer-gpt 做第一轮代码复审
-5. 再调用 mmr-code-reviewer-gemini 做第二轮代码复审
-6. 最终统一输出结果给用户
+2. 依次调用 mmr-plan-reviewer-gpt-5-5、mmr-plan-reviewer-gemini-3-1-pro-preview、mmr-plan-reviewer-claude-opus-4-6-thinking，对方案进行三模型复审
+3. 如果三份方案复审均没有 P0 阻塞，则调用 mmr-executor 执行代码修改
+4. 执行完成后，依次调用 mmr-code-reviewer-gpt-5-5、mmr-code-reviewer-gemini-3-1-pro-preview、mmr-code-reviewer-claude-opus-4-6-thinking 做三模型代码复审
+5. 最终统一输出结果给用户
 
 # 何时允许中途停止并请求用户确认
 
@@ -58,7 +62,11 @@ alwaysApply: true
 ## 最终修复方案
 ## 实际改动文件
 ## 校验结果
-## GPT 复审结论
-## Gemini 复审结论
+## GPT-5.5 方案复审结论
+## Gemini 方案复审结论
+## Claude 方案复审结论
+## GPT-5.5 代码复审结论
+## Gemini 代码复审结论
+## Claude 代码复审结论
 ## 最终风险与建议
 ## 是否建议提交

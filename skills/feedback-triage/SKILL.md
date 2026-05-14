@@ -4,22 +4,30 @@
 
 ```bash
 if [ -z "${HARNESSCTL:-}" ]; then
-  candidates=(
-    "./stage-harness/scripts/harnessctl"
-    "../stage-harness/scripts/harnessctl"
-    "$(git rev-parse --show-toplevel 2>/dev/null)/stage-harness/scripts/harnessctl"
-  )
+  # 1. Read from .harness/config.json if available
+  if [ -f ".harness/config.json" ]; then
+    _cfg_path=$(python3 -c "import json,sys;print(json.load(open('.harness/config.json')).get('harnessctl_path',''))" 2>/dev/null)
+    [ -n "$_cfg_path" ] && [ -x "$_cfg_path" ] && HARNESSCTL="$_cfg_path"
+  fi
 
-  for candidate in "${candidates[@]}"; do
-    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-      HARNESSCTL="$candidate"
-      break
-    fi
-  done
+  # 2. Fallback: search common locations
+  if [ -z "${HARNESSCTL:-}" ]; then
+    candidates=(
+      "./stage-harness/scripts/harnessctl"
+      "../stage-harness/scripts/harnessctl"
+      "$(git rev-parse --show-toplevel 2>/dev/null)/stage-harness/scripts/harnessctl"
+    )
+    for candidate in "${candidates[@]}"; do
+      if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        HARNESSCTL="$candidate"
+        break
+      fi
+    done
+  fi
 fi
 
 test -n "${HARNESSCTL:-}" && test -x "$HARNESSCTL" || {
-  echo "harnessctl not found. Set HARNESSCTL=/abs/path/to/stage-harness/scripts/harnessctl" >&2
+  echo "harnessctl not found. Set HARNESSCTL or add harnessctl_path to .harness/config.json" >&2
   exit 1
 }
 ```
@@ -43,11 +51,12 @@ Feedback Triage Council 调度技能。当 stage-reminder hook 自动提交 feed
 
 ## 硬性规则（绝对禁止）
 
-1. **禁止手工复刻 feedback 流程**：禁止用 Bash/Write/Edit 工具手动创建 `evidence-pack.json`、`votes/*.json`、`verdict.json` 文件。必须通过 `harnessctl` 标准命令完成每一步。
+1. **禁止手工复刻 feedback 流程**：禁止用 Bash/Write/Edit 工具手动创建 `evidence-pack.json`、`votes/*.json`、`verdict.json` 文件。必须通过 `harnessctl` 标准命令完成每一步。PreToolUse hooks 会自动拦截违规操作。
 2. **禁止使用旧版 vote schema**：`decision` 字段仅接受以下值：`REOPEN_CLARIFY`、`REOPEN_SPEC`、`REOPEN_PLAN`、`STAY_EXECUTE`、`NO_REOPEN_WITH_EVIDENCE`、`INSUFFICIENT_EVIDENCE`、`REJECT`、`DEFER`。旧版值（如 `agree_reopen`、`conditional`、`reopen` 等）会被 aggregate-triage 拒绝。
 3. **confirmed in-scope 后自动继续**：triage 裁决后，若 verdict 为 low/medium risk 的 REOPEN_* 或 STAY_EXECUTE，必须自动执行后续步骤（plan-amendment → approve → reopen/create-task），不得询问用户"要不要修"。仅 `scope_change` 或 `high risk` 需人工确认。
 4. **confirmed feedback 必须立即处理**：feedback 提交后不得跳过 triage 直接回答用户，也不得 idle 等待。
 5. **related-gap-scan 必须在 scope_gap 裁决后执行**：verdict 为 REOPEN_* 或 STAY_EXECUTE + scope_gap 时，必须运行 `related-gap-scan`，结果送入 amendment-plan。
+6. **Vote 必须通过 write-vote 命令提交**：Agent 投票必须使用 `harnessctl feedback write-vote` 命令，禁止直接写入 votes 目录。write-vote 会注入 `_managed`、`_written_by`、`_schema_version`、`_vote_session_id` 元数据，aggregate-triage 会校验这些字段存在且 `_managed=true`。`evidence` 数组不得为空，每条 evidence 必须引用具体文件路径或代码片段。
 
 ---
 
@@ -110,36 +119,52 @@ $HARNESSCTL feedback council-triage \
 
 ### Step 4: 并行调度 6 个 Reviewer Agent
 
-使用 Agent 工具并行调度（复用已有 agent 定义）：
+使用 Agent 工具并行调度（复用已有 agent 定义）。每个 agent **必须通过 `harnessctl feedback write-vote` 提交投票**，禁止直接写入 votes 目录文件：
 
 ```
 Agent 1 (requirement-analyst):
   读取 evidence-pack，判断用户反馈是否改变需求语义/范围/用户意图。
-  输出 vote JSON 到 votes_dir/requirement-analyst.json
+  通过 write-vote 提交投票：
+  $HARNESSCTL feedback write-vote --epic-id ${EPIC_ID} --feedback-id ${FEEDBACK_ID} \
+    --agent requirement-analyst --stdin <<< '<vote JSON>'
 
 Agent 2 (impact-analyst):
   读取 evidence-pack + 项目源码（按 source_evidence_hints 检索），
   判断是否遗漏影响面（仓库、模块、页面、接口）。
-  输出 vote JSON 到 votes_dir/impact-analyst.json
+  通过 write-vote 提交投票：
+  $HARNESSCTL feedback write-vote --epic-id ${EPIC_ID} --feedback-id ${FEEDBACK_ID} \
+    --agent impact-analyst --stdin <<< '<vote JSON>'
 
 Agent 3 (challenger):
   读取 evidence-pack，尝试反证"无需调整"是否站得住。
-  输出 vote JSON 到 votes_dir/challenger.json
+  通过 write-vote 提交投票：
+  $HARNESSCTL feedback write-vote --epic-id ${EPIC_ID} --feedback-id ${FEEDBACK_ID} \
+    --agent challenger --stdin <<< '<vote JSON>'
 
 Agent 4 (plan-reviewer):
   读取 evidence-pack + tasks，判断 PLAN/tasks 是否遗漏相关任务。
-  输出 vote JSON 到 votes_dir/plan-reviewer.json
+  通过 write-vote 提交投票：
+  $HARNESSCTL feedback write-vote --epic-id ${EPIC_ID} --feedback-id ${FEEDBACK_ID} \
+    --agent plan-reviewer --stdin <<< '<vote JSON>'
 
 Agent 5 (test-reviewer):
   读取 evidence-pack + spec，判断验收标准和测试是否覆盖。
-  输出 vote JSON 到 votes_dir/test-reviewer.json
+  通过 write-vote 提交投票：
+  $HARNESSCTL feedback write-vote --epic-id ${EPIC_ID} --feedback-id ${FEEDBACK_ID} \
+    --agent test-reviewer --stdin <<< '<vote JSON>'
 
 Agent 6 (code-reviewer):
   读取 evidence-pack + 相关源码（按 candidate_paths 检索），
   判断代码证据是否支持结论。注意：code-reviewer 只做事实判断，
   不单独决定上游阶段。
-  输出 vote JSON 到 votes_dir/code-reviewer.json
+  通过 write-vote 提交投票：
+  $HARNESSCTL feedback write-vote --epic-id ${EPIC_ID} --feedback-id ${FEEDBACK_ID} \
+    --agent code-reviewer --stdin <<< '<vote JSON>'
 ```
+
+> **⛔ 禁止行为**：Agent 不得使用 Write/Edit/Bash 直接创建 `votes/*.json` 文件。
+> PreToolUse hooks 会拦截此类操作。只有 `write-vote` 命令能写入 votes 目录，
+> 并自动注入 `_managed`/`_written_by`/`_schema_version`/`_vote_session_id` 元数据。
 
 ### Vote JSON 格式 (v2 Unified Schema)
 
@@ -352,9 +377,12 @@ feedback_candidate 检测
 
 | 约束 | 说明 |
 |------|------|
-| 禁止手工复刻 | 不得用 Bash/Write 创建 evidence-pack/votes/verdict 文件 |
+| 禁止手工复刻 | 不得用 Bash/Write 创建 evidence-pack/votes/verdict 文件，hooks 自动拦截 |
+| write-vote 唯一路径 | Agent 投票必须通过 `harnessctl feedback write-vote`，注入 managed 元数据 |
+| evidence 非空 | vote 的 evidence 数组不得为空，必须引用具体文件/代码 |
 | v2 schema only | decision 仅限 8 个标准值，旧值被 aggregate 拒绝 |
 | 自动继续 | low/medium risk 确认后自动执行，不问用户 |
 | feedback 不得 idle | submitted/triaged 状态的 feedback 必须立即处理 |
 | related-gap-scan | scope_gap 类型必须执行，结果送入 amendment |
+| approve-amendment gate | 高置信度 related gaps 必须在 Amend 或 Deferred(含 reason) 中体现 |
 | REOPEN 门禁 | 回退阶段必须重新完成门禁，使用 re-complete 标记 |

@@ -2330,6 +2330,48 @@ def cmd_repair(args, project_root: Path) -> None:
         )
 
 
+def cmd_resolve(args) -> None:
+    """Output resolved PLUGIN_ROOT, git sha, and path resolution method."""
+    import subprocess as _sp
+
+    # Determine git sha of the plugin checkout
+    git_sha = ""
+    try:
+        result = _sp.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(PLUGIN_ROOT), capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            git_sha = result.stdout.strip()
+    except Exception:
+        pass
+
+    # Resolution method: how was this harnessctl found?
+    resolution_method = "direct"  # script invoked directly
+    env_val = os.environ.get("HARNESSCTL", "")
+    if env_val:
+        resolution_method = "env_HARNESSCTL"
+    elif os.environ.get("CLAUDE_PLUGIN_ROOT", ""):
+        resolution_method = "env_CLAUDE_PLUGIN_ROOT"
+
+    payload = {
+        "plugin_root": str(PLUGIN_ROOT),
+        "harnessctl": str(_HARNESSCTL_DIR / "harnessctl"),
+        "git_sha": git_sha,
+        "resolution_method": resolution_method,
+        "python": sys.executable,
+    }
+
+    if getattr(args, "json", False):
+        out_json(payload)
+    else:
+        print(f"PLUGIN_ROOT: {PLUGIN_ROOT}")
+        print(f"harnessctl:  {_HARNESSCTL_DIR / 'harnessctl'}")
+        print(f"git_sha:     {git_sha or '(not a git repo)'}")
+        print(f"resolved_via: {resolution_method}")
+        print(f"python:      {sys.executable}")
+
+
 # ---------------------------------------------------------------------------
 # config commands
 # ---------------------------------------------------------------------------
@@ -7312,6 +7354,28 @@ def cmd_feedback_plan_amendment(args, h: Path) -> None:
         err(f"Triage file not found for {feedback_id}")
     triage = load_json(triage_path)
 
+    # Load related-gap-scan results if available
+    gap_scan_path = _feedback_dir(h, epic_id) / f"{feedback_id}.related-gap-scan.json"
+    related_gaps_section = "None"
+    deferred_gaps_section = "None"
+    if gap_scan_path.exists():
+        gap_scan = load_json(gap_scan_path)
+        gaps = gap_scan.get("gaps", [])
+        high_conf = [g for g in gaps if g.get("confidence", 0) >= 0.7]
+        low_conf = [g for g in gaps if g.get("confidence", 0) < 0.7]
+        if high_conf:
+            related_gaps_section = "\n".join(
+                f"- [{g.get('category', 'unknown')}] {g.get('description', '')} "
+                f"(confidence={g.get('confidence', 0)})"
+                for g in high_conf
+            )
+        if low_conf:
+            deferred_gaps_section = "\n".join(
+                f"- [{g.get('category', 'unknown')}] {g.get('description', '')} "
+                f"(confidence={g.get('confidence', 0)})"
+                for g in low_conf
+            )
+
     # Write amendment plan template
     plan_path = _feedback_dir(h, epic_id) / f"{feedback_id}.amendment-plan.md"
     plan_content = f"""# Amendment Plan — {feedback_id}
@@ -7328,6 +7392,13 @@ def cmd_feedback_plan_amendment(args, h: Path) -> None:
 
 ## Amend
 <!-- List artifacts to modify -->
+
+## Related Gaps (auto-populated from related-gap-scan)
+{related_gaps_section}
+
+## Deferred Related Gaps
+{deferred_gaps_section}
+<!-- Each deferred gap MUST have a defer_reason to pass approve-amendment -->
 
 ## Invalidate
 <!-- List downstream artifacts to mark stale/invalidated -->
@@ -7348,9 +7419,12 @@ medium
     _save_feedback(h, epic_id, feedback_id, fb)
 
     if args.json:
-        out_json({"status": "ok", "feedback_id": feedback_id, "plan_path": str(plan_path)})
+        out_json({"status": "ok", "feedback_id": feedback_id, "plan_path": str(plan_path),
+                  "related_gaps_included": related_gaps_section != "None"})
     else:
         print(f"Amendment plan created: {plan_path}")
+        if related_gaps_section != "None":
+            print(f"  ⚠ Related gaps auto-populated — review before approve")
 
 
 def cmd_feedback_approve_amendment(args, h: Path) -> None:
@@ -7365,6 +7439,48 @@ def cmd_feedback_approve_amendment(args, h: Path) -> None:
     plan_path = _feedback_dir(h, epic_id) / f"{feedback_id}.amendment-plan.md"
     if not plan_path.exists():
         err(f"Amendment plan not found for {feedback_id}")
+
+    # Gate: verify high-confidence related gaps are addressed or explicitly deferred
+    gap_scan_path = _feedback_dir(h, epic_id) / f"{feedback_id}.related-gap-scan.json"
+    if gap_scan_path.exists():
+        gap_scan = load_json(gap_scan_path)
+        high_conf_gaps = [g for g in gap_scan.get("gaps", []) if g.get("confidence", 0) >= 0.7]
+        if high_conf_gaps:
+            plan_text = plan_path.read_text(encoding="utf-8")
+            # Parse sections
+            sections: dict = {}
+            current_section = ""
+            for line in plan_text.splitlines():
+                if line.startswith("## "):
+                    current_section = line[3:].strip().lower()
+                    sections[current_section] = ""
+                elif current_section:
+                    sections[current_section] += line + "\n"
+
+            amend_text = sections.get("amend", "")
+            deferred_text = sections.get("deferred related gaps", "")
+
+            unaddressed = []
+            for gap in high_conf_gaps:
+                desc = gap.get("description", "")
+                cat = gap.get("category", "")
+                # Check if gap is referenced in Amend section
+                in_amend = (desc and desc.lower() in amend_text.lower()) or \
+                           (cat and cat.lower() in amend_text.lower())
+                # Check if gap is in Deferred section with a defer_reason
+                in_deferred = False
+                if desc and desc.lower() in deferred_text.lower():
+                    # Must have defer_reason nearby (any non-comment, non-empty line after it)
+                    if "defer_reason" in deferred_text.lower() or "reason:" in deferred_text.lower():
+                        in_deferred = True
+                if not in_amend and not in_deferred:
+                    unaddressed.append(f"[{cat}] {desc} (confidence={gap.get('confidence', 0)})")
+
+            if unaddressed:
+                msg = (f"Cannot approve: {len(unaddressed)} high-confidence related gap(s) "
+                       f"not addressed in ## Amend or deferred with reason in ## Deferred Related Gaps:\n"
+                       + "\n".join(f"  - {g}" for g in unaddressed))
+                err(msg)
 
     fb["status"] = "approved"
     _save_feedback(h, epic_id, feedback_id, fb)
@@ -7749,6 +7865,89 @@ def cmd_feedback_evidence_pack(args, h: Path) -> None:
         print(f"  Keywords: {', '.join(keywords[:5])}")
 
 
+def cmd_feedback_write_vote(args, h: Path) -> None:
+    """Write a council agent vote through the managed pipeline.
+
+    Only way to create valid vote files — ensures schema validation,
+    evidence enforcement, and managed metadata injection.
+    """
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    agent_name = args.agent
+
+    _load_feedback(h, epic_id, feedback_id)  # validate exists
+
+    # Validate council is initialized
+    councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council" / feedback_id
+    meta_path = councils_dir / "metadata.json"
+    if not meta_path.exists():
+        err(f"Council not initialized for {feedback_id}. Run: feedback council-triage first")
+    meta = load_json(meta_path)
+
+    if agent_name not in FEEDBACK_TRIAGE_COUNCIL_AGENTS:
+        err(f"Unknown agent: {agent_name}. Valid: {', '.join(FEEDBACK_TRIAGE_COUNCIL_AGENTS)}")
+
+    # Read vote JSON from --vote-json, --vote-file, or stdin
+    vote_raw = None
+    if getattr(args, "vote_file", None):
+        vote_path_input = Path(args.vote_file)
+        if not vote_path_input.exists():
+            err(f"Vote file not found: {args.vote_file}")
+        vote_raw = vote_path_input.read_text(encoding="utf-8")
+    elif getattr(args, "stdin", False):
+        vote_raw = sys.stdin.read()
+    elif getattr(args, "vote_json", None):
+        vote_raw = args.vote_json
+    else:
+        err("Must provide one of: --vote-json, --vote-file, or --stdin")
+
+    try:
+        vote = json.loads(vote_raw)
+    except json.JSONDecodeError as e:
+        err(f"Invalid JSON: {e}")
+
+    if not isinstance(vote, dict):
+        err("Vote must be a JSON object")
+
+    # Schema validation: decision field
+    decision = vote.get("decision", "")
+    decision_upper = decision.upper().replace("-", "_")
+    if decision_upper not in [d.upper() for d in FEEDBACK_TRIAGE_OUTCOMES]:
+        err(f"Invalid decision: '{decision}'. Valid: {', '.join(FEEDBACK_TRIAGE_OUTCOMES)}")
+    vote["decision"] = decision_upper
+
+    # Evidence enforcement for actionable decisions
+    EVIDENCE_REQUIRED_DECISIONS = {
+        "REOPEN_CLARIFY", "REOPEN_SPEC", "REOPEN_PLAN",
+        "STAY_EXECUTE", "NO_REOPEN_WITH_EVIDENCE",
+    }
+    if decision_upper in EVIDENCE_REQUIRED_DECISIONS:
+        evidence = vote.get("evidence", [])
+        if not evidence:
+            err(f"Decision '{decision_upper}' requires non-empty 'evidence' field")
+
+    # Inject managed metadata
+    vote["agent"] = agent_name
+    vote["feedback_id"] = feedback_id
+    vote["_managed"] = True
+    vote["_written_by"] = "harnessctl"
+    vote["_schema_version"] = "feedback_vote_v2"
+    vote["_vote_session_id"] = meta.get("initialized_at", "")
+    vote["_written_at"] = now_iso()
+
+    # Write to votes directory
+    votes_dir = councils_dir / "votes"
+    votes_dir.mkdir(parents=True, exist_ok=True)
+    vote_out_path = votes_dir / f"{agent_name}.json"
+    atomic_write_json(vote_out_path, vote)
+
+    if getattr(args, "json", False):
+        out_json({"status": "ok", "agent": agent_name, "decision": decision_upper,
+                  "path": str(vote_out_path)})
+    else:
+        print(f"Vote written: {agent_name} -> {decision_upper} ({vote_out_path})")
+
+
 def cmd_feedback_council_triage(args, h: Path) -> None:
     """Initialize feedback triage council for multi-agent review."""
     epic_id = args.epic_id
@@ -7862,6 +8061,54 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
                 "invalid_decision": decision,
                 "reason": f"Decision '{decision}' not in valid set: {', '.join(FEEDBACK_TRIAGE_OUTCOMES)}"
             })
+
+    # Validate managed metadata — votes must be created by harnessctl write-vote
+    meta_path = councils_dir / "metadata.json"
+    session_id = ""
+    if meta_path.exists():
+        meta = load_json(meta_path)
+        session_id = meta.get("initialized_at", "")
+
+    for v in list(votes):
+        if v in [rv_src for rv_src in votes if rv_src.get("agent") in
+                 {r["agent"] for r in rejected_votes}]:
+            continue  # already rejected above
+        if not v.get("_managed"):
+            agent_name = v.get("agent", "unknown")
+            rejected_votes.append({
+                "agent": agent_name,
+                "invalid_decision": v.get("decision", ""),
+                "reason": "Vote missing _managed metadata. Must use: "
+                          "harnessctl feedback write-vote"
+            })
+            continue
+        if session_id and v.get("_vote_session_id") != session_id:
+            agent_name = v.get("agent", "unknown")
+            rejected_votes.append({
+                "agent": agent_name,
+                "invalid_decision": v.get("decision", ""),
+                "reason": f"Vote session_id mismatch (expected={session_id}, "
+                          f"got={v.get('_vote_session_id')}). Stale or manually created vote."
+            })
+
+    # Enforce evidence for actionable decisions
+    EVIDENCE_REQUIRED_DECISIONS = {
+        "REOPEN_CLARIFY", "REOPEN_SPEC", "REOPEN_PLAN",
+        "STAY_EXECUTE", "NO_REOPEN_WITH_EVIDENCE",
+    }
+    for v in list(votes):
+        if v.get("agent") in {r["agent"] for r in rejected_votes}:
+            continue
+        decision_upper = v.get("decision", "").upper()
+        if decision_upper in EVIDENCE_REQUIRED_DECISIONS:
+            evidence = v.get("evidence", [])
+            if not evidence:
+                agent_name = v.get("agent", "unknown")
+                rejected_votes.append({
+                    "agent": agent_name,
+                    "invalid_decision": v.get("decision", ""),
+                    "reason": f"Decision '{decision_upper}' requires non-empty 'evidence' field"
+                })
 
     # Remove rejected votes from processing
     if rejected_votes:
@@ -9171,6 +9418,9 @@ def cmd_feedback_continue(args, h: Path) -> None:
     """Auto-execute post-triage actions based on verdict. Implements the auto-continue
     logic: for low/medium risk non-scope-change verdicts, automatically approve and
     execute without asking the user.
+
+    With --execute flag: directly calls plan-amendment/approve/reopen/close/task-graph
+    instead of outputting next_steps.
     """
     epic_id = args.epic_id
     feedback_id = args.feedback_id
@@ -9221,6 +9471,8 @@ def cmd_feedback_continue(args, h: Path) -> None:
                 project_root=getattr(args, 'project_root', None))
             cmd_feedback_related_gap_scan(rgs_args, h)
 
+    execute_mode = getattr(args, "execute", False)
+
     action_plan = {
         "feedback_id": feedback_id,
         "decision": decision,
@@ -9230,6 +9482,7 @@ def cmd_feedback_continue(args, h: Path) -> None:
         "needs_human_confirm": needs_human_confirm,
         "confirm_reason": confirm_reason,
         "gap_scan_required": gap_scan_required,
+        "executed": False,
     }
 
     if needs_human_confirm:
@@ -9243,39 +9496,109 @@ def cmd_feedback_continue(args, h: Path) -> None:
             f"--epic-id {epic_id} --feedback-id {feedback_id}",
         ]
     elif decision == "NO_REOPEN_WITH_EVIDENCE":
-        action_plan["status"] = "auto_close"
-        action_plan["message"] = "No reopen needed. Close feedback with evidence."
-        action_plan["next_steps"] = [
-            f"Close: harnessctl feedback close --epic-id {epic_id} --feedback-id {feedback_id} "
-            f"--evidence 'Council verdict: {decision}'",
-        ]
+        if execute_mode:
+            # Auto-close
+            close_args = argparse.Namespace(
+                epic_id=epic_id, feedback_id=feedback_id,
+                evidence=[f"Council verdict: {decision}"],
+                reject=False, defer=False, force=True, json=True,
+                project_root=getattr(args, 'project_root', None))
+            cmd_feedback_close(close_args, h)
+            action_plan["status"] = "auto_closed"
+            action_plan["message"] = f"Auto-closed: {decision}"
+            action_plan["executed"] = True
+        else:
+            action_plan["status"] = "auto_close"
+            action_plan["message"] = "No reopen needed. Close feedback with evidence."
+            action_plan["next_steps"] = [
+                f"Close: harnessctl feedback close --epic-id {epic_id} --feedback-id {feedback_id} "
+                f"--evidence 'Council verdict: {decision}'",
+            ]
     elif decision == "INSUFFICIENT_EVIDENCE":
         action_plan["status"] = "blocked_insufficient_evidence"
         action_plan["message"] = "Evidence insufficient. Cannot proceed — supplemental evidence required."
         action_plan["next_steps"] = ["Collect additional evidence and re-run triage"]
     elif requires_reopen:
-        action_plan["status"] = "auto_reopen"
-        action_plan["message"] = (
-            f"Auto-approved: REOPEN to {target_stage} "
-            f"(risk={risk_level}, classification={classification})"
-        )
-        action_plan["next_steps"] = [
-            f"1. harnessctl feedback plan-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
-            f"2. harnessctl feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
-            f"3. harnessctl reopen --epic-id {epic_id} --to {target_stage} --feedback-id {feedback_id}",
-            f"4. Execute re-{target_stage.lower()} skill",
-        ]
+        if execute_mode:
+            # Auto-execute: plan-amendment → approve → reopen
+            pa_args = argparse.Namespace(
+                epic_id=epic_id, feedback_id=feedback_id, json=True,
+                project_root=getattr(args, 'project_root', None))
+            cmd_feedback_plan_amendment(pa_args, h)
+
+            aa_args = argparse.Namespace(
+                epic_id=epic_id, feedback_id=feedback_id, json=True,
+                project_root=getattr(args, 'project_root', None))
+            cmd_feedback_approve_amendment(aa_args, h)
+
+            ro_args = argparse.Namespace(
+                epic_id=epic_id, to=target_stage, feedback_id=feedback_id, json=True,
+                project_root=getattr(args, 'project_root', None))
+            cmd_reopen(ro_args, h)
+
+            action_plan["status"] = "auto_reopened"
+            action_plan["message"] = (
+                f"Auto-executed: REOPEN to {target_stage} "
+                f"(risk={risk_level}, classification={classification})"
+            )
+            action_plan["executed"] = True
+            action_plan["next_steps"] = [
+                f"Execute re-{target_stage.lower()} skill",
+            ]
+        else:
+            action_plan["status"] = "auto_reopen"
+            action_plan["message"] = (
+                f"Auto-approved: REOPEN to {target_stage} "
+                f"(risk={risk_level}, classification={classification})"
+            )
+            action_plan["next_steps"] = [
+                f"1. harnessctl feedback plan-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+                f"2. harnessctl feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+                f"3. harnessctl reopen --epic-id {epic_id} --to {target_stage} --feedback-id {feedback_id}",
+                f"4. Execute re-{target_stage.lower()} skill",
+            ]
     elif decision == "STAY_EXECUTE":
-        action_plan["status"] = "auto_create_task"
-        action_plan["message"] = (
-            "Stay in EXECUTE — auto-create supplemental task and execute via /harness:work"
-        )
-        action_plan["next_steps"] = [
-            f"1. harnessctl task-graph merge --epic-id {epic_id} --feedback-id {feedback_id} "
-            f"--new-tasks '[{{\"title\": \"<补充任务>\", \"surface\": \"<surface>\"}}]'",
-            "2. Execute new task via /harness:work skill",
-            f"3. harnessctl feedback close --epic-id {epic_id} --feedback-id {feedback_id}",
-        ]
+        if execute_mode:
+            # Auto-create placeholder task from feedback context
+            fb_text = fb.get("text", "")
+            task_title = f"Address feedback {feedback_id}: {fb_text[:80]}"
+            triage_path = _feedback_dir(h, epic_id) / f"{feedback_id}.triage.json"
+            surface = ""
+            if triage_path.exists():
+                triage_data = load_json(triage_path)
+                surface = triage_data.get("target_surface", "")
+
+            new_tasks_json = json.dumps([{
+                "title": task_title,
+                "surface": surface,
+                "acceptance_criteria": [f"Resolve issue raised in {feedback_id}"],
+            }])
+            tgm_args = argparse.Namespace(
+                epic_id=epic_id, feedback_id=feedback_id,
+                new_tasks=new_tasks_json, check_done=False, json=True,
+                project_root=getattr(args, 'project_root', None))
+            cmd_task_graph_merge(tgm_args, h)
+
+            action_plan["status"] = "auto_task_created"
+            action_plan["message"] = (
+                f"Stay in EXECUTE — placeholder task created: {task_title[:60]}..."
+            )
+            action_plan["executed"] = True
+            action_plan["next_steps"] = [
+                "Execute new task via /harness:work skill",
+                f"Then: harnessctl feedback close --epic-id {epic_id} --feedback-id {feedback_id}",
+            ]
+        else:
+            action_plan["status"] = "auto_create_task"
+            action_plan["message"] = (
+                "Stay in EXECUTE — auto-create supplemental task and execute via /harness:work"
+            )
+            action_plan["next_steps"] = [
+                f"1. harnessctl task-graph merge --epic-id {epic_id} --feedback-id {feedback_id} "
+                f"--new-tasks '[{{\"title\": \"<补充任务>\", \"surface\": \"<surface>\"}}]'",
+                "2. Execute new task via /harness:work skill",
+                f"3. harnessctl feedback close --epic-id {epic_id} --feedback-id {feedback_id}",
+            ]
     else:
         action_plan["status"] = "unknown_decision"
         action_plan["message"] = f"Unhandled decision: {decision}"
@@ -9287,6 +9610,8 @@ def cmd_feedback_continue(args, h: Path) -> None:
         print(f"  Decision: {decision}")
         print(f"  Status: {action_plan['status']}")
         print(f"  Message: {action_plan['message']}")
+        if action_plan.get("executed"):
+            print(f"  ✓ Executed")
         if action_plan.get("next_steps"):
             print(f"  Next steps:")
             for step in action_plan["next_steps"]:
@@ -9446,6 +9771,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_repair = sub.add_parser("repair", help="Plan or apply low-risk installation/runtime repairs")
     p_repair.add_argument("--apply", action="store_true", help="Apply repairs (default: dry-run only)")
     p_repair.add_argument("--json", action="store_true")
+
+    # ---- resolve ----
+    p_resolve = sub.add_parser("resolve", help="Output resolved PLUGIN_ROOT, git sha, and path resolution method")
+    p_resolve.add_argument("--json", action="store_true")
 
     # ---- config ----
     p_config = sub.add_parser("config", help="Read/write .harness/config.json")
@@ -9937,6 +10266,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_agg.add_argument("--feedback-id", dest="feedback_id", required=True)
     p_fb_agg.add_argument("--json", action="store_true")
 
+    p_fb_writevote = fb_sub.add_parser("write-vote", help="Write a managed council vote (only valid vote path)")
+    p_fb_writevote.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_writevote.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_writevote.add_argument("--agent", required=True, help="Council agent name")
+    p_fb_writevote.add_argument("--vote-json", dest="vote_json", default=None, help="Vote as inline JSON string")
+    p_fb_writevote.add_argument("--vote-file", dest="vote_file", default=None, help="Path to vote JSON file")
+    p_fb_writevote.add_argument("--stdin", action="store_true", help="Read vote JSON from stdin")
+    p_fb_writevote.add_argument("--json", action="store_true")
+
     p_fb_recomplete = fb_sub.add_parser("re-complete", help="Mark re-* stage as completed for a feedback item")
     p_fb_recomplete.add_argument("--epic-id", dest="epic_id", required=True)
     p_fb_recomplete.add_argument("--feedback-id", dest="feedback_id", required=True)
@@ -9967,6 +10305,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_continue = fb_sub.add_parser("continue", help="Auto-execute post-triage actions based on verdict")
     p_fb_continue.add_argument("--epic-id", dest="epic_id", required=True)
     p_fb_continue.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_continue.add_argument("--execute", action="store_true", help="Auto-execute actions instead of outputting next_steps")
     p_fb_continue.add_argument("--json", action="store_true")
 
     p_fb_close_all = fb_sub.add_parser("close-all", help="Close all open feedback items for an epic")
@@ -10100,6 +10439,9 @@ def main() -> None:
         return
     if args.command == "repair":
         cmd_repair(args, project_root)
+        return
+    if args.command == "resolve":
+        cmd_resolve(args)
         return
     if args.command == "start":
         cmd_start(args, project_root)
@@ -10304,6 +10646,8 @@ def main() -> None:
             cmd_feedback_council_triage(args, h)
         elif args.feedback_action == "aggregate-triage":
             cmd_feedback_aggregate_triage(args, h)
+        elif args.feedback_action == "write-vote":
+            cmd_feedback_write_vote(args, h)
         elif args.feedback_action == "re-complete":
             cmd_feedback_re_complete(args, h)
         elif args.feedback_action == "related-gap-scan":

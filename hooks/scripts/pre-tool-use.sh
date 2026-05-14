@@ -230,6 +230,59 @@ PY
   fi
 fi
 
+# Guard: block Bash commands that write to managed feedback artifacts
+BASH_WRITES_PROTECTED="$(
+  COMMAND_VALUE="$COMMAND" python3 - <<'PY' 2>/dev/null || true
+import os
+import re
+
+cmd = os.environ.get("COMMAND_VALUE", "")
+
+# Protected path patterns
+protected = [
+    r"feedback/HFB-[^/]*\.evidence-pack\.json",
+    r"councils/feedback_triage_council/[^/]+/votes/[^/]+\.json",
+    r"councils/feedback_triage_council/[^/]+/verdict\.json",
+    r"councils/feedback_triage_council/[^/]+/metadata\.json",
+    r"feedback/HFB-[^/]*\.triage\.json",
+]
+
+# Write indicators in shell commands — must indicate actual file creation/modification
+write_ops = [r"(?<![12])>\s*\S", r">>\s*\S", r"\btee\s+\S", r"\bcp\s+\S", r"\bmv\s+\S",
+             r"open\s*\(.*['\"]w['\"]", r"write_text\s*\(", r"atomic_write",
+             r"\becho\b.*>", r"\bprintf\b.*>", r"\bcat\b.*>"]
+
+has_protected = any(re.search(p, cmd) for p in protected)
+has_write = any(re.search(w, cmd) for w in write_ops)
+
+# Also catch: python3 -c '... json.dump/open(...,"w") ... <protected_path> ...'
+# But NOT: python3 -m json.tool (read-only formatting)
+if not has_write and re.search(r"python3?\s+(-c|<<)", cmd):
+    if re.search(r"(json\.dump|open\s*\(|write|atomic_write)", cmd):
+        if any(re.search(p, cmd) for p in protected):
+            has_write = True
+
+if has_protected and has_write:
+    print("BLOCKED")
+else:
+    print("OK")
+PY
+)"
+
+if [[ "$BASH_WRITES_PROTECTED" == "BLOCKED" ]]; then
+  STOP_REASON="禁止通过 Bash 写入 feedback 核心产物（evidence-pack / votes / verdict / triage）。必须使用 harnessctl 标准命令：feedback evidence-pack / feedback write-vote / feedback aggregate-triage。" \
+    python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "continue": False,
+    "stopReason": os.environ["STOP_REASON"],
+}, ensure_ascii=False))
+PY
+  exit 0
+fi
+
 while IFS=$'\t' read -r pattern trace_label description; do
   [[ -n "$pattern" ]] || continue
   if printf '%s\n%s\n' "$COMMAND" "$NORMALIZED_COMMAND" | grep -Eqi "$pattern" 2>/dev/null; then
