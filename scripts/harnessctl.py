@@ -9728,6 +9728,47 @@ def cmd_feedback_clean(args, h: Path) -> None:
         print(f"Cleaned feedback for epic {epic_id}: {removed_files} files, {removed_dirs} directories removed")
 
 
+def cmd_feedback_update_metadata(args, h: Path) -> None:
+    """Update metadata fields on an existing feedback item.
+
+    Merges provided key-value pairs into the feedback JSON without
+    overwriting core fields (feedback_id, epic_id, status, text).
+    """
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    load_epic(h, epic_id)
+
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    # Parse metadata JSON
+    try:
+        metadata = json.loads(args.metadata_json)
+    except json.JSONDecodeError as e:
+        err(f"Invalid --metadata-json: {e}")
+
+    if not isinstance(metadata, dict):
+        err("--metadata-json must be a JSON object (dict)")
+
+    # Protected fields that cannot be overwritten via update-metadata
+    protected = {"feedback_id", "epic_id", "status", "text", "created_at"}
+    violations = set(metadata.keys()) & protected
+    if violations:
+        err(f"Cannot overwrite protected fields via update-metadata: {sorted(violations)}")
+
+    # Merge metadata into feedback
+    fb.update(metadata)
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    if args.json:
+        out_json({
+            "status": "ok",
+            "feedback_id": feedback_id,
+            "updated_fields": sorted(metadata.keys()),
+        })
+    else:
+        print(f"Updated {feedback_id}: {', '.join(sorted(metadata.keys()))}")
+
+
 def _feedback_requires_related_gap_scan(fb: dict, verdict: dict, votes: list) -> bool:
     """Determine if related-gap-scan is mandatory for this feedback.
 
@@ -9810,12 +9851,33 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
 
         elif status == "triaging":
             verdict_path = councils_dir / feedback_id / "verdict.json"
+            votes_dir = councils_dir / feedback_id / "votes"
             if not verdict_path.exists():
-                reason = "triaging_without_verdict"
-                next_action = "feedback aggregate-triage"
-                required_commands = [
-                    f"feedback aggregate-triage --epic-id {epic_id} --feedback-id {feedback_id}",
-                ]
+                # Check if votes are incomplete (some agents haven't voted)
+                expected_agents = {"requirement-analyst", "impact-analyst", "challenger",
+                                   "plan-reviewer", "test-reviewer", "code-reviewer"}
+                existing_votes = set()
+                if votes_dir.exists():
+                    for vf in votes_dir.glob("*.json"):
+                        existing_votes.add(vf.stem)
+                missing_agents = expected_agents - existing_votes
+
+                if missing_agents:
+                    reason = f"triage_incomplete (missing votes: {', '.join(sorted(missing_agents))})"
+                    next_action = "feedback triage (resume missing votes)"
+                    required_commands = [
+                        f"feedback write-vote --epic-id {epic_id} --feedback-id {feedback_id} "
+                        f"--agent {agent}" for agent in sorted(missing_agents)
+                    ]
+                    required_commands.append(
+                        f"feedback aggregate-triage --epic-id {epic_id} --feedback-id {feedback_id}"
+                    )
+                else:
+                    reason = "triaging_without_verdict"
+                    next_action = "feedback aggregate-triage"
+                    required_commands = [
+                        f"feedback aggregate-triage --epic-id {epic_id} --feedback-id {feedback_id}",
+                    ]
 
         elif status == "triaged":
             # Has verdict but no continue action taken
@@ -10526,6 +10588,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_gate.add_argument("--epic-id", dest="epic_id", required=True)
     p_fb_gate.add_argument("--json", action="store_true")
 
+    p_fb_updmeta = fb_sub.add_parser("update-metadata", help="Update metadata fields on a feedback item")
+    p_fb_updmeta.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_updmeta.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_updmeta.add_argument("--metadata-json", dest="metadata_json", required=True,
+                              help="JSON object with fields to merge into feedback")
+    p_fb_updmeta.add_argument("--json", action="store_true")
+
     # ---- reopen ----
     p_reopen = sub.add_parser("reopen", help="Controlled stage reopen via approved feedback")
     p_reopen.add_argument("--epic-id", dest="epic_id", required=True)
@@ -10875,6 +10944,8 @@ def main() -> None:
             cmd_feedback_clean(args, h)
         elif args.feedback_action == "gate-check":
             cmd_feedback_gate_check(args, h)
+        elif args.feedback_action == "update-metadata":
+            cmd_feedback_update_metadata(args, h)
 
     elif args.command == "reopen":
         cmd_reopen(args, h)

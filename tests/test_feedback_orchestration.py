@@ -361,5 +361,201 @@ class TestScopeGapClassification(unittest.TestCase):
             self.assertEqual(stored["candidate_type"], "scope_gap_question")
 
 
+class TestUpdateMetadata(unittest.TestCase):
+    """Test harnessctl feedback update-metadata command."""
+
+    def test_update_metadata_basic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+
+            # Submit feedback
+            result = run_harnessctl(tmp_path, "feedback", "submit",
+                                    "--epic-id", epic_id,
+                                    "--stage", "EXECUTE",
+                                    "--text", "test metadata update",
+                                    "--json")
+            fb_data = json.loads(result.stdout)
+            feedback_id = fb_data["feedback_id"]
+
+            # Update metadata
+            result = run_harnessctl(tmp_path, "feedback", "update-metadata",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", feedback_id,
+                                    "--metadata-json", '{"mentioned_surface":"oms-docs","priority":"high"}',
+                                    "--json")
+            self.assertEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["status"], "ok")
+            self.assertIn("mentioned_surface", data["updated_fields"])
+            self.assertIn("priority", data["updated_fields"])
+
+            # Verify persisted
+            fb_path = (tmp_path / ".harness" / "features" / epic_id /
+                       "feedback" / f"{feedback_id}.json")
+            stored = json.loads(fb_path.read_text())
+            self.assertEqual(stored["mentioned_surface"], "oms-docs")
+            self.assertEqual(stored["priority"], "high")
+            # Core fields preserved
+            self.assertEqual(stored["text"], "test metadata update")
+
+    def test_update_metadata_rejects_protected_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+
+            result = run_harnessctl(tmp_path, "feedback", "submit",
+                                    "--epic-id", epic_id,
+                                    "--stage", "EXECUTE",
+                                    "--text", "test protected",
+                                    "--json")
+            fb_data = json.loads(result.stdout)
+            feedback_id = fb_data["feedback_id"]
+
+            # Try to overwrite protected field
+            result = run_harnessctl(tmp_path, "feedback", "update-metadata",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", feedback_id,
+                                    "--metadata-json", '{"status":"closed","custom_field":"ok"}',
+                                    "--json")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("protected", result.stderr)
+
+
+class TestTriageIncomplete(unittest.TestCase):
+    """Test gate-check detects incomplete triage (missing votes) and provides recovery path."""
+
+    def test_missing_votes_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+
+            # Create feedback in triaging state
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            fb_data = {
+                "feedback_id": "HFB-001",
+                "epic_id": epic_id,
+                "status": "triaging",
+                "text": "some feedback",
+            }
+            (fb_dir / "HFB-001.json").write_text(json.dumps(fb_data, indent=2))
+
+            # Create council dir with only 3 of 6 votes
+            votes_dir = (tmp_path / ".harness" / "features" / epic_id /
+                         "councils" / "feedback_triage_council" / "HFB-001" / "votes")
+            votes_dir.mkdir(parents=True, exist_ok=True)
+            for agent in ["requirement-analyst", "impact-analyst", "challenger"]:
+                vote = {"agent": agent, "decision": "STAY_EXECUTE",
+                        "confidence": 0.8, "evidence": ["test"]}
+                (votes_dir / f"{agent}.json").write_text(json.dumps(vote))
+
+            # gate-check should block with triage_incomplete
+            result = run_harnessctl(tmp_path, "feedback", "gate-check",
+                                    "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 1)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["status"], "blocked")
+            blocked = data["blocked_items"][0]
+            self.assertIn("triage_incomplete", blocked["reason"])
+            self.assertIn("plan-reviewer", blocked["reason"])
+            self.assertIn("test-reviewer", blocked["reason"])
+            self.assertIn("code-reviewer", blocked["reason"])
+            # Should suggest write-vote for missing agents
+            self.assertTrue(any("write-vote" in cmd for cmd in blocked["required_commands"]))
+            # Should end with aggregate-triage
+            self.assertIn("aggregate-triage", blocked["required_commands"][-1])
+
+    def test_all_votes_present_suggests_aggregate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+
+            # Create feedback in triaging state
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            fb_data = {
+                "feedback_id": "HFB-001",
+                "epic_id": epic_id,
+                "status": "triaging",
+                "text": "some feedback",
+            }
+            (fb_dir / "HFB-001.json").write_text(json.dumps(fb_data, indent=2))
+
+            # Create all 6 votes but no verdict
+            votes_dir = (tmp_path / ".harness" / "features" / epic_id /
+                         "councils" / "feedback_triage_council" / "HFB-001" / "votes")
+            votes_dir.mkdir(parents=True, exist_ok=True)
+            for agent in ["requirement-analyst", "impact-analyst", "challenger",
+                          "plan-reviewer", "test-reviewer", "code-reviewer"]:
+                vote = {"agent": agent, "decision": "STAY_EXECUTE",
+                        "confidence": 0.8, "evidence": ["test"]}
+                (votes_dir / f"{agent}.json").write_text(json.dumps(vote))
+
+            # gate-check should block with triaging_without_verdict
+            result = run_harnessctl(tmp_path, "feedback", "gate-check",
+                                    "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 1)
+            data = json.loads(result.stdout)
+            blocked = data["blocked_items"][0]
+            self.assertEqual(blocked["reason"], "triaging_without_verdict")
+            self.assertEqual(blocked["next_action"], "feedback aggregate-triage")
+
+    def test_resume_after_adding_missing_vote(self):
+        """Simulate recovery: add missing vote then gate-check passes after aggregate."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+
+            # Submit and start triage
+            result = run_harnessctl(tmp_path, "feedback", "submit",
+                                    "--epic-id", epic_id,
+                                    "--stage", "EXECUTE",
+                                    "--text", "test resume",
+                                    "--json")
+            fb_data = json.loads(result.stdout)
+            feedback_id = fb_data["feedback_id"]
+
+            # evidence-pack
+            run_harnessctl(tmp_path, "feedback", "evidence-pack",
+                           "--epic-id", epic_id,
+                           "--feedback-id", feedback_id, "--json")
+
+            # council-triage (sets status to triaging)
+            run_harnessctl(tmp_path, "feedback", "council-triage",
+                           "--epic-id", epic_id,
+                           "--feedback-id", feedback_id, "--json")
+
+            # Write all 6 votes via write-vote
+            for agent in ["requirement-analyst", "impact-analyst", "challenger",
+                          "plan-reviewer", "test-reviewer", "code-reviewer"]:
+                run_harnessctl(tmp_path, "feedback", "write-vote",
+                               "--epic-id", epic_id,
+                               "--feedback-id", feedback_id,
+                               "--agent", agent,
+                               "--decision", "NO_REOPEN_WITH_EVIDENCE",
+                               "--confidence", "0.9",
+                               "--evidence", "verified in code",
+                               "--json")
+
+            # Aggregate
+            run_harnessctl(tmp_path, "feedback", "aggregate-triage",
+                           "--epic-id", epic_id,
+                           "--feedback-id", feedback_id, "--json")
+
+            # Continue
+            run_harnessctl(tmp_path, "feedback", "continue",
+                           "--epic-id", epic_id,
+                           "--feedback-id", feedback_id,
+                           "--execute", "--json")
+
+            # gate-check should now pass
+            result = run_harnessctl(tmp_path, "feedback", "gate-check",
+                                    "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["status"], "pass")
+
+
 if __name__ == "__main__":
     unittest.main()

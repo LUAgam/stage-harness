@@ -315,20 +315,13 @@ print(json.dumps({
     --json 2>/dev/null)
   AUTO_FB_ID=$(echo "$AUTO_FB_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('feedback_id',''))" 2>/dev/null)
 
-  # 写入 mentioned_surface metadata（scope_gap_question 时）
+  # 写入 mentioned_surface metadata（scope_gap_question 时，通过 harnessctl 管理）
   if [[ -n "$AUTO_FB_ID" && -n "$MENTIONED_SURFACE" ]]; then
-    FB_JSON_PATH=".harness/features/${ACTIVE_EPIC_ID}/feedback/${AUTO_FB_ID}.json"
-    if [[ -f "$FB_JSON_PATH" ]]; then
-      python3 -c "
-import json, sys
-path = '$FB_JSON_PATH'
-with open(path) as f:
-    data = json.load(f)
-data['mentioned_surface'] = '${MENTIONED_SURFACE}'
-with open(path, 'w') as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
-" 2>/dev/null || true
-    fi
+    "$HARNESSCTL" feedback update-metadata \
+      --epic-id "$ACTIVE_EPIC_ID" \
+      --feedback-id "$AUTO_FB_ID" \
+      --metadata-json "{\"mentioned_surface\":\"${MENTIONED_SURFACE}\"}" \
+      --json 2>/dev/null || true
   fi
 fi
 
