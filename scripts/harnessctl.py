@@ -8445,7 +8445,13 @@ def cmd_task_graph_merge(args, h: Path) -> None:
 
 
 def cmd_feedback_re_complete(args, h: Path) -> None:
-    """Mark a re-* stage as completed for a reopened feedback."""
+    """Mark a re-* stage as completed for a reopened feedback.
+
+    Validates revision-manifest.json (hash-based) for integrity.
+    Falls back to legacy revision-diff check if no manifest exists.
+    """
+    import hashlib
+
     epic_id = args.epic_id
     feedback_id = args.feedback_id
     stage = args.stage.upper()
@@ -8457,75 +8463,327 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
     if stage not in ("CLARIFY", "SPEC", "PLAN"):
         err(f"Invalid re-* stage: {stage}. Must be CLARIFY, SPEC, or PLAN")
 
-    # Check revision-diff exists
-    rdiff_path = h / "features" / epic_id / f"revision-diff-{feedback_id}.md"
-    if not rdiff_path.exists():
-        err(f"revision-diff-{feedback_id}.md not found. Write it before marking re-* complete.")
+    features_dir = h / "features" / epic_id
+    fb_dir = _feedback_dir(h, epic_id)
 
-    # Parse canonical artifacts from args
+    # --- Manifest-based validation (preferred path) ---
+    manifest_path = fb_dir / f"{feedback_id}.revision-manifest.json"
+    use_manifest = manifest_path.exists()
+
+    warnings = []
+    manifest_validated = False
+
+    if use_manifest:
+        manifest = load_json(manifest_path)
+
+        def _sha256(path: Path) -> str:
+            if not path.exists():
+                return "sha256:none"
+            return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+        # 1. changed_artifacts must be non-empty
+        changed_artifacts = manifest.get("changed_artifacts", [])
+        if not changed_artifacts:
+            err(f"revision-manifest for {feedback_id} has no changed_artifacts")
+
+        # 2. Verify after_hash matches current file content
+        for art in changed_artifacts:
+            art_path = features_dir / art["path"]
+            if not art_path.exists():
+                warnings.append(f"artifact '{art['path']}' referenced in manifest does not exist")
+                continue
+            actual_hash = _sha256(art_path)
+            if actual_hash != art.get("after_hash"):
+                warnings.append(
+                    f"artifact '{art['path']}' hash mismatch: "
+                    f"manifest={art.get('after_hash')}, actual={actual_hash}"
+                )
+
+        # 3. At least one stage key artifact must have changed
+        stage_keys = {
+            "PLAN": ["task-graph.json", "coverage-matrix.json", "TASKS.md"],
+            "SPEC": ["SDD.md"],
+            "CLARIFY": ["clarify-summary.md"],
+        }
+        changed_paths = [
+            a["path"] for a in changed_artifacts
+            if a.get("before_hash") != a.get("after_hash")
+        ]
+        if not any(p in changed_paths for p in stage_keys.get(stage, [])):
+            warnings.append(
+                f"No {stage} key artifact actually changed. "
+                f"Expected at least one of: {stage_keys.get(stage, [])}"
+            )
+
+        # 4. Structural traceability: task-graph must have source_feedback
+        task_graph_path = features_dir / "task-graph.json"
+        if stage == "PLAN" and task_graph_path.exists():
+            task_graph = load_json(task_graph_path)
+            has_trace = any(
+                t.get("source_feedback") == feedback_id
+                for t in task_graph.get("tasks", [])
+            )
+            if not has_trace:
+                warnings.append(
+                    f"No task with source_feedback={feedback_id} in task-graph.json"
+                )
+
+        manifest_validated = len(warnings) == 0
+    else:
+        # --- Legacy path: revision-diff only ---
+        rdiff_path = features_dir / f"revision-diff-{feedback_id}.md"
+        if not rdiff_path.exists():
+            err(f"Neither revision-manifest nor revision-diff-{feedback_id}.md found. "
+                "Run 'harnessctl feedback re-plan' first.")
+        warnings.append("legacy_mode: no revision-manifest, using revision-diff only")
+
+    # Parse canonical artifacts from args (legacy compat)
     artifacts = []
     if args.artifacts:
         artifacts = [a.strip() for a in args.artifacts.split(",") if a.strip()]
 
-    # Strong validation: verify artifacts exist on disk
-    warnings = []
-    features_dir = h / "features" / epic_id
-    for art_path in artifacts:
-        full_path = features_dir / art_path if not art_path.startswith("specs/") else h / art_path
-        # Handle directory references (e.g. "tasks/")
-        if art_path.endswith("/"):
-            if not full_path.exists():
-                warnings.append(f"artifact directory '{art_path}' does not exist")
-        else:
-            if not full_path.exists():
-                # Also check under h directly
-                alt_path = h / art_path
-                if not alt_path.exists():
-                    warnings.append(f"artifact '{art_path}' not found")
-
     # Strong validation: check artifact-status shows current (not stale)
     art_status_data = load_artifact_status(h, epic_id)
-    stale_artifacts = []
     for art_entry in art_status_data.get("artifacts", []):
         art_entry_path = art_entry.get("path", "")
         entry_status = art_entry.get("status", "")
-        # Check if any listed artifact is still stale
         for art_path in artifacts:
             if art_path in art_entry_path or art_entry_path in art_path:
                 if entry_status in ("stale", "invalidated", "needs_amendment"):
-                    stale_artifacts.append(f"'{art_entry_path}' is still '{entry_status}'")
-
-    if stale_artifacts:
-        warnings.extend(stale_artifacts)
+                    warnings.append(f"'{art_entry_path}' is still '{entry_status}'")
 
     completion = {
         "feedback_id": feedback_id,
         "epic_id": epic_id,
         "stage": stage,
         "completed_at": now_iso(),
-        "revision_diff_path": str(rdiff_path.relative_to(h)),
-        "canonical_artifacts_updated": artifacts,
+        "manifest_validated": manifest_validated,
+        "manifest_used": use_manifest,
+        "canonical_artifacts_updated": artifacts if artifacts else [
+            a["path"] for a in manifest.get("changed_artifacts", [])
+        ] if use_manifest else [],
         "validation_warnings": warnings,
         "validated": len(warnings) == 0,
     }
 
-    completion_path = _feedback_dir(h, epic_id) / f"{feedback_id}.re-completion.json"
+    completion_path = fb_dir / f"{feedback_id}.re-completion.json"
     atomic_write_json(completion_path, completion)
 
-    # Update feedback status
-    fb["status"] = "amending"
+    # Update feedback status → resolved if manifest validated, else amending
+    if manifest_validated:
+        fb["status"] = "resolved"
+        # Trace: feedback_recomplete_completed
+        append_trace_event(h, _make_trace_event(
+            epic_id, "feedback_recomplete_completed",
+            stage=stage,
+            summary=f"re-complete validated for {feedback_id}, status=resolved",
+            payload={"feedback_id": feedback_id, "stage": stage, "manifest_validated": True},
+        ))
+    else:
+        fb["status"] = "amending"
+        # Trace: feedback_recomplete_blocked
+        append_trace_event(h, _make_trace_event(
+            epic_id, "feedback_recomplete_blocked",
+            stage=stage, status="warning",
+            summary=f"re-complete has warnings for {feedback_id}",
+            payload={"feedback_id": feedback_id, "stage": stage, "warnings": warnings},
+        ))
     _save_feedback(h, epic_id, feedback_id, fb)
 
     if args.json:
         out_json({"status": "ok", **completion})
     else:
-        print(f"Re-{stage.lower()} completion marked for {feedback_id}")
-        if artifacts:
-            print(f"  Canonical artifacts updated: {', '.join(artifacts)}")
+        status_label = "RESOLVED" if manifest_validated else "amending (warnings)"
+        print(f"Re-{stage.lower()} completion for {feedback_id}: {status_label}")
+        if completion["canonical_artifacts_updated"]:
+            print(f"  Artifacts: {', '.join(completion['canonical_artifacts_updated'])}")
         if warnings:
-            print(f"  Validation warnings ({len(warnings)}):")
+            print(f"  Warnings ({len(warnings)}):")
             for w in warnings:
                 print(f"    - {w}")
+
+
+def cmd_feedback_re_plan(args, h: Path) -> None:
+    """Deterministic merge of amendment-plan.json into task-graph and coverage-matrix.
+
+    This command does NOT do semantic planning. It reads a structured
+    amendment-plan.json (produced by Agent/Skill via /harness:plan --reopen)
+    and performs deterministic merges + generates revision-manifest.json.
+    """
+    import hashlib
+
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    if fb.get("status") not in ("continuation_pending", "reopened", "amending"):
+        err(f"Feedback {feedback_id} status is '{fb.get('status')}', "
+            "expected 'continuation_pending', 'reopened', or 'amending'")
+
+    features_dir = h / "features" / epic_id
+    fb_dir = _feedback_dir(h, epic_id)
+
+    # 1. Read amendment-plan.json (must exist, produced by Agent/Skill)
+    amendment_path = fb_dir / f"{feedback_id}.amendment-plan.json"
+    if not amendment_path.exists():
+        err(f"{feedback_id}.amendment-plan.json not found. "
+            "Run /harness:plan --reopen first to produce it.")
+    amendment = load_json(amendment_path)
+
+    # Trace: feedback_replan_started
+    append_trace_event(h, _make_trace_event(
+        epic_id, "feedback_replan_started",
+        summary=f"re-plan started for {feedback_id}",
+        payload={"feedback_id": feedback_id, "amendment_path": str(amendment_path.relative_to(h))},
+    ))
+
+    # Validate amendment schema
+    tasks_to_add = amendment.get("tasks_to_add", [])
+    coverage_updates = amendment.get("coverage_updates", [])
+    if not tasks_to_add and not coverage_updates:
+        err("amendment-plan.json has no tasks_to_add and no coverage_updates")
+
+    def _sha256(path: Path) -> str:
+        if not path.exists():
+            return "sha256:none"
+        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+    # 2. Snapshot before-hashes
+    task_graph_path = features_dir / "task-graph.json"
+    coverage_path = features_dir / "coverage-matrix.json"
+    tasks_md_path = features_dir / "TASKS.md"
+
+    before_hashes = {
+        "task-graph.json": _sha256(task_graph_path),
+        "coverage-matrix.json": _sha256(coverage_path),
+        "TASKS.md": _sha256(tasks_md_path),
+    }
+
+    # 3. Merge tasks_to_add into task-graph.json
+    task_graph = load_json(task_graph_path) if task_graph_path.exists() else {"tasks": []}
+    existing_ids = {t.get("id") for t in task_graph.get("tasks", [])}
+
+    for new_task in tasks_to_add:
+        if new_task.get("id") in existing_ids:
+            continue  # skip duplicates
+        # Ensure traceability fields
+        new_task.setdefault("source_feedback", feedback_id)
+        new_task.setdefault("source_verdict", amendment.get("source_verdict", ""))
+        task_graph["tasks"].append(new_task)
+
+    atomic_write_json(task_graph_path, task_graph)
+
+    # 4. Merge coverage_updates into coverage-matrix.json
+    coverage = load_json(coverage_path) if coverage_path.exists() else {"coverage": []}
+    for update in coverage_updates:
+        update.setdefault("source_feedback", feedback_id)
+        coverage["coverage"].append(update)
+
+    atomic_write_json(coverage_path, coverage)
+
+    # 5. Update TASKS.md (append new tasks)
+    tasks_md_content = tasks_md_path.read_text() if tasks_md_path.exists() else "# Tasks\n\n"
+    new_lines = []
+    for t in tasks_to_add:
+        tid = t.get("id", "T???")
+        subject = t.get("subject", t.get("title", ""))
+        surface = t.get("surface", "")
+        new_lines.append(f"- [ ] {tid}: {subject} [surface: {surface}] (from {feedback_id})")
+    if new_lines:
+        tasks_md_content += "\n" + "\n".join(new_lines) + "\n"
+        tasks_md_path.write_text(tasks_md_content)
+
+    # 6. Compute after-hashes
+    after_hashes = {
+        "task-graph.json": _sha256(task_graph_path),
+        "coverage-matrix.json": _sha256(coverage_path),
+        "TASKS.md": _sha256(tasks_md_path),
+    }
+
+    # 7. Generate revision-manifest.json
+    changed_artifacts = []
+    for name in before_hashes:
+        if before_hashes[name] != after_hashes[name]:
+            evidence_parts = []
+            if name == "task-graph.json":
+                evidence_parts.append(f"added {len(tasks_to_add)} task(s) from {feedback_id}")
+            if name == "coverage-matrix.json":
+                evidence_parts.append(f"added {len(coverage_updates)} coverage update(s) from {feedback_id}")
+            if name == "TASKS.md":
+                evidence_parts.append(f"appended {len(tasks_to_add)} task line(s)")
+            changed_artifacts.append({
+                "path": name,
+                "before_hash": before_hashes[name],
+                "after_hash": after_hashes[name],
+                "evidence": "; ".join(evidence_parts) if evidence_parts else f"updated from {feedback_id}",
+            })
+
+    manifest = {
+        "feedback_id": feedback_id,
+        "stage": amendment.get("target_stage", fb.get("continuation", {}).get("next_args", {}).get("stage", "PLAN")),
+        "changed_artifacts": changed_artifacts,
+        "generated_by": "harnessctl feedback re-plan",
+        "generated_at": now_iso(),
+        "amendment_plan_path": str(amendment_path.relative_to(h)),
+    }
+    manifest_path = fb_dir / f"{feedback_id}.revision-manifest.json"
+    atomic_write_json(manifest_path, manifest)
+
+    # 8. Generate revision-diff.md (human-readable summary)
+    diff_path = features_dir / f"revision-diff-{feedback_id}.md"
+    diff_lines = [
+        f"# Revision Diff for {feedback_id}",
+        "",
+        f"**Source**: {amendment.get('source_verdict', 'REOPEN_PLAN')}",
+        f"**Generated by**: harnessctl feedback re-plan",
+        f"**Generated at**: {manifest['generated_at']}",
+        "",
+        "## Changed Artifacts",
+        "",
+    ]
+    for art in changed_artifacts:
+        diff_lines.append(f"- `{art['path']}`: {art['before_hash']} → {art['after_hash']}")
+        diff_lines.append(f"  - {art['evidence']}")
+    diff_lines.append("")
+    diff_lines.append("## Tasks Added")
+    diff_lines.append("")
+    for t in tasks_to_add:
+        diff_lines.append(f"- {t.get('id', '?')}: {t.get('subject', t.get('title', ''))}")
+    diff_path.write_text("\n".join(diff_lines) + "\n")
+
+    # 9. Update feedback status
+    fb["status"] = "reopened"
+    if "continuation" in fb:
+        del fb["continuation"]
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    # Trace: feedback_replan_applied
+    append_trace_event(h, _make_trace_event(
+        epic_id, "feedback_replan_applied",
+        summary=f"re-plan applied for {feedback_id}: {len(tasks_to_add)} tasks, {len(changed_artifacts)} artifacts changed",
+        payload={"feedback_id": feedback_id, "tasks_added": len(tasks_to_add),
+                 "coverage_updates": len(coverage_updates),
+                 "changed_artifacts": [a["path"] for a in changed_artifacts]},
+    ))
+
+    if args.json:
+        out_json({
+            "status": "ok",
+            "feedback_id": feedback_id,
+            "manifest_path": str(manifest_path.relative_to(h)),
+            "changed_artifacts_count": len(changed_artifacts),
+            "tasks_added": len(tasks_to_add),
+            "coverage_updates": len(coverage_updates),
+        })
+    else:
+        print(f"Re-plan completed for {feedback_id}:")
+        print(f"  Tasks added: {len(tasks_to_add)}")
+        print(f"  Coverage updates: {len(coverage_updates)}")
+        print(f"  Changed artifacts: {len(changed_artifacts)}")
+        print(f"  Manifest: {manifest_path.relative_to(h)}")
+        print(f"  Next: harnessctl feedback re-complete --epic-id {epic_id} "
+              f"--feedback-id {feedback_id} --stage {manifest['stage']}")
+
 
 
 def _auto_discover_related_gaps(h: Path, epic_id: str, feedback_id: str,
@@ -9556,14 +9814,54 @@ def cmd_feedback_continue(args, h: Path) -> None:
                 project_root=getattr(args, 'project_root', None))
             cmd_reopen(ro_args, h)
 
+            # Write continuation_pending state to HFB record
+            # This enables gate-check to enforce auto-continuation
+            category = "must_confirm" if needs_human_confirm else "assumable"
+            continuation = {
+                "category": category,
+                "next_action": "feedback_replan",
+                "next_command": (
+                    f"harnessctl feedback re-plan --epic-id {epic_id} "
+                    f"--feedback-id {feedback_id}"
+                ),
+                "next_args": {
+                    "epic_id": epic_id,
+                    "feedback_id": feedback_id,
+                    "stage": target_stage,
+                },
+                "must_auto_continue": True,
+                "required_artifacts": [f"{feedback_id}.amendment-plan.json"],
+                "allowed_commands": [
+                    "/harness:plan --reopen",
+                    "harnessctl feedback re-plan",
+                    "harnessctl feedback gate-check",
+                    "harnessctl feedback update-metadata",
+                ],
+            }
+            fb = _load_feedback(h, epic_id, feedback_id)
+            fb["status"] = "continuation_pending"
+            fb["continuation"] = continuation
+            _save_feedback(h, epic_id, feedback_id, fb)
+
+            # Trace: feedback_continuation_pending
+            append_trace_event(h, _make_trace_event(
+                epic_id, "feedback_continuation_pending",
+                stage=target_stage,
+                summary=f"REOPEN to {target_stage}, continuation_pending (category={category})",
+                payload={"feedback_id": feedback_id, "category": category,
+                         "next_action": "feedback_replan", "risk_level": risk_level},
+            ))
+
             action_plan["status"] = "auto_reopened"
             action_plan["message"] = (
                 f"Auto-executed: REOPEN to {target_stage} "
                 f"(risk={risk_level}, classification={classification})"
             )
             action_plan["executed"] = True
+            action_plan["continuation"] = continuation
             action_plan["next_steps"] = [
-                f"Execute re-{target_stage.lower()} skill",
+                f"Execute re-{target_stage.lower()} via /harness:plan --reopen",
+                f"Then: harnessctl feedback re-plan --epic-id {epic_id} --feedback-id {feedback_id}",
             ]
         else:
             action_plan["status"] = "auto_reopen"
@@ -9901,6 +10199,35 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
             required_commands = [
                 f"feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
             ]
+
+        elif status == "continuation_pending":
+            # Continuation pending: only allowed_commands can proceed
+            cont = fb.get("continuation", {})
+            next_action_name = cont.get("next_action", "feedback_replan")
+            allowed = cont.get("allowed_commands", [])
+            required_art = cont.get("required_artifacts", [])
+            reason = "continuation_pending"
+            next_action = f"Execute continuation: {next_action_name}"
+            required_commands = []
+            # Check if amendment-plan exists (prerequisite for re-plan)
+            for art in required_art:
+                art_path = fb_dir / art
+                if not art_path.exists():
+                    required_commands.append(
+                        f"/harness:plan --reopen (to produce {art})"
+                    )
+            required_commands.append(cont.get("next_command", ""))
+            # Include allowlist in blocked item for stage-reminder
+            blocked_items.append({
+                "feedback_id": feedback_id,
+                "status": status,
+                "reason": reason,
+                "next_action": next_action,
+                "required_commands": required_commands,
+                "allowed_commands": allowed,
+                "must_auto_continue": cont.get("must_auto_continue", True),
+            })
+            continue
 
         elif status == "reopened":
             # Check for re-complete
@@ -10575,6 +10902,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_continue.add_argument("--execute", action="store_true", help="Auto-execute actions instead of outputting next_steps")
     p_fb_continue.add_argument("--json", action="store_true")
 
+    p_fb_replan = fb_sub.add_parser("re-plan", help="Deterministic merge of amendment-plan into task-graph/coverage")
+    p_fb_replan.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_replan.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_replan.add_argument("--json", action="store_true")
+
     p_fb_close_all = fb_sub.add_parser("close-all", help="Close all open feedback items for an epic")
     p_fb_close_all.add_argument("--epic-id", dest="epic_id", required=True)
     p_fb_close_all.add_argument("--reason", default="Batch closed", help="Closure reason")
@@ -10938,6 +11270,8 @@ def main() -> None:
             cmd_feedback_run_triage(args, h)
         elif args.feedback_action == "continue":
             cmd_feedback_continue(args, h)
+        elif args.feedback_action == "re-plan":
+            cmd_feedback_re_plan(args, h)
         elif args.feedback_action == "close-all":
             cmd_feedback_close_all(args, h)
         elif args.feedback_action == "clean":

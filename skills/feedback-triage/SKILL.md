@@ -369,3 +369,43 @@ feedback_candidate 检测
 | related-gap-scan | scope_gap 类型必须执行，结果送入 amendment |
 | approve-amendment gate | 高置信度 related gaps 必须在 Amend 或 Deferred(含 reason) 中体现 |
 | REOPEN 门禁 | 回退阶段必须重新完成门禁，使用 re-complete 标记 |
+
+## 反空转约束（硬性，对标 CLARIFY 约束 6）
+
+### 规则 A: continuation_pending 时禁止暂停
+
+当 HFB 状态为 `continuation_pending` 且 `continuation.category == "assumable"` 时：
+- gate-check 已硬阻断所有无关动作
+- Agent 层面同样禁止输出任何用户确认请求
+- 下一步必须是 `continuation.allowed_commands` 中的命令
+- 不得执行 status/budget check 等非产出动作
+
+### 规则 B: 仅 must_confirm 可中断（对标 Decision Bundle 三分类）
+
+| category | 行为 |
+|----------|------|
+| `assumable` (low/medium risk + REOPEN_*) | 静默自动推进 |
+| `must_confirm` (high risk / scope_change) | 输出决策包，等待确认 |
+| `must_confirm` + 预算耗尽 | 阻断，不自动默认执行 |
+
+### 规则 C: 输出黑名单（category=assumable 时）
+
+以下模式视为违反反空转约束：
+- "需要我继续推进吗？"
+- "是否执行 re-plan？"
+- "要我帮你..."
+- 任何以问号结尾且语义为征求许可的句子
+
+### 规则 D: re-plan 完整时序（不可跳步）
+
+```
+continuation_pending
+  → /harness:plan --reopen (Agent 产出 amendment-plan.json)
+  → harnessctl feedback re-plan (确定性合并 + revision-manifest)
+  → harnessctl feedback re-complete --stage <STAGE> (manifest 校验)
+  → HFB status = resolved
+  → gate-check pass
+```
+
+禁止跳过 re-plan 直接执行 re-complete。
+禁止手写 revision-manifest.json 或 revision-diff.md。
