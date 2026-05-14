@@ -25,23 +25,8 @@ argument-hint: "<模糊需求描述>"
 立刻执行：
 
 ```bash
-if [ -z "${HARNESSCTL:-}" ]; then
-  candidates=(
-    "./stage-harness/scripts/harnessctl"
-    "../stage-harness/scripts/harnessctl"
-    "$(git rev-parse --show-toplevel 2>/dev/null)/stage-harness/scripts/harnessctl"
-  )
-
-  for candidate in "${candidates[@]}"; do
-    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-      HARNESSCTL="$candidate"
-      break
-    fi
-  done
-fi
-
 test -n "${HARNESSCTL:-}" && test -x "$HARNESSCTL" || {
-  echo "harnessctl not found. Set HARNESSCTL=/abs/path/to/stage-harness/scripts/harnessctl" >&2
+  echo "ERROR: HARNESSCTL 环境变量未设置或不可执行。请先执行: export HARNESSCTL=/path/to/stage-harness/scripts/harnessctl" >&2
   exit 1
 }
 
