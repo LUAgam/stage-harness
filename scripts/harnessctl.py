@@ -3017,13 +3017,20 @@ def _detect_profile_data(h: Path, project_root: Path) -> dict:
                 confidence = 0.8
                 break
 
-    # If still unknown, check if mostly .md files
+    # If still unknown, check if mostly .md files — but only if subdirs lack build markers
     if detected_type == "unknown":
         all_files = [f for f in project_root.iterdir() if f.is_file()]
         md_files = [f for f in all_files if f.suffix == ".md"]
         if all_files and len(md_files) / len(all_files) > 0.5:
-            detected_type = "docs"
-            confidence = 0.7
+            subdirs_with_build_markers = 0
+            for child in project_root.iterdir():
+                if not child.is_dir() or child.name.startswith(".") or child.name in PROFILE_SCAN_IGNORE_DIRS:
+                    continue
+                if any((child / m).exists() for m in PROFILE_REPO_MARKERS if m != ".git"):
+                    subdirs_with_build_markers += 1
+            if subdirs_with_build_markers == 0:
+                detected_type = "docs"
+                confidence = 0.7
 
     # Map type to profile_type string
     type_map = {
