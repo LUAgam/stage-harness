@@ -47,10 +47,18 @@ Respect `.harness/project-profile.yaml`：`workspace_mode`、`risk_level`、`sca
    a. Search codebase for related symbols (Grep) within routed scope only
    b. Identify existing implementations
    c. Classify impact level
-4. Build dependency graph (who imports what)
-5. Identify test coverage gaps
-6. Flag integration points with external systems
-7. Score total blast radius: contained / moderate / broad / systemic
+4. Precedent constraint inheritance:
+   a. Identify existing features/paths that are analogous to the new epic
+      (same source, same target type, same operation category, or same domain)
+   b. Search project documentation and code for known limitations,
+      "not supported" declarations, and prerequisite checks of those
+      analogous features
+   c. For each discovered constraint, assess whether it likely applies
+      to the new epic and record as Risk Flag (category: "precedent-constraint")
+5. Build dependency graph (who imports what)
+6. Identify test coverage gaps
+7. Flag integration points with external systems
+8. Score total blast radius: contained / moderate / broad / systemic
 ```
 
 Authoritative agent behavior: `agents/impact-analyst.md`. Templates: `templates/cross-repo-impact-index.json`, `templates/repo-catalog.yaml`.

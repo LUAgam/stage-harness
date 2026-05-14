@@ -44,7 +44,13 @@ Decisions where:
    a. Assign category (must_confirm / assumable / deferrable)
    b. Assign risk_if_wrong (low / medium / high / critical)
    c. Write proposed_default and why_now
-3. Count must_confirm items vs interrupt budget
+3. Prerequisite constraint check:
+   When a must_confirm decision confirms a capability is in scope,
+   check whether that capability has known prerequisites or constraints
+   in existing implementations (from impact-scan precedent-constraint
+   flags or challenger CHK items). If so, generate a follow-up decision
+   asking whether those constraints should be inherited or overridden.
+4. Count must_confirm items vs interrupt budget
 4. If must_confirm count > budget:
    a. Re-evaluate: can any be reclassified as assumable?
    b. If not: bundle remaining into one packet (don't split across multiple interrupts)

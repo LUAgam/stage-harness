@@ -50,6 +50,13 @@ Pressure-test **constraint_conflicts** and **state_transition_scenarios** from `
 ### Concept consistency（SPEC light_council 阶段适用）
 当作为 light_council 成员审查 SDD 时，额外检查：`decision-bundle.json` 中 resolved 决策使用的技术术语（如"subagent"、"event-driven"、"plugin"等）在 SDD 架构描述中是否被真正实现。术语标签与实际实现不匹配（例如：决策写"subagent 模式"但 SDD 描述的是 subprocess 调用）→ 标记为 Critical Challenge。
 
+### Precedent constraint inheritance
+When the epic extends or creates a variant of an existing feature:
+- Identify the closest existing analogous feature (same source, same operation type, or same domain)
+- Check its documentation and pre-check code for "must have", "not supported", "required" declarations
+- Challenge whether those same constraints apply to the new variant
+- If they likely do, escalate as a dedicated CHK item (not a sub-bullet of another challenge)
+
 ## Write scope
 
 You may use **Write** only to create or replace this single artifact:
