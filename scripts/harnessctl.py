@@ -7440,8 +7440,23 @@ def cmd_feedback_approve_amendment(args, h: Path) -> None:
     if not plan_path.exists():
         err(f"Amendment plan not found for {feedback_id}")
 
-    # Gate: verify high-confidence related gaps are addressed or explicitly deferred
+    # Gate: related-gap-scan must exist if required by trigger conditions
     gap_scan_path = _feedback_dir(h, epic_id) / f"{feedback_id}.related-gap-scan.json"
+    councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council" / feedback_id
+    verdict_path = councils_dir / "verdict.json"
+    verdict = load_json(verdict_path) if verdict_path.exists() else {}
+    votes = []
+    votes_dir = councils_dir / "votes"
+    if votes_dir.exists():
+        for vf in votes_dir.glob("*.json"):
+            votes.append(load_json(vf))
+    if _feedback_requires_related_gap_scan(fb, verdict, votes) and not gap_scan_path.exists():
+        err(f"Cannot approve: related-gap-scan is required for {feedback_id} "
+            f"(triggers: REOPEN/scope_gap/vote.related_gaps) but "
+            f"{feedback_id}.related-gap-scan.json does not exist. "
+            f"Run: harnessctl feedback related-gap-scan --epic-id {epic_id} --feedback-id {feedback_id}")
+
+    # Gate: verify high-confidence related gaps are addressed or explicitly deferred
     if gap_scan_path.exists():
         gap_scan = load_json(gap_scan_path)
         high_conf_gaps = [g for g in gap_scan.get("gaps", []) if g.get("confidence", 0) >= 0.7]
@@ -9459,10 +9474,15 @@ def cmd_feedback_continue(args, h: Path) -> None:
         needs_human_confirm = True
         confirm_reason = f"risk_level=high with REOPEN requires human confirmation"
 
-    # Check for related-gap-scan requirement (mandatory for scope_gap)
-    gap_scan_required = False
-    if classification in ("scope_gap", "scope_gap_question") or requires_reopen:
-        gap_scan_required = True
+    # Check for related-gap-scan requirement using unified trigger logic
+    votes = []
+    votes_dir = councils_dir / "votes"
+    if votes_dir.exists():
+        for vf in votes_dir.glob("*.json"):
+            votes.append(load_json(vf))
+
+    gap_scan_required = _feedback_requires_related_gap_scan(fb, verdict, votes)
+    if gap_scan_required:
         gap_scan_path = _feedback_dir(h, epic_id) / f"{feedback_id}.related-gap-scan.json"
         if not gap_scan_path.exists():
             # Auto-run related-gap-scan
@@ -9706,6 +9726,191 @@ def cmd_feedback_clean(args, h: Path) -> None:
         out_json({"status": "ok", "removed_files": removed_files, "removed_dirs": removed_dirs})
     else:
         print(f"Cleaned feedback for epic {epic_id}: {removed_files} files, {removed_dirs} directories removed")
+
+
+def _feedback_requires_related_gap_scan(fb: dict, verdict: dict, votes: list) -> bool:
+    """Determine if related-gap-scan is mandatory for this feedback.
+
+    Triggers (any one sufficient):
+    1. verdict decision is REOPEN_* (any reopen)
+    2. verdict decision is STAY_EXECUTE and classification contains scope_gap
+    3. any vote has non-empty related_gaps
+    4. feedback classification is scope_gap_question
+    """
+    decision = verdict.get("decision", "")
+    classification = verdict.get("classification", fb.get("candidate_type", ""))
+
+    # Trigger 1: any REOPEN
+    if decision.startswith("REOPEN_"):
+        return True
+
+    # Trigger 2: STAY_EXECUTE + scope_gap classification
+    if decision == "STAY_EXECUTE" and "scope_gap" in classification:
+        return True
+
+    # Trigger 3: any vote has related_gaps
+    for vote in votes:
+        if vote.get("related_gaps"):
+            return True
+
+    # Trigger 4: feedback classification is scope_gap_question
+    if fb.get("candidate_type") == "scope_gap_question":
+        return True
+
+    return False
+
+
+def cmd_feedback_gate_check(args, h: Path) -> None:
+    """Check if any unresolved feedback blocks further progress.
+
+    Returns structured JSON with blocked items and next actions.
+    Exit code 0 = pass (no blockers), exit code 1 = blocked.
+    """
+    epic_id = args.epic_id
+    load_epic(h, epic_id)
+
+    fb_dir = h / "features" / epic_id / "feedback"
+    councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council"
+
+    blocked_items = []
+
+    if not fb_dir.exists():
+        # No feedback at all — pass
+        if args.json:
+            out_json({"status": "pass", "blocked_count": 0, "blocked_items": []})
+        else:
+            print("Feedback gate-check: PASS (no feedback)")
+        return
+
+    for fb_file in sorted(fb_dir.glob("HFB-*.json")):
+        # Skip non-primary files (triage, closure, evidence-pack, etc.)
+        if "." in fb_file.stem.replace("HFB-", ""):
+            continue
+        fb = load_json(fb_file)
+        feedback_id = fb.get("feedback_id", fb_file.stem)
+        status = fb.get("status", "")
+
+        # Record-only feedback is never blocking
+        if fb.get("record_only"):
+            continue
+
+        reason = ""
+        next_action = ""
+        required_commands = []
+
+        if status == "submitted":
+            ep_path = fb_dir / f"{feedback_id}.evidence-pack.json"
+            if not ep_path.exists():
+                reason = "submitted_without_evidence_pack"
+                next_action = "feedback evidence-pack"
+                required_commands = [
+                    f"feedback evidence-pack --epic-id {epic_id} --feedback-id {feedback_id}",
+                    f"feedback council-triage --epic-id {epic_id} --feedback-id {feedback_id}",
+                ]
+
+        elif status == "triaging":
+            verdict_path = councils_dir / feedback_id / "verdict.json"
+            if not verdict_path.exists():
+                reason = "triaging_without_verdict"
+                next_action = "feedback aggregate-triage"
+                required_commands = [
+                    f"feedback aggregate-triage --epic-id {epic_id} --feedback-id {feedback_id}",
+                ]
+
+        elif status == "triaged":
+            # Has verdict but no continue action taken
+            closure_path = fb_dir / f"{feedback_id}.closure.json"
+            state_file = h / "features" / epic_id / "state.json"
+            has_reopen = False
+            if state_file.exists():
+                state = load_json(state_file)
+                reopen_history = state.get("reopen_history", [])
+                has_reopen = any(r.get("feedback_id") == feedback_id for r in reopen_history)
+            if not closure_path.exists() and not has_reopen:
+                reason = "triaged_without_continue"
+                next_action = "feedback continue"
+                required_commands = [
+                    f"feedback continue --epic-id {epic_id} --feedback-id {feedback_id} --execute",
+                ]
+
+        elif status == "amendment_planned":
+            reason = "amendment_planned_not_approved"
+            next_action = "feedback approve-amendment"
+            required_commands = [
+                f"feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+            ]
+
+        elif status == "reopened":
+            # Check for re-complete
+            rc_path = fb_dir / f"{feedback_id}.re-completion.json"
+            if not rc_path.exists():
+                reason = "reopened_without_re_complete"
+                next_action = "feedback re-complete"
+                required_commands = [
+                    f"feedback re-complete --epic-id {epic_id} --feedback-id {feedback_id}",
+                ]
+
+        elif status == "deferred":
+            # Deferred requires reason + evidence to be valid
+            has_reason = bool(fb.get("defer_reason"))
+            has_defer_to = bool(fb.get("defer_to") or fb.get("defer_until"))
+            has_evidence = bool(fb.get("defer_evidence") or fb.get("closure_evidence"))
+            if not (has_reason and has_defer_to and has_evidence):
+                missing = []
+                if not has_reason:
+                    missing.append("defer_reason")
+                if not has_defer_to:
+                    missing.append("defer_to/defer_until")
+                if not has_evidence:
+                    missing.append("evidence")
+                reason = f"deferred_incomplete (missing: {', '.join(missing)})"
+                next_action = "feedback close --defer"
+                required_commands = [
+                    f"feedback close --epic-id {epic_id} --feedback-id {feedback_id} "
+                    f"--defer --reason '<reason>' --evidence '<evidence>'",
+                ]
+
+        elif status == "rejected":
+            # Rejected requires evidence
+            if not fb.get("rejection_evidence") and not fb.get("closure_evidence"):
+                reason = "rejected_without_evidence"
+                next_action = "feedback close --reject"
+                required_commands = [
+                    f"feedback close --epic-id {epic_id} --feedback-id {feedback_id} "
+                    f"--reject --evidence '<evidence>'",
+                ]
+
+        # closed / resolved → pass (no check needed)
+
+        if reason:
+            blocked_items.append({
+                "feedback_id": feedback_id,
+                "status": status,
+                "reason": reason,
+                "next_action": next_action,
+                "required_commands": required_commands,
+            })
+
+    if blocked_items:
+        result = {
+            "status": "blocked",
+            "blocked_count": len(blocked_items),
+            "blocked_items": blocked_items,
+        }
+        if args.json:
+            out_json(result)
+        else:
+            print(f"Feedback gate-check: BLOCKED ({len(blocked_items)} item(s))")
+            for item in blocked_items:
+                print(f"  {item['feedback_id']} [{item['status']}]: {item['reason']}")
+                print(f"    Next: {item['next_action']}")
+        sys.exit(1)
+    else:
+        result = {"status": "pass", "blocked_count": 0, "blocked_items": []}
+        if args.json:
+            out_json(result)
+        else:
+            print("Feedback gate-check: PASS")
 
 
 def _pitfall_recommendation(classification: str) -> str:
@@ -10317,6 +10522,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_clean.add_argument("--epic-id", dest="epic_id", required=True)
     p_fb_clean.add_argument("--json", action="store_true")
 
+    p_fb_gate = fb_sub.add_parser("gate-check", help="Check if unresolved feedback blocks progress")
+    p_fb_gate.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_gate.add_argument("--json", action="store_true")
+
     # ---- reopen ----
     p_reopen = sub.add_parser("reopen", help="Controlled stage reopen via approved feedback")
     p_reopen.add_argument("--epic-id", dest="epic_id", required=True)
@@ -10664,6 +10873,8 @@ def main() -> None:
             cmd_feedback_close_all(args, h)
         elif args.feedback_action == "clean":
             cmd_feedback_clean(args, h)
+        elif args.feedback_action == "gate-check":
+            cmd_feedback_gate_check(args, h)
 
     elif args.command == "reopen":
         cmd_reopen(args, h)

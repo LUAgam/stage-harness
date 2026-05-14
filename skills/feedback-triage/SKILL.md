@@ -30,10 +30,16 @@ Feedback Triage Council 调度技能。当 stage-reminder hook 自动提交 feed
 
 1. **禁止手工复刻 feedback 流程**：禁止用 Bash/Write/Edit 工具手动创建 `evidence-pack.json`、`votes/*.json`、`verdict.json` 文件。必须通过 `harnessctl` 标准命令完成每一步。PreToolUse hooks 会自动拦截违规操作。
 2. **禁止使用旧版 vote schema**：`decision` 字段仅接受以下值：`REOPEN_CLARIFY`、`REOPEN_SPEC`、`REOPEN_PLAN`、`STAY_EXECUTE`、`NO_REOPEN_WITH_EVIDENCE`、`INSUFFICIENT_EVIDENCE`、`REJECT`、`DEFER`。旧版值（如 `agree_reopen`、`conditional`、`reopen` 等）会被 aggregate-triage 拒绝。
-3. **confirmed in-scope 后自动继续**：triage 裁决后，若 verdict 为 low/medium risk 的 REOPEN_* 或 STAY_EXECUTE，必须自动执行后续步骤（plan-amendment → approve → reopen/create-task），不得询问用户"要不要修"。仅 `scope_change` 或 `high risk` 需人工确认。
-4. **confirmed feedback 必须立即处理**：feedback 提交后不得跳过 triage 直接回答用户，也不得 idle 等待。
-5. **related-gap-scan 必须在 scope_gap 裁决后执行**：verdict 为 REOPEN_* 或 STAY_EXECUTE + scope_gap 时，必须运行 `related-gap-scan`，结果送入 amendment-plan。
+3. **confirmed in-scope 后自动继续**：triage 裁决后，若 verdict 为 low/medium risk 的 REOPEN_* 或 STAY_EXECUTE，必须自动执行后续步骤（plan-amendment → approve → reopen/create-task），不得询问用户"要不要修"。仅 `scope_change` 或 `high risk` 需人工确认。`continue --execute` 只能调用 harness 编排命令（plan-amendment / approve-amendment / reopen / task-graph merge / re-complete / close），真正代码/文档修改仍由对应阶段命令执行。
+4. **confirmed feedback 必须立即处理**：feedback 提交后不得跳过 triage 直接回答用户，也不得 idle 等待。`/harness:feedback submit` 默认强制编排完整 triage 闭环。
+5. **related-gap-scan 触发条件（任一满足即强制执行）**：
+   - verdict 为 REOPEN_*（任何回退）
+   - verdict 为 STAY_EXECUTE 且 classification 含 scope_gap
+   - 任意 vote.related_gaps 非空
+   - feedback classification = scope_gap_question
+   触发后 `HFB-xxx.related-gap-scan.json` 必须存在才能 approve-amendment。高置信度 gaps 必须在 Amend 或 Deferred(含 reason) 中体现。通用 sibling category 扫描范围：docs / tests / frontend / backend / config / i18n / infra / data-schema / api-contract / release-user-facing-notes / domain-specific-support-matrix。
 6. **Vote 必须通过 write-vote 命令提交**：Agent 投票必须使用 `harnessctl feedback write-vote` 命令，禁止直接写入 votes 目录。write-vote 会注入 `_managed`、`_written_by`、`_schema_version`、`_vote_session_id` 元数据，aggregate-triage 会校验这些字段存在且 `_managed=true`。`evidence` 数组不得为空，每条 evidence 必须引用具体文件路径或代码片段。
+7. **mentioned_surface 安全解析**：scope_gap_question 类型的 feedback 中 `mentioned_surface` 不能直接当路径用。evidence-pack 中必须先匹配 repo-catalog / surface-routing / codemap alias，命中后作为 probe root，未命中则仅作为 keyword hint。
 
 ---
 

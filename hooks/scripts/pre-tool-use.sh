@@ -384,4 +384,82 @@ done <<'EOF'
 (^|[[:space:]])rm[[:space:]]+-rf[[:space:]]+\.harness([[:space:]]|$)	rm -rf .harness	rm -rf .harness 会删除 stage-harness 所有状态数据
 EOF
 
+# ---------------------------------------------------------------------------
+# Feedback Gate Guard (P1): block investigation commands when HFB is unresolved
+# Only blocks: grep -R / rg / find / ack / ag
+# Does NOT block: ls, harnessctl feedback commands, evidence-pack/source-probe internals
+# ---------------------------------------------------------------------------
+
+# Check if command looks like a search/investigation command
+IS_INVESTIGATION_CMD=false
+if echo "$NORMALIZED_COMMAND" | grep -qiE '(^|[[:space:]])(grep[[:space:]]+-[rR]|grep[[:space:]]+--recursive|rg[[:space:]]|find[[:space:]]|ack[[:space:]]|ag[[:space:]])'; then
+  IS_INVESTIGATION_CMD=true
+fi
+
+if [[ "$IS_INVESTIGATION_CMD" == "true" ]]; then
+  # Check if this is a feedback-allowlisted internal call
+  # (evidence-pack, source-probe, related-gap-scan invoke grep/find internally)
+  IS_FEEDBACK_INTERNAL=false
+  if echo "$NORMALIZED_COMMAND" | grep -qiE 'harnessctl[[:space:]]+feedback|evidence.pack|source.probe|related.gap.scan|council.triage'; then
+    IS_FEEDBACK_INTERNAL=true
+  fi
+
+  if [[ "$IS_FEEDBACK_INTERNAL" == "false" ]]; then
+    # Determine active epic and check gate
+    GATE_EPIC_ID=""
+    if [[ "${#ACTIVE_EPIC_IDS[@]}" -eq 1 ]]; then
+      GATE_EPIC_ID="${ACTIVE_EPIC_IDS[0]}"
+    fi
+
+    if [[ -n "$GATE_EPIC_ID" && -x "${HARNESSCTL:-}" ]]; then
+      GATE_RESULT=$("$HARNESSCTL" feedback gate-check --epic-id "$GATE_EPIC_ID" --json 2>/dev/null || true)
+      GATE_STATUS=$(echo "$GATE_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || true)
+
+      if [[ "$GATE_STATUS" == "blocked" ]]; then
+        BLOCKED_INFO=$(echo "$GATE_RESULT" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+items = data.get('blocked_items', [])
+if items:
+    item = items[0]
+    print(f\"{item.get('feedback_id','?')}: {item.get('reason','?')} → next: {item.get('next_action','?')}\")
+" 2>/dev/null || true)
+
+        # Trace the block event
+        if [[ -n "$GATE_EPIC_ID" ]]; then
+          EVENT="$(
+            ACTIVE_EPIC_ID_VALUE="$GATE_EPIC_ID" COMMAND_VALUE="$COMMAND" BLOCKED_INFO_VALUE="${BLOCKED_INFO:-unknown}" python3 - <<'PY' 2>/dev/null || true
+import hashlib
+import json
+import os
+from datetime import datetime, timezone
+
+cmd_hash = hashlib.sha256(os.environ["COMMAND_VALUE"].encode("utf-8")).hexdigest()[:12]
+print(json.dumps({
+    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "epic_id": os.environ["ACTIVE_EPIC_ID_VALUE"],
+    "source": "hook",
+    "actor": "pre-tool-use-feedback-guard",
+    "event_type": "investigation_blocked_by_feedback_gate",
+    "status": "blocked",
+    "tool_name": "Bash",
+    "summary": f"Investigation command blocked: unresolved feedback ({os.environ['BLOCKED_INFO_VALUE']})",
+    "payload": {
+        "command_hash": cmd_hash,
+        "blocked_info": os.environ["BLOCKED_INFO_VALUE"],
+    },
+    "artifact_paths": [],
+}, ensure_ascii=False))
+PY
+          )"
+          [[ -n "$EVENT" ]] && "$HARNESSCTL" patch trace --event-json "$EVENT" 2>/dev/null || true
+        fi
+
+        printf '{"continue": false, "reason": "⚠️ [Feedback Gate Guard] 存在未处理的 feedback (%s)，禁止执行调查命令。请先完成 feedback triage 流程。"}\n' "$BLOCKED_INFO"
+        exit 0
+      fi
+    fi
+  fi
+fi
+
 printf '{"continue": true}\n'

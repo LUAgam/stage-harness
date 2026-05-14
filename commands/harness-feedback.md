@@ -41,8 +41,10 @@ Feedback 生命周期管理命令。提供对 HFB（Harness Feedback）记录的
 | 子命令 | 说明 | 示例 |
 |--------|------|------|
 | `list` | 列出所有 HFB 及状态 | `/harness:feedback <epic-id> list` |
-| `submit` | 手动提交新 feedback | `/harness:feedback <epic-id> submit "前端页面需要适配"` |
+| `submit` | 提交并立即编排完整 triage | `/harness:feedback <epic-id> submit "前端页面需要适配"` |
+| `submit --record-only` | 只记录不自动 triage | `/harness:feedback <epic-id> submit --record-only "批量备注"` |
 | `triage` | 手动触发某个 HFB 的 triage 流程 | `/harness:feedback <epic-id> triage HFB-001` |
+| `gate-check` | 检查未处理 HFB 是否阻断进展 | `/harness:feedback <epic-id> gate-check` |
 | `close` | 关闭指定 HFB | `/harness:feedback <epic-id> close HFB-001 --reason "已修复"` |
 | `close-all` | 批量关闭所有未关闭的 HFB | `/harness:feedback <epic-id> close-all` |
 | `clean` | 物理删除所有 feedback 记录 | `/harness:feedback <epic-id> clean` |
@@ -57,6 +59,9 @@ Feedback 生命周期管理命令。提供对 HFB（Harness Feedback）记录的
 1. **`clean` 操作不可逆**：执行前必须向用户确认，展示将删除的文件数量。
 2. **`triage` 必须调用内部 skill**：禁止手工创建 evidence-pack/votes/verdict 文件，必须通过 `harnessctl` + Agent 工具完成。
 3. **`close-all` 会跳过已关闭的 HFB**：不会重复关闭。
+4. **`submit` 默认强制编排完整 triage**：submit 后禁止停在 submitted 状态直接回答用户。只有 `--record-only` 允许只记录不处理。
+5. **未处理 HFB 阻断后续**：存在 submitted/triaging/triaged(未 continue) 状态的 HFB 时，禁止执行与 feedback 处理无关的开发动作或阶段推进。
+6. **`deferred` 不能无条件放行**：deferred 状态必须有 defer_reason + defer_to/defer_until + evidence，否则 gate-check 不放行。
 
 ---
 
@@ -88,7 +93,106 @@ HFB-003   submitted  correction            议会发现问题不会回退...
 
 ### 子命令：submit
 
-手动提交新的 feedback。
+提交新 feedback 并**立即编排完整 triage 闭环**。这是 orchestrator 入口，不是简单记录命令。
+
+> **⛔ 核心约束**：submit 后禁止停在 submitted 状态。必须完成完整 triage 流程后，再基于 verdict 结论回答用户。
+> 只有显式指定 `--record-only` 时，才允许只记录不处理（适用于批量录入/人工整理场景）。
+
+#### 默认模式（submit + 自动 triage）
+
+**Step 1**: 创建 HFB 记录
+
+```bash
+SUBMIT_RESULT=$($HARNESSCTL feedback submit \
+  --epic-id ${EPIC_ID} \
+  --stage ${CURRENT_STAGE} \
+  --text "${FEEDBACK_TEXT}" \
+  --source manual \
+  --json)
+FEEDBACK_ID=$(echo "$SUBMIT_RESULT" | python3 -c "import json,sys;print(json.load(sys.stdin)['feedback_id'])")
+```
+
+**Step 2**: 收集证据包
+
+```bash
+$HARNESSCTL feedback evidence-pack \
+  --epic-id ${EPIC_ID} \
+  --feedback-id ${FEEDBACK_ID} \
+  --json
+```
+
+**Step 3**: 初始化议会
+
+```bash
+$HARNESSCTL feedback council-triage \
+  --epic-id ${EPIC_ID} \
+  --feedback-id ${FEEDBACK_ID} \
+  --json
+```
+
+**Step 4**: 并行调度 6 agent 投票
+
+使用 Agent 工具并行调度以下 6 个角色（必须通过 `harnessctl feedback write-vote` 提交，禁止手工创建 vote JSON）：
+
+- requirement-analyst
+- impact-analyst
+- challenger
+- plan-reviewer
+- test-reviewer
+- code-reviewer
+
+每个 agent 必须：
+- 引用具体文件路径或代码片段作为 evidence
+- 使用 v2 schema 标准 decision 值
+- 通过 `harnessctl feedback write-vote` 命令提交
+
+**Step 5**: 聚合裁决
+
+```bash
+$HARNESSCTL feedback aggregate-triage \
+  --epic-id ${EPIC_ID} \
+  --feedback-id ${FEEDBACK_ID} \
+  --json
+```
+
+**Step 6**: Related-gap-scan（条件触发）
+
+以下任一条件满足时，必须执行 related-gap-scan：
+1. verdict 为 REOPEN_*（任何回退）
+2. verdict 为 STAY_EXECUTE 且 classification 含 scope_gap
+3. 任意 vote.related_gaps 非空
+4. feedback classification = scope_gap_question
+
+```bash
+$HARNESSCTL feedback related-gap-scan \
+  --epic-id ${EPIC_ID} \
+  --feedback-id ${FEEDBACK_ID} \
+  --json
+```
+
+**Step 7**: 自动执行后续
+
+```bash
+$HARNESSCTL feedback continue \
+  --epic-id ${EPIC_ID} \
+  --feedback-id ${FEEDBACK_ID} \
+  --execute \
+  --json
+```
+
+`continue --execute` 执行边界：只能调用 harness 编排命令（plan-amendment / approve-amendment / reopen / task-graph merge / re-complete / close）。真正代码/文档修改仍由对应阶段命令执行（`/harness:work`、re-plan、re-spec）。
+
+| verdict | 后续动作 | 是否问用户 |
+|---------|---------|-----------|
+| STAY_EXECUTE + low/medium risk | 自动 task-graph merge → /harness:work | 不问 |
+| REOPEN_* + low/medium risk | auto plan-amendment → approve → reopen | 不问 |
+| NO_REOPEN_WITH_EVIDENCE | 带证据回答 → close | 不问 |
+| INSUFFICIENT_EVIDENCE | 阻断，要求补证据 | 打断 |
+| scope_change / high risk | 展示 amendment plan | 需确认 |
+
+#### --record-only 模式
+
+仅创建 HFB 记录，不自动 triage。HFB metadata 写入 `"record_only": true`。
 
 ```bash
 $HARNESSCTL feedback submit \
@@ -99,12 +203,12 @@ $HARNESSCTL feedback submit \
   --json
 ```
 
-提交后输出新 feedback 的 ID，并提示：
+提交后在 HFB JSON 中补充 metadata：
+```json
+{"record_only": true, "triage_required": false}
+```
 
-```
-已提交 HFB-xxx。
-  运行 /harness:feedback <epic-id> triage HFB-xxx 触发分诊流程。
-```
+> 注意：record-only 的 HFB 不会触发 gate-check 阻断。
 
 ### 子命令：triage
 
@@ -201,6 +305,61 @@ $HARNESSCTL feedback reopen-stats --epic-id ${EPIC_ID} --json
 - 按 classification 分类的 reopen 次数
 - 高频 reopen 模式
 - 建议改进方向
+
+### 子命令：gate-check
+
+检查是否存在未处理的 feedback 阻断后续进展。返回结构化结果，包含阻断项和下一步操作。
+
+```bash
+$HARNESSCTL feedback gate-check --epic-id ${EPIC_ID} --json
+```
+
+输出示例（blocked）：
+```json
+{
+  "status": "blocked",
+  "blocked_count": 1,
+  "blocked_items": [
+    {
+      "feedback_id": "HFB-003",
+      "reason": "submitted_without_evidence_pack",
+      "next_action": "feedback evidence-pack",
+      "required_commands": [
+        "feedback evidence-pack --epic-id <epic-id> --feedback-id HFB-003",
+        "feedback council-triage --epic-id <epic-id> --feedback-id HFB-003"
+      ]
+    }
+  ]
+}
+```
+
+输出示例（pass）：
+```json
+{
+  "status": "pass",
+  "blocked_count": 0,
+  "blocked_items": []
+}
+```
+
+**阻断规则**：
+
+| HFB 状态 | 是否阻断 |
+|----------|---------|
+| submitted（无 evidence-pack） | 阻断 |
+| triaging（无 verdict） | 阻断 |
+| triaged（未 continue） | 阻断 |
+| amendment_planned（未 approve） | 阻断 |
+| reopened（未 re-complete） | 阻断 |
+| deferred（缺 reason/defer_to/evidence） | 阻断 |
+| rejected（缺 evidence） | 阻断 |
+| closed / resolved | 放行 |
+| record_only=true | 放行（不参与 gate） |
+
+**集成位置**：
+- Stop hook / stage-reminder hook 在每次 prompt 时调用
+- EXECUTE / VERIFY / DONE 阶段 gate 前调用
+- 阻断时展示 `next_action` 和 `required_commands`，引导处理
 
 ---
 

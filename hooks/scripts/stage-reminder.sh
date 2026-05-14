@@ -236,6 +236,35 @@ elif echo "$PROMPT_TEXT" | grep -qiE "不需要(改|调整|处理|适配|支持)
   IS_SCOPE_GAP=true
 elif echo "$PROMPT_TEXT" | grep -qiE "是不是漏了.*(模块|页面|接口|组件|仓库)"; then
   IS_SCOPE_GAP=true
+elif echo "$PROMPT_TEXT" | grep -qiE "是否需要调整|需不需要改|有没有遗漏"; then
+  IS_SCOPE_GAP=true
+elif echo "$PROMPT_TEXT" | grep -qiE "是否也要适配|不用处理吗|是不是还差"; then
+  IS_SCOPE_GAP=true
+elif echo "$PROMPT_TEXT" | grep -qiE "还有.*没覆盖|是否.*也要(改|调整|适配|处理)"; then
+  IS_SCOPE_GAP=true
+fi
+
+# 提取 mentioned_surface（scope_gap_question 时从文本中提取命名对象）
+MENTIONED_SURFACE=""
+if [[ "$IS_SCOPE_GAP" == "true" ]]; then
+  MENTIONED_SURFACE=$(echo "$PROMPT_TEXT" | python3 -c "
+import sys, re
+text = sys.stdin.read().strip()
+# Extract named objects: look for identifiers before question patterns
+patterns = [
+    r'([\w\-]+)\s*(?:是否需要|需不需要|不需要|不用|有没有)',
+    r'(?:是否也要|是不是漏了?)\s*([\w\-]+)',
+    r'([\w\-]+)\s*(?:也要适配|不用处理|还差)',
+]
+for p in patterns:
+    m = re.search(p, text)
+    if m:
+        surface = m.group(1)
+        # Filter out common non-surface words
+        if surface not in ('这个', '那个', '这些', '那些', '什么', '哪些', '是否', '是不是'):
+            print(surface)
+            break
+" 2>/dev/null || true)
 fi
 
 # 记录 feedback_candidate — 需求变更类
@@ -285,6 +314,22 @@ print(json.dumps({
     --candidate-type "$FEEDBACK_CANDIDATE_TYPE" \
     --json 2>/dev/null)
   AUTO_FB_ID=$(echo "$AUTO_FB_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('feedback_id',''))" 2>/dev/null)
+
+  # 写入 mentioned_surface metadata（scope_gap_question 时）
+  if [[ -n "$AUTO_FB_ID" && -n "$MENTIONED_SURFACE" ]]; then
+    FB_JSON_PATH=".harness/features/${ACTIVE_EPIC_ID}/feedback/${AUTO_FB_ID}.json"
+    if [[ -f "$FB_JSON_PATH" ]]; then
+      python3 -c "
+import json, sys
+path = '$FB_JSON_PATH'
+with open(path) as f:
+    data = json.load(f)
+data['mentioned_surface'] = '${MENTIONED_SURFACE}'
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+" 2>/dev/null || true
+    fi
+  fi
 fi
 
 # 注入 feedback_candidate 提示到 REMINDER
@@ -313,39 +358,35 @@ if [[ -n "$FEEDBACK_CANDIDATE_TYPE" ]]; then
   fi
 fi
 
-# Guard: Check for existing feedback items that are idle (submitted/triaged but not acted on)
+# Guard: Use gate-check for structured blocking detection
 if [[ -n "$ACTIVE_EPIC_ID" && -x "$HARNESSCTL" && -z "$FEEDBACK_CANDIDATE_TYPE" ]]; then
-  IDLE_FB=$("$HARNESSCTL" feedback list --epic-id "$ACTIVE_EPIC_ID" --json 2>/dev/null | python3 -c "
-import json, sys
-try:
-    data = json.load(sys.stdin)
-    items = data if isinstance(data, list) else data.get('feedbacks', data.get('items', []))
-    idle = [f for f in items if f.get('status') in ('submitted', 'triaging')]
-    triaged = [f for f in items if f.get('status') == 'triaged']
-    result = {'idle': idle, 'triaged': triaged}
-    if idle or triaged:
-        print(json.dumps(result))
-except:
-    pass
-" 2>/dev/null || true)
+  GATE_RESULT=$("$HARNESSCTL" feedback gate-check --epic-id "$ACTIVE_EPIC_ID" --json 2>/dev/null || true)
+  GATE_STATUS=$(echo "$GATE_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || true)
 
-  if [[ -n "$IDLE_FB" ]]; then
-    IDLE_IDS=$(echo "$IDLE_FB" | python3 -c "
+  if [[ "$GATE_STATUS" == "blocked" ]]; then
+    GATE_INFO=$(echo "$GATE_RESULT" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 parts = []
-for f in data.get('idle', []):
-    parts.append(f.get('feedback_id', f.get('id', '?')) + ' (status: ' + f.get('status', '?') + ')')
-for f in data.get('triaged', []):
-    parts.append(f.get('feedback_id', f.get('id', '?')) + ' (status: triaged, needs continue)')
-print('; '.join(parts))
+for item in data.get('blocked_items', []):
+    fid = item.get('feedback_id', '?')
+    reason = item.get('reason', '?')
+    next_act = item.get('next_action', '?')
+    cmds = item.get('required_commands', [])
+    parts.append(f'{fid} ({reason}) → next: {next_act}')
+    for c in cmds:
+        parts.append(f'    harnessctl {c}')
+print('\n'.join(parts))
 " 2>/dev/null || true)
-    if [[ -n "$IDLE_IDS" ]]; then
-      REMINDER+="\n  ⚠️  [Feedback IDLE Guard] 存在未处理的 feedback: ${IDLE_IDS}"
-      REMINDER+="\n     禁止在 feedback 完成 triage + continue 之前进行其他开发工作。"
-      REMINDER+="\n     立即处理："
-      REMINDER+="\n     - submitted 状态: 执行 harnessctl feedback run-triage --epic-id ${ACTIVE_EPIC_ID} --feedback-id <id>"
-      REMINDER+="\n     - triaged 状态: 执行 harnessctl feedback continue --epic-id ${ACTIVE_EPIC_ID} --feedback-id <id>"
+    if [[ -n "$GATE_INFO" ]]; then
+      REMINDER+="\n  ⚠️  [Feedback Gate-Check BLOCKED] 存在未处理的 feedback，禁止进行其他开发工作。"
+      REMINDER+="\n     阻断详情："
+      while IFS= read -r line; do
+        REMINDER+="\n     ${line}"
+      done <<< "$GATE_INFO"
+      REMINDER+="\n"
+      REMINDER+="\n     允许的操作：feedback evidence-pack/council-triage/write-vote/aggregate-triage/related-gap-scan/continue/close"
+      REMINDER+="\n     阻断的操作：普通开发、阶段推进、与 HFB 无关的调查"
     fi
   fi
 fi
