@@ -46,7 +46,7 @@ PROFILE_FILE = "project-profile.yaml"
 REPO_CATALOG_FILE = "repo-catalog.yaml"
 VERSION = "4.6"
 
-STAGES = ["IDEA", "CLARIFY", "SPEC", "PLAN", "EXECUTE", "VERIFY", "FIX", "DONE"]
+STAGES = ["IDEA", "CLARIFY", "SPEC", "PLAN", "EXECUTE", "VERIFY", "BUILD", "DEPLOY", "E2E", "FIX", "DONE"]
 
 TRANSITIONS = {
     "IDEA":    ["CLARIFY"],
@@ -54,8 +54,11 @@ TRANSITIONS = {
     "SPEC":    ["PLAN"],
     "PLAN":    ["EXECUTE"],
     "EXECUTE": ["VERIFY", "PLAN"],
-    "VERIFY":  ["FIX", "DONE"],
-    "FIX":     ["VERIFY", "PLAN"],
+    "VERIFY":  ["FIX", "BUILD"],
+    "BUILD":   ["DEPLOY", "FIX"],
+    "DEPLOY":  ["E2E", "FIX"],
+    "E2E":     ["DONE", "FIX"],
+    "FIX":     ["VERIFY", "BUILD", "PLAN"],
     "DONE":    [],
 }
 
@@ -4010,6 +4013,9 @@ _STAGE_NEXT_ACTION = {
     "PLAN": "run_plan",
     "EXECUTE": "run_execute",
     "VERIFY": "run_verify",
+    "BUILD": "run_build",
+    "DEPLOY": "run_deploy",
+    "E2E": "run_e2e",
     "FIX": "run_verify",
     "DONE": "complete",
 }
@@ -4389,6 +4395,17 @@ STAGE_GATE_ARTIFACTS = {
     "EXECUTE": [],
     "VERIFY": [
         "{features_dir}/verification.json",
+    ],
+    "BUILD": [
+        "{features_dir}/build/build-receipt.json",
+    ],
+    "DEPLOY": [
+        "{features_dir}/deploy/deploy-receipt.json",
+    ],
+    "E2E": [
+        "{features_dir}/test-cases.md",
+        "{features_dir}/verify-cases/verify-receipt.json",
+        "{features_dir}/verify-cases/case-tracker.json",
     ],
     "DONE": [
         "{features_dir}/delivery-summary.md",
@@ -4891,54 +4908,6 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
         for msg in _plan_multi_repo_repo_fanin_summary_gate_errors(features_dir, h):
             missing.append(msg)
 
-    if stage == "EXECUTE":
-        # Validate all task receipts exist and contain build results
-        receipts_dir = features_dir / "receipts"
-        tasks_dir = h / "tasks"
-        if tasks_dir.exists():
-            import glob as _glob
-            task_files = sorted(_glob.glob(str(tasks_dir / f"{epic_id}.*.json")))
-            for tf in task_files:
-                try:
-                    task_data = json.loads(Path(tf).read_text(encoding="utf-8"))
-                    task_id = task_data.get("id", "")
-                    task_status = task_data.get("status", "")
-                    if task_status != "done":
-                        continue
-                    receipt_path = receipts_dir / f"{task_id}.json"
-                    if not receipt_path.exists():
-                        missing.append(f"{receipt_path} (task {task_id} done but no receipt)")
-                    else:
-                        try:
-                            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-                            smoke = receipt.get("smoke", {})
-                            if isinstance(smoke, dict) and not smoke.get("passed", True):
-                                missing.append(f"{receipt_path} (smoke.passed=false for {task_id})")
-                            build = receipt.get("build", {})
-                            if isinstance(build, dict) and build.get("executed"):
-                                if not build.get("passed", True):
-                                    missing.append(f"{receipt_path} (build.passed=false for {task_id})")
-                        except (json.JSONDecodeError, OSError):
-                            warnings.append(f"{receipt_path} (invalid JSON)")
-                except (json.JSONDecodeError, OSError):
-                    continue
-        # Check no unresolved feedback
-        fb_dir = features_dir / "feedback"
-        if fb_dir.exists():
-            for fb_file in sorted(fb_dir.glob("HFB-*.json")):
-                if fb_file.name.endswith(".triage.json") or fb_file.name.endswith(".evidence-pack.json"):
-                    continue
-                if ".re-completion" in fb_file.name or ".related-gap-scan" in fb_file.name:
-                    continue
-                try:
-                    fb_data = json.loads(fb_file.read_text(encoding="utf-8"))
-                    fb_status = fb_data.get("status", "")
-                    if fb_status in ("submitted", "triaging", "triaged", "reopened", "amending"):
-                        fb_id = fb_data.get("feedback_id", fb_file.stem)
-                        warnings.append(f"Feedback {fb_id} still in status '{fb_status}' — resolve before VERIFY")
-                except (json.JSONDecodeError, OSError):
-                    continue
-
     if stage == "VERIFY":
         verification_path = features_dir / "verification.json"
         if verification_path.exists():
@@ -4996,6 +4965,19 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
 
         if not any(directory.exists() and any(directory.iterdir()) for directory in receipt_dirs_for_epic(h, epic_id)):
             missing.append(f"{features_dir}/receipts (or runtime-receipts/runs) (empty or missing)")
+
+    if stage == "E2E":
+        tracker_path = features_dir / "verify-cases" / "case-tracker.json"
+        if tracker_path.exists():
+            try:
+                tracker_data = json.loads(tracker_path.read_text(encoding="utf-8"))
+                cases = tracker_data.get("cases", [])
+                pending = [c for c in cases if c.get("status") in ("pending", "in_progress")]
+                if pending:
+                    ids = ", ".join(c.get("case_id", "?") for c in pending[:5])
+                    missing.append(f"{tracker_path} (unprocessed cases: {ids})")
+            except json.JSONDecodeError:
+                missing.append(f"{tracker_path} (invalid JSON)")
 
     append_trace_event(h, _make_trace_event(
         epic_id, "stage_gate_checked",

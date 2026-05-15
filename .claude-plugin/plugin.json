@@ -41,7 +41,9 @@
     "./agents/symbol-navigator.md",
     "./agents/system-observer.md",
     "./agents/test-reviewer.md",
-    "./agents/worker.md"
+    "./agents/worker.md",
+    "./agents/e2e-generator.md",
+    "./agents/generate-test-cases.md"
   ],
   "skills": ["./skills/"]
 }

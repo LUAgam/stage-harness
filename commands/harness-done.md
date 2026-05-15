@@ -25,17 +25,22 @@ DONE 阶段 orchestrator。负责验证 VERIFY 通过、编排发布议会、触
 
 ## 前置检查
 
-验证 VERIFY 阶段通过：
+验证 E2E 阶段通过：
 
 ```bash
-$HARNESSCTL stage-gate check VERIFY --epic-id <epic-id>
+$HARNESSCTL stage-gate check E2E --epic-id <epic-id>
 ```
 
-必须满足（与 `$HARNESSCTL stage-gate check VERIFY` 一致）：
-- `verification.json` 存在且其中 `acceptance_council` 或 `council_verdict` 为 `PASS` 或 `CONDITIONAL_PASS`，**或** `councils/verdict-acceptance_council.json` 中 `verdict` 为 `PASS` 或 `CONDITIONAL_PASS`（兜底）
+必须满足：
+- `e2e-receipt.json` 存在且 `status = PASS`
+- `e2e-cases.json` 存在
+
+同时验证 VERIFY 阶段通过（兜底）：
+- `verification.json` 存在且其中 `acceptance_council` 或 `council_verdict` 为 `PASS` 或 `CONDITIONAL_PASS`，**或** `councils/verdict-acceptance_council.json` 中 `verdict` 为 `PASS` 或 `CONDITIONAL_PASS`
 - 无未解决的 `critical_issues`，且各 review 维度字段若存在则不得为 `FAIL`
 
-若检查失败，提示先完成 `/harness:review <epic-id>`，终止。
+若 E2E 检查失败，提示先完成 `/stage-harness:harness-e2e <epic-id>`，终止。
+若 VERIFY 检查失败，提示先完成 `/stage-harness:harness-review <epic-id>`，终止。
 
 ## 执行步骤
 

@@ -125,6 +125,14 @@ clarification-notes.md 必须包含：
 - 间接受影响的模块（MEDIUM）
 - 可能需要测试覆盖的路径
 
+**派发方式（强制）**：Lead 必须通过 `Agent` 工具并指定 `subagent_type: "stage-harness:impact-analyst"` 派发影响扫描。禁止用通用 Agent 手写简化 prompt 替代——这会跳过 impact-analyst SKILL.md 中的完整流程（包括 Reference Tracking via Exemplar 等关键步骤）。
+
+**产物所有权（强制）**：`impact-scan.md`（及 `cross-repo-impact-index.json`）的内容由 `impact-analyst` 子代理全权负责。Lead 在收到子代理返回后：
+- **禁止**用自己的版本覆盖或重写子代理已写入的文件
+- **禁止**基于子代理的文本摘要"重新整理"后写入一份简化版本
+- **允许**在子代理写入失败（Write 工具报错或文件不存在）时，基于子代理返回的文本摘要完整还原写入，但必须保留子代理发现的所有 HIGH/MEDIUM 条目，不得遗漏
+- 若 Lead 需要补充信息（如与其他并行角色的交叉发现），只能以 **追加** 方式在文件末尾增加章节，不得修改子代理已写入的表格内容
+
 `impact-analyst` 读取 `project-profile.yaml`（含 `workspace_mode`、`scan.max_repos_deep_scan`、`scan.max_files_deep_read_per_scout`、`scan.max_subagents_wave`）后：
 
 - **多仓**（`workspace_mode: multi-repo`）：先对照 `.harness/repo-catalog.yaml` 做契约优先的 **Phase A**，写出 **`cross-repo-impact-index.json`**；深扫仓数不得超过 `max_repos_deep_scan`，超出须在 `impact-scan.md` 的 Risk Flags 中要求 Lead/用户收敛后再深扫。该 JSON 现要求带 **`fanout_decision`**：`mode` 仅允许 `repo_wave` / `single_agent`，`reason` 为非空字符串；`repo_ids` 表示“本轮需要按仓独立 fan-out 深扫的 catalog `repo_id` 列表”。其中 `repo_wave` 时 `repo_ids` 必须非空，`single_agent` 时 `repo_ids` 必须为空数组 `[]`。

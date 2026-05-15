@@ -87,15 +87,23 @@ $HARNESSCTL task list <epic-id> --status pending
 
 若仍有未完成的修复任务，展示列表并等待。
 
-### Step 5：触发重新审查
+### Step 5：触发重新审查或重新编译
 
-修复完成后，自动转换状态并触发 review：
+修复完成后，根据触发 FIX 的来源阶段决定回流目标：
 
 ```bash
-$HARNESSCTL state transition <epic-id> VERIFY
+# 读取 FIX 来源阶段
+FIX_SOURCE=$($HARNESSCTL state get <epic-id> --field fix_source_stage)
 ```
 
-然后调用：`/harness:review <epic-id>`
+| `fix_source_stage` | 回流目标 | 执行命令 |
+|-------------------|---------|---------|
+| `VERIFY`（默认） | VERIFY | `$HARNESSCTL state transition <epic-id> VERIFY` → `/harness:review <epic-id>` |
+| `BUILD` | BUILD | `$HARNESSCTL state transition <epic-id> BUILD` → `/stage-harness:harness-build <epic-id>` |
+| `DEPLOY` | BUILD | `$HARNESSCTL state transition <epic-id> BUILD` → `/stage-harness:harness-build <epic-id>` |
+| `E2E` | BUILD | `$HARNESSCTL state transition <epic-id> BUILD` → `/stage-harness:harness-build <epic-id>` |
+
+**说明**：BUILD / DEPLOY / E2E 阶段触发的 FIX，修复完成后均从 BUILD 重新开始，确保修复后的代码经过完整的编译 → 部署 → e2e 链路验证。
 
 ## 产物要求
 
@@ -138,11 +146,10 @@ $HARNESSCTL state transition <epic-id> VERIFY
 ## 与其他阶段的关系
 
 ```
-VERIFY (REJECTED) → $HARNESSCTL state transition <epic-id> FIX
-                   → /harness:fix <epic-id>
-                   → (内部) /harness:review <epic-id>
-                   → PASS → DONE
-                   → REJECTED → /harness:fix <epic-id> (再次)
+VERIFY (REJECTED)  → FIX → VERIFY（重新审查）→ PASS → BUILD
+BUILD  (FAIL)      → FIX → BUILD（重新编译）
+DEPLOY (FAIL)      → FIX → BUILD → DEPLOY → E2E
+E2E    (FAIL)      → FIX → BUILD → DEPLOY → E2E（完整重试）
 ```
 
 最多允许 3 轮 FIX 循环。超过 3 轮时，升级为人工干预，展示未解决的 CRITICAL 问题并暂停。

@@ -55,6 +55,12 @@ REQUIRED_ARTIFACTS[EXECUTE]="
 REQUIRED_ARTIFACTS[VERIFY]="
   $FEATURES_DIR/verification.json
 "
+REQUIRED_ARTIFACTS[E2E]="
+  $FEATURES_DIR/test-cases.md
+  $FEATURES_DIR/verify-cases/verify-receipt.json
+  $FEATURES_DIR/verify-cases/case-tracker.json
+  $FEATURES_DIR/verify-cases/verify-summary.md
+"
 REQUIRED_ARTIFACTS[DONE]="
   $FEATURES_DIR/delivery-summary.md
   $FEATURES_DIR/release-notes.md
