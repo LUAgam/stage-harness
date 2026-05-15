@@ -55,6 +55,18 @@ Output: Structured idea summary with initial assumption list.
 - Lead 将摘要合并进 `clarification-notes.md` 的 **Domain Frame** / **领域框架** 章节。
 - 若运行时已提供 profile/state 摘要，Lead 不得在 Step 2 前反复做低价值状态探测；拿到最小必要上下文后应立即派发 `domain-scout`。
 
+### Step 2.5 — Project Anchor Read（项目锚定读取，必选）
+
+domain-scout 完成后、Step 3 并行分析之前，Lead **必须**读取项目核心文档：
+
+1. 检查 `CLAUDE.md` 是否引用了项目 README；若有，读取该文件。
+2. 否则检查项目根目录是否存在 `README.md` 或 `README`；若有，读取该文件。
+3. 若均不存在，跳过并标注"项目无 README"。
+
+**目的**：为 Step 3 各并行 agent 提供项目架构上下文（组件职责、子系统边界、已有能力）。domain-scout 仅推断领域知识，不含项目实际技术架构。
+
+**硬约束**：1. 仅读取项目级文档（README），不做代码扫描。 2. 读取后提取的关键上下文应附加到 Step 3 各 agent prompt 中。
+
 ### Step 3 — Parallel Analysis（spawn 4 agents simultaneously）
 
 Launch in parallel:

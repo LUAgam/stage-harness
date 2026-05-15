@@ -97,7 +97,21 @@ $HARNESSCTL dispatch register <epic-id> CLARIFY --via=skill:harness-clarify
 - 产出 **`.harness/features/<epic-id>/domain-frame.json`**（轻量 JSON；完整 schema 以 `agents/domain-scout.md` 为准）。
 - **Step 0 与 `stage-gate check CLARIFY` 对齐的顶层必填键**：`business_goals`、`domain_constraints`、`semantic_signals`、`candidate_edge_cases`、`candidate_open_questions`（与 `scripts/clarify_gate_shared.py` 中 `DOMAIN_FRAME_REQUIRED_KEYS` 一致）。不得用旧 schema 顶层字段（如 `domain`、`subdomain`、`domain_signals` 等）替代上述键。
 - Lead 将摘要写入 `clarification-notes.md` 的 **`## Domain Frame`** 或 **`## 领域框架`** 小节（可与后续 Q&A 合并编辑，但门禁要求该标题存在）。
-- **硬检查**：若 `domain-frame.json` 尚不存在，禁止进入 Step 1/2/2.5，也禁止执行任何代码库扫描命令；优先完成该文件产出。
+- **硬检查**：若 `domain-frame.json` 尚不存在，禁止进入 Step 0.5/1/2/2.5，也禁止执行任何代码库扫描命令；优先完成该文件产出。
+
+### Step 0.5 — 项目锚定读取（Project Anchor Read，必选）
+
+domain-scout 完成后、Step 1/2 并行分析之前，Lead **必须**读取项目核心文档以建立架构上下文：
+
+1. 检查 `CLAUDE.md` 是否引用了项目 README（如 `[README](./OMS_README.md)`）；若引用存在，读取该文件。
+2. 若 `CLAUDE.md` 未引用 README，检查项目根目录是否存在 `README.md` 或 `README`；若存在，读取该文件。
+3. 若上述均不存在，跳过本步骤并在 `clarification-notes.md` 中标注"项目无 README，架构上下文仅来自 domain-frame"。
+
+**目的**：为后续并行 agent（尤其是 impact-analyst）提供项目级的架构地图 — 子系统职责、组件边界、已有能力等。domain-scout 仅基于需求描述推断领域知识，无法提供项目实际的技术架构信息。
+
+**硬约束**：
+- 仅读取项目级文档（README），不做代码扫描。
+- 读取后提取的关键上下文（组件列表、职责边界、已支持能力）应附加到 Step 2 各并行 agent 的 prompt 中。
 
 ### Step 1 — 需求澄清（Q&A）
 
