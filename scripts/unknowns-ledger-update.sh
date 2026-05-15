@@ -57,13 +57,30 @@ PYEOF
 add)
   JSON_INPUT="${3:-}"
   [[ -z "$JSON_INPUT" ]] && { echo "usage: add <epic-id> <json-file>" >&2; exit 1; }
+  if [[ ! -f "$JSON_INPUT" ]]; then
+    echo "ERROR: input file '$JSON_INPUT' does not exist" >&2
+    exit 1
+  fi
+  if [[ ! -r "$JSON_INPUT" ]]; then
+    echo "ERROR: input file '$JSON_INPUT' is not readable" >&2
+    exit 1
+  fi
+  # Staleness check: reject files older than the ledger itself
+  if [[ -f "$LEDGER_FILE" && "$JSON_INPUT" -ot "$LEDGER_FILE" ]]; then
+    echo "ERROR: input file '$JSON_INPUT' is older than unknowns-ledger.json — possible stale/leftover file from another epic. Use a unique path (e.g. mktemp) to avoid cross-epic contamination." >&2
+    exit 1
+  fi
   [[ -f "$LEDGER_FILE" ]] || { echo "Run 'init' first" >&2; exit 1; }
 
   python3 - <<PYEOF
 import json, sys, datetime
 
-ledger = json.load(open("$LEDGER_FILE"))
-new_entry = json.load(open("$JSON_INPUT"))
+try:
+    ledger = json.load(open("$LEDGER_FILE"))
+    new_entry = json.load(open("$JSON_INPUT"))
+except (json.JSONDecodeError, IOError) as e:
+    print(f"ERROR: failed to read/parse input file '$JSON_INPUT': {e}", file=sys.stderr)
+    sys.exit(1)
 
 # Validate required fields
 for field in ["id", "description", "discovered_at"]:

@@ -167,11 +167,28 @@ add)
     echo "usage: decision-bundle.sh add <epic-id> <json-file>" >&2
     exit 1
   fi
+  if [[ ! -f "$JSON_INPUT" ]]; then
+    echo "ERROR: input file '$JSON_INPUT' does not exist" >&2
+    exit 1
+  fi
+  if [[ ! -r "$JSON_INPUT" ]]; then
+    echo "ERROR: input file '$JSON_INPUT' is not readable" >&2
+    exit 1
+  fi
+  # Staleness check: reject files older than the bundle itself
+  if bundle_exists && [[ "$JSON_INPUT" -ot "$BUNDLE_FILE" ]]; then
+    echo "ERROR: input file '$JSON_INPUT' is older than decision-bundle.json — possible stale/leftover file from another epic. Use a unique path (e.g. mktemp) to avoid cross-epic contamination." >&2
+    exit 1
+  fi
   bundle_exists || { echo "Run 'generate' first" >&2; exit 1; }
   python3 - <<PYEOF
 import json, re, sys
 bundle = json.load(open("$BUNDLE_FILE"))
-new_decision = json.load(open("$JSON_INPUT"))
+try:
+    new_decision = json.load(open("$JSON_INPUT"))
+except (json.JSONDecodeError, IOError) as e:
+    print(f"ERROR: failed to read/parse '{sys.argv[0] if sys.argv else ''}' input file '$JSON_INPUT': {e}", file=sys.stderr)
+    sys.exit(1)
 # Ensure required fields
 for field in ["question", "category"]:
     if field not in new_decision:
