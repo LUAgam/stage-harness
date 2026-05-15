@@ -1,0 +1,82 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ECC Install State",
+  "type": "object",
+  "required": ["schemaVersion", "installedAt", "target", "request", "resolution", "source", "operations"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "ecc.install.v1"
+    },
+    "installedAt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "lastValidatedAt": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "target": {
+      "type": "object",
+      "required": ["id", "root", "installStatePath"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "target": { "type": ["string", "null"] },
+        "kind": { "type": "string", "enum": ["home", "project"] },
+        "root": { "type": "string", "minLength": 1 },
+        "installStatePath": { "type": "string", "minLength": 1 }
+      }
+    },
+    "request": {
+      "type": "object",
+      "required": ["profile", "modules", "includeComponents", "excludeComponents", "legacyLanguages", "legacyMode"],
+      "additionalProperties": false,
+      "properties": {
+        "profile": { "type": ["string", "null"] },
+        "modules": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "includeComponents": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "excludeComponents": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "legacyLanguages": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "legacyMode": { "type": "boolean" }
+      }
+    },
+    "resolution": {
+      "type": "object",
+      "required": ["selectedModules", "skippedModules"],
+      "additionalProperties": false,
+      "properties": {
+        "selectedModules": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "skippedModules": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "source": {
+      "type": "object",
+      "required": ["manifestVersion"],
+      "additionalProperties": false,
+      "properties": {
+        "repoVersion": { "type": ["string", "null"] },
+        "repoCommit": { "type": ["string", "null"] },
+        "manifestVersion": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "moduleId", "sourceRelativePath", "destinationPath", "strategy", "ownership", "scaffoldOnly"],
+        "properties": {
+          "kind": { "type": "string", "minLength": 1 },
+          "moduleId": { "type": "string", "minLength": 1 },
+          "sourcePath": { "type": "string" },
+          "sourceRelativePath": { "type": "string", "minLength": 1 },
+          "destinationPath": { "type": "string", "minLength": 1 },
+          "strategy": { "type": "string", "minLength": 1 },
+          "ownership": { "type": "string", "minLength": 1 },
+          "scaffoldOnly": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

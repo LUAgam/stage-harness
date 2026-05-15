@@ -42,7 +42,7 @@ Extract: key nouns (entities), verbs (operations), and named components.
 | `workspace_mode` | Strategy |
 |------------------|----------|
 | `multi-repo` | **Contract-first, repo-narrowing** (Section 3) |
-| `docs-heavy` | Prefer README, ADR, indexes; minimal code Grep; small blast radius unless REQ demands code |
+| `docs-heavy` | Prefer README, ADR, indexes; minimal code Grep; small blast radius unless REQ demands code. **Section 4.5 still applies unconditionally.** |
 | `infra-heavy` | Prefer IaC, CI, env modules; scope to changed stacks |
 | `monorepo` | Treat each top-level package/app as a potential “major module”; then Section 4 |
 | `single-repo` (default) | Section 4 |
@@ -96,6 +96,21 @@ If you stay single-agent, do the reconnaissance yourself using Grep and Glob:
 - API route definitions
 - Type definitions / interfaces
 ```
+
+### 4.5. Reverse Reference Tracking (MANDATORY — all workspace modes)
+
+> **This step is unconditional.** Regardless of `workspace_mode` (single-repo, multi-repo, docs-heavy, infra-heavy, monorepo), execute it after the initial forward scan (Sections 2–4) produces its first set of hit files.
+
+For every file identified by forward scanning:
+
+1. **Extract peer identifiers:** In each hit location, identify the enclosing data structure (array, map, enum, config block, pattern list, prompt template). Collect all sibling values at the same structural level — these are "peer identifiers."
+2. **Full-project grep:** Search the entire project for each peer identifier (all string forms: literal, regex, path, enum value, directory name, config key). Respect `scan.max_files_deep_read_per_scout` budget.
+3. **Differential merge:** Any file hit by reverse grep but NOT already in the forward scan results is a **candidate missed surface**. Evaluate whether the epic requires a corresponding change at that location.
+4. **Record findings:** Add confirmed locations to `## High/Medium Impact Surfaces` in `impact-scan.md`. For locations where impact is uncertain, add to `## Medium Impact Surfaces` with a note.
+
+**Why this is mandatory:** Forward scanning only finds code semantically related to the requirement keywords. But many registration points (routing tables, pattern-match lists, factory methods, prompt templates, doc-path mappings) share no keywords with the requirement — they only share structural peers with the already-found hits. Without reverse tracking, these are systematically invisible to forward search.
+
+**Example:** Forward scan finds `env.py` containing `"Postgresql-15"` in a list. Peer identifiers include `"Postgresql-15"`, `"pg_15"`, `"pg_9_2"`. Reverse grep for `pg_15` hits `sql_repair_service.py` and `prompt_cursor_agent.py` — files that forward scan missed because they contain no requirement keywords like `enhance_support_db` or `target_db`.
 
 ### 5. Dependency Mapping
 For each directly-impacted file:
@@ -186,6 +201,17 @@ The output must stay compatible with existing CLARIFY docs and downstream reader
 ## Files NOT Impacted
 <list key files explicitly ruled out, to prevent over-scoping>
 ```
+
+## Output Protocol (mandatory)
+
+Before calling Write to create `impact-scan.md`, you MUST first emit a text summary listing ALL discovered impact surfaces. This ensures the parent agent receives complete findings even if the Write call fails or the agent is truncated.
+
+The text summary must include:
+- Every file path identified as HIGH or MEDIUM impact
+- For each: the change type and one-line reason
+- Explicitly mention any hardcoded routing tables, pattern-match lists, or factory registrations found via Section 4.5
+
+Only AFTER emitting this text summary, proceed to Write the full `impact-scan.md`.
 
 ## Constraints
 - Do NOT modify files outside `.harness/features/<epic-id>/` (use Write only for harness artifacts listed above)

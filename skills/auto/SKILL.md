@@ -1,6 +1,6 @@
 # Skill: auto
 
-Autonomous execution mode — runs CLARIFY → SPEC → PLAN → EXECUTE → VERIFY without user interrupts (low/medium risk only).
+Autonomous execution mode — runs CLARIFY → SPEC → PLAN → EXECUTE → VERIFY → BUILD → DEPLOY → E2E → DONE without user interrupts (low/medium risk only).
 
 ## Purpose
 
@@ -42,11 +42,40 @@ Stage 4: EXECUTE
   → Workers never interrupt — BLOCKED tasks are deferred
   → Atomic commits per task
 
-Stage 5: VERIFY
-  → Run acceptance_council
-  → If APPROVED: proceed to DONE
-  → If APPROVED_WITH_WARNINGS: proceed with warning log
-  → If REJECTED: pause, surface to user (this always consumes a budget unit)
+Stage 5: VERIFY (conditional skip in auto mode)
+  → If risk_level = high: run acceptance_council normally
+     - If APPROVED / APPROVED_WITH_WARNINGS: proceed to BUILD
+     - If REJECTED: pause, surface to user (consumes a budget unit)
+  → If risk_level in [low, medium] AND config auto_skip_verify != false:
+     - SKIP acceptance_council entirely
+     - state transition: EXECUTE → VERIFY → BUILD (status log preserved)
+     - export HARNESS_SKIP_VERIFY_GATE=1 so harness-build accepts EXECUTE receipts as proof
+     - Proceed directly to BUILD
+
+Stage 6: BUILD
+  → Resolve build command via build skill (profile → code-aware infer → ask user)
+  → Auto-proceed if build/build-receipt.json status is PASS or SKIPPED
+  → If FAIL: state transition to FIX, surface error, exit loop
+
+Stage 7: DEPLOY
+  → Run deploy skill (multi sub-project aware: scan → infer → confirm → deploy)
+  → Auto-proceed if deploy/deploy-receipt.json status is PASS or SKIPPED
+  → If FAIL: state transition to FIX, then resume from BUILD on next loop
+
+Stage 8: E2E-TEST
+  → Run /stage-harness:harness-e2e-test (user-value-driven: generate-test-cases → verify-and-fix-cases)
+  → Result from verify-cases/verify-receipt.json (three states: PASS / PARTIAL / FAIL)
+  → If PASS: auto-proceed to DONE
+  → If PARTIAL (P0 all passed, some P1/P2/P3 failed): pause, surface failed cases, consume budget unit
+     - User accepts → proceed to DONE (record in delivery-summary.md known defects)
+     - User rejects → treat as FAIL
+  → If FAIL: synthesize verification.json from failed cases, state transition to FIX
+     → harness-fix → resume from BUILD → DEPLOY → harness-e2e-test (max 3 rounds)
+
+Stage 9: DONE
+  → Run release_council
+  → If RELEASE_READY / RELEASE_WITH_CONDITIONS: emit delivery-summary.md & release-notes.md, mark epic DONE
+  → If NOT_READY: pause, surface to user (consumes a budget unit)
 ```
 
 ## Auto Mode Safeguards
@@ -71,6 +100,8 @@ Reversible: yes (config change)
 - Security reviewer finds CRITICAL vulnerability
 - Test coverage drops below 60%
 - Any BLOCKED unknown rated `critical` impact
+- VERIFY skip path: any task in EXECUTE remains `blocked` when entering BUILD (skipping VERIFY removes the human gate, so blocked tasks must abort instead of pass through)
+- E2E-TEST FIX loop exceeds 3 rounds (BUILD → DEPLOY → harness-e2e-test cycle repeated 3 times without reaching PASS/PARTIAL)
 
 On abort: write `.harness/features/<epic-id>/auto-abort.md` with reason and last safe state.
 
@@ -84,6 +115,10 @@ During auto mode, show real-time progress:
   ⟳ PLAN running... (scouts: 4/4 complete, council: reviewing)
   ○ EXECUTE pending
   ○ VERIFY pending
+  ○ BUILD pending
+  ○ DEPLOY pending
+  ○ E2E-TEST pending
+  ○ DONE pending
 ```
 
 ## Usage

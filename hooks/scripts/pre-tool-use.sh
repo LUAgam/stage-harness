@@ -48,7 +48,79 @@ PY
 )"
 
 if [[ -z "$COMMAND" ]]; then
-  printf '{"continue": true}\n'
+  # Bash 工具被调用但 command 字段缺失或为空字符串。这通常是模型在长上下文下
+  # 生成了空参数 tool_use payload。直接放行会让 runtime 抛 InputValidationError
+  # 浪费 turn；这里返回 stopReason 让模型立刻自检并重发带 command 的调用。
+  STOP_REASON="Bash 工具调用缺少必填参数 command。请重新发起 Bash 工具调用，并在 input 对象中显式提供 {\"command\": \"<要执行的 shell 命令>\", \"description\": \"<简述>\"}。如本次只是想思考下一步而不需要执行命令，请不要发起工具调用，直接输出文本。" \
+    python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "continue": False,
+    "stopReason": os.environ["STOP_REASON"],
+}, ensure_ascii=False))
+PY
+
+  HARNESSCTL="${CLAUDE_PLUGIN_ROOT:-}/scripts/harnessctl"
+  if [[ -x "$HARNESSCTL" ]]; then
+    ACTIVE_EPIC_ID_FOR_EVENT=""
+    HARNESS_DIR_FOR_EVENT=".harness"
+    if [[ -d "$HARNESS_DIR_FOR_EVENT/epics" ]]; then
+      for epic_file in "$HARNESS_DIR_FOR_EVENT/epics/"*.json; do
+        [[ -f "$epic_file" ]] || continue
+        candidate_id="$(
+          EPIC_FILE="$epic_file" python3 - <<'PY' 2>/dev/null || true
+import json
+import os
+try:
+    with open(os.environ["EPIC_FILE"], encoding="utf-8") as fh:
+        print(json.load(fh).get("id", ""))
+except Exception:
+    print("")
+PY
+        )"
+        [[ -n "$candidate_id" ]] || continue
+        is_safe_epic_id "$candidate_id" || continue
+        candidate_stage="$(
+          STATE_FILE=".harness/features/$candidate_id/state.json" python3 - <<'PY' 2>/dev/null || true
+import json
+import os
+try:
+    with open(os.environ["STATE_FILE"], encoding="utf-8") as fh:
+        print(json.load(fh).get("current_stage", ""))
+except Exception:
+    print("")
+PY
+        )"
+        if [[ "$candidate_stage" != "DONE" && "$candidate_stage" != "CANCELLED" && -n "$candidate_stage" ]]; then
+          ACTIVE_EPIC_ID_FOR_EVENT="$candidate_id"
+          break
+        fi
+      done
+    fi
+
+    EVENT="$(ACTIVE_EPIC_ID_VALUE="$ACTIVE_EPIC_ID_FOR_EVENT" python3 - <<'PY' 2>/dev/null
+import json
+import os
+from datetime import datetime, timezone
+
+print(json.dumps({
+    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "epic_id": os.environ.get("ACTIVE_EPIC_ID_VALUE", ""),
+    "source": "hook",
+    "actor": "pre-tool-use",
+    "event_type": "empty_param_tool_call_blocked",
+    "status": "blocked",
+    "tool_name": "Bash",
+    "summary": "Bash invoked with empty/missing command parameter; instructed model to retry",
+    "payload": {"missing_param": "command"},
+    "artifact_paths": [],
+}, ensure_ascii=False))
+PY
+    )"
+    [[ -n "$EVENT" ]] && "$HARNESSCTL" patch trace --event-json "$EVENT" 2>/dev/null || true
+  fi
   exit 0
 fi
 

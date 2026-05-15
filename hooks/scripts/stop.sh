@@ -63,10 +63,74 @@ except:
 " 2>/dev/null)
   [[ "$current_stage" == "DONE" ]] && continue
 
+  # E2E 阶段异常停机判定：current_stage=E2E 但缺少 e2e-receipt.json
+  abnormal_stop="false"
+  abnormal_reason=""
+  if [[ "$current_stage" == "E2E" ]]; then
+    receipt_file="$HARNESS_DIR/features/$epic_id/e2e-receipt.json"
+    if [[ ! -f "$receipt_file" ]]; then
+      abnormal_stop="true"
+      abnormal_reason="E2E stage stopped without e2e-receipt.json"
+      python3 -c "
+import json
+p = '$state_file'
+try:
+    d = json.load(open(p))
+    rh = d.setdefault('runtime_health', {})
+    rh['consecutive_failures'] = int(rh.get('consecutive_failures', 0)) + 1
+    json.dump(d, open(p, 'w'), indent=2, ensure_ascii=False)
+except Exception as e:
+    import sys; print(f'warn: bump consecutive_failures failed: {e}', file=sys.stderr)
+" 2>/dev/null
+    fi
+  fi
+
+  # 空参工具调用循环检测：本 session 中 empty_param_tool_call_blocked 事件 ≥ 3 次
+  # 视为模型陷入空参循环。即便阶段产物存在也标记异常，提示用户介入。
+  if [[ "$abnormal_stop" != "true" && -n "$SESSION_ID" ]]; then
+    trace_file="$HARNESS_DIR/logs/epics/$epic_id/execution-trace.jsonl"
+    if [[ -f "$trace_file" ]]; then
+      empty_param_count=$(SESSION_ID="$SESSION_ID" TRACE_FILE="$trace_file" python3 -c "
+import json
+import os
+count = 0
+sid = os.environ['SESSION_ID']
+try:
+    with open(os.environ['TRACE_FILE']) as fh:
+        for line in fh:
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get('session_id') == sid and ev.get('event_type') == 'empty_param_tool_call_blocked':
+                count += 1
+except Exception:
+    pass
+print(count)
+" 2>/dev/null || echo 0)
+      if [[ "$empty_param_count" -ge 3 ]]; then
+        abnormal_stop="true"
+        abnormal_reason="Session looped on empty-parameter tool calls (count=$empty_param_count)"
+        python3 -c "
+import json
+p = '$state_file'
+try:
+    d = json.load(open(p))
+    rh = d.setdefault('runtime_health', {})
+    rh['consecutive_failures'] = int(rh.get('consecutive_failures', 0)) + 1
+    json.dump(d, open(p, 'w'), indent=2, ensure_ascii=False)
+except Exception as e:
+    import sys; print(f'warn: bump consecutive_failures failed: {e}', file=sys.stderr)
+" 2>/dev/null
+      fi
+    fi
+  fi
+
   # 生成 handoff.md
   next_command=$(stage_to_command "$current_stage")
-  python3 -c "
+  ABNORMAL_STOP="$abnormal_stop" ABNORMAL_REASON="$abnormal_reason" python3 -c "
 import json
+import os
 from datetime import datetime, timezone
 
 try:
@@ -80,13 +144,23 @@ try:
     title = epic.get('title', '$epic_id')
     cf = health.get('consecutive_failures', 0)
 
+    abnormal = os.environ.get('ABNORMAL_STOP') == 'true'
+    abnormal_reason = os.environ.get('ABNORMAL_REASON', '')
+
+    abnormal_block = ''
+    if abnormal:
+        abnormal_block = f'''> ⚠️ **异常停机**：{abnormal_reason}
+> 推荐立即执行：/stage-harness:harness-patch $epic_id
+
+'''
+
     hint = ''
     if cf >= 2:
         hint = f'\n⚠️  {cf} 次连续失败 — 考虑运行 /harness:patch $epic_id 诊断原因。'
 
     handoff = f'''# Handoff: {title}
 
-**Saved**: {datetime.now(timezone.utc).isoformat()}
+{abnormal_block}**Saved**: {datetime.now(timezone.utc).isoformat()}
 **Epic ID**: $epic_id
 **Current Stage**: {stage}
 **Risk Level**: {risk}
@@ -144,9 +218,17 @@ except Exception as e:
 
   # Emit trace events
   if [[ -x "$HARNESSCTL" ]]; then
-    # session_stopped
-    EVENT=$(python3 -c "
+    # session_stopped (or stage_abnormal_stop)
+    EVENT=$(ABNORMAL_STOP="$abnormal_stop" ABNORMAL_REASON="$abnormal_reason" python3 -c "
 import json
+import os
+abnormal = os.environ.get('ABNORMAL_STOP') == 'true'
+abnormal_reason = os.environ.get('ABNORMAL_REASON', '')
+cf = 0
+try:
+    cf = json.load(open('$state_file')).get('runtime_health', {}).get('consecutive_failures', 0)
+except:
+    pass
 print(json.dumps({
   'ts': __import__('datetime').datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
   'session_id': '${SESSION_ID}',
@@ -154,10 +236,10 @@ print(json.dumps({
   'stage': '${current_stage}',
   'source': 'hook',
   'actor': 'stop',
-  'event_type': 'session_stopped',
-  'status': 'ok',
-  'summary': 'Session stopped, handoff written',
-  'payload': {'consecutive_failures': $(python3 -c "import json; d=json.load(open('$state_file')); print(d.get('runtime_health',{}).get('consecutive_failures',0))" 2>/dev/null || echo 0)},
+  'event_type': 'stage_abnormal_stop' if abnormal else 'session_stopped',
+  'status': 'warn' if abnormal else 'ok',
+  'summary': abnormal_reason if abnormal else 'Session stopped, handoff written',
+  'payload': {'consecutive_failures': cf, 'abnormal': abnormal, 'reason': abnormal_reason} if abnormal else {'consecutive_failures': cf},
   'artifact_paths': ['.harness/features/${epic_id}/handoff.md'],
 }))
 " 2>/dev/null)
