@@ -1,0 +1,13 @@
+{
+  "epic_id": "",
+  "e2e_command": "",
+  "status": "PASS",
+  "total": 0,
+  "passed": 0,
+  "failed": 0,
+  "skipped": 0,
+  "failed_cases": [],
+  "stdout": "",
+  "started_at": "",
+  "completed_at": ""
+}
