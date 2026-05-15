@@ -299,6 +299,31 @@ class HarnessctlStartTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(f".harness/ not found at {child / '.harness'}", result.stderr)
 
+    def test_harness_root_flag_resolves_explicit_harness_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            run_harnessctl(tmp_path, "--project-root", str(tmp_path), "init")
+            created = run_harnessctl(tmp_path, "--project-root", str(tmp_path),
+                                     "epic", "create", "Root flag epic", "--json")
+            self.assertEqual(created.returncode, 0, created.stderr)
+            epic_id = json.loads(created.stdout)["id"]
+
+            nested = tmp_path / "worktree" / "nested"
+            nested.mkdir(parents=True)
+            result = run_harnessctl(nested, "--harness-root", str(tmp_path / ".harness"),
+                                    "epic", "show", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["id"], epic_id)
+
+    def test_missing_harness_error_includes_recovery_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            result = run_harnessctl(tmp_path, "epic", "list")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--harness-root", result.stderr)
+            self.assertIn("Do not manually create or edit .harness JSON", result.stderr)
+
     def test_epic_create_accepts_flag_title_and_description(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

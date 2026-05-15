@@ -1,5 +1,6 @@
 """Tests for Feedback Subsystem v2 features."""
 import json
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -97,6 +98,31 @@ class TestReCompletionMarker(unittest.TestCase):
             fb["decision"] = "REOPEN_PLAN"
             fb_path.write_text(json.dumps(fb))
 
+            state_path = tmp_path / ".harness" / "features" / epic_id / "state.json"
+            state = json.loads(state_path.read_text())
+            state["pending_re_completion"] = {
+                "feedback_id": "HFB-001",
+                "stages": ["PLAN"],
+                "completed_stages": [],
+                "created_at": "2026-05-13T10:00:00Z",
+            }
+            state_path.write_text(json.dumps(state))
+
+            task_graph = tmp_path / ".harness" / "features" / epic_id / "task-graph.json"
+            task_graph.write_text(json.dumps({"tasks": [{"id": "T-1", "source_feedback": "HFB-001"}]}))
+            digest = "sha256:" + hashlib.sha256(task_graph.read_bytes()).hexdigest()[:16]
+            manifest = tmp_path / ".harness" / "features" / epic_id / "feedback" / "HFB-001.revision-manifest.json"
+            manifest.write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "stage": "PLAN",
+                "changed_artifacts": [{
+                    "path": "task-graph.json",
+                    "before_hash": "sha256:old",
+                    "after_hash": digest,
+                    "evidence": "test",
+                }],
+            }))
+
             # Write revision-diff at the expected location (features/<epic>/revision-diff-HFB-001.md)
             rd_path = (tmp_path / ".harness" / "features" / epic_id /
                       "revision-diff-HFB-001.md")
@@ -117,6 +143,162 @@ class TestReCompletionMarker(unittest.TestCase):
             self.assertTrue(marker.exists())
             mc = json.loads(marker.read_text())
             self.assertEqual(mc["stage"], "PLAN")
+            self.assertTrue(mc["validated"])
+            state = json.loads(state_path.read_text())
+            self.assertNotIn("pending_re_completion", state)
+
+    def test_re_complete_requires_pending_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                          "--epic-id", epic_id, "--text", "Missing feature")
+            fb_path = (tmp_path / ".harness" / "features" / epic_id /
+                      "feedback" / "HFB-001.json")
+            fb = json.loads(fb_path.read_text())
+            fb["status"] = "reopened"
+            fb["decision"] = "REOPEN_PLAN"
+            fb_path.write_text(json.dumps(fb))
+
+            result = run_harnessctl(tmp_path, "feedback", "re-complete",
+                                   "--epic-id", epic_id, "--feedback-id", "HFB-001",
+                                   "--stage", "PLAN", "--json")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("pending_re_completion", result.stderr)
+
+    def test_re_plan_creates_backing_task_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                          "--epic-id", epic_id, "--text", "Missing feature")
+            fb_path = (tmp_path / ".harness" / "features" / epic_id /
+                      "feedback" / "HFB-001.json")
+            fb = json.loads(fb_path.read_text())
+            fb["status"] = "reopened"
+            fb["decision"] = "REOPEN_PLAN"
+            fb_path.write_text(json.dumps(fb))
+            amendment = tmp_path / ".harness" / "features" / epic_id / "feedback" / "HFB-001.amendment-plan.json"
+            amendment.write_text(json.dumps({
+                "source_verdict": "REOPEN_PLAN",
+                "target_stage": "PLAN",
+                "tasks_to_add": [{
+                    "title": "Implement missing behavior",
+                    "surface": "backend",
+                    "acceptance_criteria": ["works"],
+                }],
+                "coverage_updates": [],
+            }))
+
+            result = run_harnessctl(tmp_path, "feedback", "re-plan",
+                                   "--epic-id", epic_id,
+                                   "--feedback-id", "HFB-001",
+                                   "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            task_files = list((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            self.assertEqual(len(task_files), 1)
+            task = json.loads(task_files[0].read_text())
+            self.assertEqual(task["source_feedback"], "HFB-001")
+            task_graph = json.loads((tmp_path / ".harness" / "features" / epic_id /
+                                     "task-graph.json").read_text())
+            self.assertEqual(task_graph["tasks"][0]["id"], task["id"])
+
+    def test_re_plan_preserves_in_batch_temp_dependencies_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                          "--epic-id", epic_id, "--text", "Missing feature")
+            fb_path = (tmp_path / ".harness" / "features" / epic_id /
+                      "feedback" / "HFB-001.json")
+            fb = json.loads(fb_path.read_text())
+            fb["status"] = "reopened"
+            fb["decision"] = "REOPEN_PLAN"
+            fb_path.write_text(json.dumps(fb))
+            amendment = tmp_path / ".harness" / "features" / epic_id / "feedback" / "HFB-001.amendment-plan.json"
+            amendment.write_text(json.dumps({
+                "source_verdict": "REOPEN_PLAN",
+                "target_stage": "PLAN",
+                "tasks_to_add": [
+                    {"id": "tmp-a", "title": "Create schema", "surface": "backend"},
+                    {"id": "tmp-b", "title": "Use schema", "surface": "backend", "depends_on": ["tmp-a"]},
+                ],
+                "coverage_updates": [{"requirement": "tmp-a", "task": "tmp-a"}],
+            }))
+
+            for _ in range(2):
+                result = run_harnessctl(tmp_path, "feedback", "re-plan",
+                                       "--epic-id", epic_id,
+                                       "--feedback-id", "HFB-001",
+                                       "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            task_files = sorted((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            self.assertEqual(len(task_files), 2)
+            tasks = [json.loads(path.read_text()) for path in task_files]
+            by_title = {task["title"]: task for task in tasks}
+            self.assertEqual(by_title["Use schema"]["dependencies"], [by_title["Create schema"]["id"]])
+            task_graph = json.loads((tmp_path / ".harness" / "features" / epic_id /
+                                     "task-graph.json").read_text())
+            self.assertEqual(len(task_graph["tasks"]), 2)
+            graph_by_title = {task["title"]: task for task in task_graph["tasks"]}
+            self.assertEqual(graph_by_title["Use schema"]["dependencies"], [by_title["Create schema"]["id"]])
+            coverage = json.loads((tmp_path / ".harness" / "features" / epic_id /
+                                   "coverage-matrix.json").read_text())
+            self.assertEqual(len(coverage["coverage"]), 1)
+            self.assertEqual(coverage["coverage"][0]["task"], by_title["Create schema"]["id"])
+            self.assertEqual(coverage["coverage"][0]["requirement"], "tmp-a")
+            tasks_md = (tmp_path / ".harness" / "features" / epic_id / "TASKS.md").read_text()
+            self.assertEqual(tasks_md.count("Create schema"), 1)
+            self.assertEqual(tasks_md.count("Use schema"), 1)
+
+    def test_re_plan_repairs_existing_task_dependencies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            (fb_dir / "HFB-001.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "epic_id": epic_id,
+                "status": "reopened",
+                "decision": "REOPEN_PLAN",
+                "text": "x",
+            }))
+            created_a = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                       "Create schema", "--json")
+            task_a = json.loads(created_a.stdout)["id"]
+            created_b = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                       "Use schema", "--json")
+            task_b = json.loads(created_b.stdout)["id"]
+            graph_path = tmp_path / ".harness" / "features" / epic_id / "task-graph.json"
+            graph_path.write_text(json.dumps({
+                "tasks": [
+                    {"id": task_a, "source_feedback": "HFB-001", "source_task_id": "tmp-a", "title": "Create schema", "surface": "backend", "dependencies": []},
+                    {"id": task_b, "source_feedback": "HFB-001", "source_task_id": "tmp-b", "title": "Use schema", "surface": "backend", "dependencies": []},
+                ]
+            }))
+            amendment = fb_dir / "HFB-001.amendment-plan.json"
+            amendment.write_text(json.dumps({
+                "source_verdict": "REOPEN_PLAN",
+                "target_stage": "PLAN",
+                "tasks_to_add": [
+                    {"id": "tmp-a", "title": "Create schema", "surface": "backend"},
+                    {"id": "tmp-b", "title": "Use schema", "surface": "backend", "depends_on": ["tmp-a"]},
+                ],
+                "coverage_updates": [],
+            }))
+
+            result = run_harnessctl(tmp_path, "feedback", "re-plan",
+                                   "--epic-id", epic_id,
+                                   "--feedback-id", "HFB-001",
+                                   "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            task_b_file = next(
+                path for path in (tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json")
+                if json.loads(path.read_text())["id"] == task_b
+            )
+            self.assertEqual(json.loads(task_b_file.read_text())["dependencies"], [task_a])
 
 
 class TestReopenGuard(unittest.TestCase):
@@ -165,6 +347,7 @@ class TestReopenGuard(unittest.TestCase):
                 "feedback_id": "HFB-001",
                 "stage": "PLAN",
                 "completed_at": "2026-05-13T10:00:00Z",
+                "validated": True,
             }
             (fb_dir / "HFB-001.re-completion.json").write_text(json.dumps(marker))
 

@@ -302,47 +302,119 @@ PY
   fi
 fi
 
-# Guard: block Bash commands that write to managed feedback artifacts
+# Guard: block Bash commands that write to managed harness artifacts.
+# Policy: protected path hit + non-trusted command source => blocked.
 BASH_WRITES_PROTECTED="$(
   COMMAND_VALUE="$COMMAND" python3 - <<'PY' 2>/dev/null || true
 import os
+import posixpath
 import re
+import shlex
 
 cmd = os.environ.get("COMMAND_VALUE", "")
+cwd = os.getcwd().replace("\\", "/")
 
-# Protected path patterns
 protected = [
-    r"feedback/HFB-[^/]*\.evidence-pack\.json",
-    r"councils/feedback_triage_council/[^/]+/votes/[^/]+\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/epics/[^\"'\s;|&]+\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/features/[^/]+/state\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/tasks/[^\"'\s;|&]+\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/features/[^/]+/feedback/HFB-[^\"'\s;|&]+\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/features/[^/]+/artifact-status\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/features/[^/]+/coverage-matrix\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/features/[^/]+/task-graph\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/features/[^/]+/surface-routing\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/features/[^/]+/domain-frame\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/features/[^/]+/(?:receipts|runtime-receipts|runs)/[^\"'\s;|&]+\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/features/[^/]+/verification\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/features/[^/]+/councils/.*/(?:verdict|metadata)\.json",
+    r"(?:^|[\"'\s/>])(?:\./)?\.harness/features/[^/]+/councils/.*/votes/[^\"'\s;|&]+\.json",
+    r"feedback/HFB-[^\"'\s;|&]*\.evidence-pack\.json",
+    r"councils/feedback_triage_council/[^/]+/votes/[^\"'\s;|&]+\.json",
     r"councils/feedback_triage_council/[^/]+/verdict\.json",
     r"councils/feedback_triage_council/[^/]+/metadata\.json",
-    r"feedback/HFB-[^/]*\.triage\.json",
+    r"feedback/HFB-[^\"'\s;|&]*\.triage\.json",
 ]
 
-# Write indicators in shell commands — must indicate actual file creation/modification
-write_ops = [r"(?<![12])>\s*\S", r">>\s*\S", r"\btee\s+\S", r"\bcp\s+\S", r"\bmv\s+\S",
-             r"open\s*\(.*['\"]w['\"]", r"write_text\s*\(", r"atomic_write",
-             r"\becho\b.*>", r"\bprintf\b.*>", r"\bcat\b.*>"]
+write_ops = [
+    r"(?<![12])>\s*\S", r">>\s*\S", r"\btee\s+\S", r"\bcp\s+\S", r"\bmv\s+\S",
+    r"\brm\s+(?:-[A-Za-z]+\s+)*\S",
+    r"\bsed\s+[^;&|]*\s-i(?:\s|$)", r"\bperl\s+[^;&|]*\s-i(?:\s|$)",
+    r"open\s*\([^)]*['\"]w['\"]", r"write_text\s*\(", r"json\.dump\s*\(",
+    r"atomic_write", r"atomic_write_json", r"\becho\b.*>", r"\bprintf\b.*>", r"\bcat\b.*>",
+]
 
-has_protected = any(re.search(p, cmd) for p in protected)
-has_write = any(re.search(w, cmd) for w in write_ops)
+trusted_basenames = {"harnessctl", "harnessctl.py"}
+logical_cwd = posixpath.normpath(cwd)
+protected_cwd = bool(re.search(r"(?:^|/)\.harness(?:/|$)", cwd))
 
-# Also catch: python3 -c '... json.dump/open(...,"w") ... <protected_path> ...'
-# But NOT: python3 -m json.tool (read-only formatting)
-if not has_write and re.search(r"python3?\s+(-c|<<)", cmd):
-    if re.search(r"(json\.dump|open\s*\(|write|atomic_write)", cmd):
-        if any(re.search(p, cmd) for p in protected):
-            has_write = True
+protected_shell_write = re.compile(
+    r"(?:>>?|tee(?:\s+-[A-Za-z]+\b)*|cp|mv|rm)\s*[^;&|]*['\"]?(?:[^'\"\s;&|]*/)?\.harness(?:/|$)"
+)
 
-if has_protected and has_write:
-    print("BLOCKED")
-else:
-    print("OK")
+for segment in re.split(r"(?:&&|\|\||;|(?<!\|)\|(?!\|))", cmd):
+    segment = segment.strip()
+    if not segment:
+        continue
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        tokens = segment.split()
+    if tokens:
+        idx = 0
+        while idx < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", tokens[idx]):
+            idx += 1
+        if idx < len(tokens) and tokens[idx] == "cd" and idx + 1 < len(tokens):
+            target = tokens[idx + 1].replace("\\", "/")
+            if target == "-":
+                protected_cwd = False
+                logical_cwd = cwd
+            elif target.startswith("/"):
+                logical_cwd = posixpath.normpath(target)
+            else:
+                logical_cwd = posixpath.normpath(posixpath.join(logical_cwd, target))
+            protected_cwd = bool(re.search(r"(?:^|/)\.harness(?:/|$)", logical_cwd))
+            continue
+    has_protected = any(re.search(p, segment) for p in protected)
+    has_write = any(re.search(w, segment) for w in write_ops)
+    if protected_cwd and has_write:
+        print("BLOCKED")
+        raise SystemExit(0)
+    if not (has_protected and has_write):
+        continue
+    if not tokens:
+        print("BLOCKED")
+        raise SystemExit(0)
+    idx = 0
+    while idx < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", tokens[idx]):
+        idx += 1
+    if idx >= len(tokens):
+        print("BLOCKED")
+        raise SystemExit(0)
+    executable = tokens[idx].split("/")[-1]
+    trusted = False
+    if executable in trusted_basenames:
+        trusted = True
+    elif executable in {"python", "python3"} and idx + 1 < len(tokens):
+        script_name = tokens[idx + 1].split("/")[-1]
+        if script_name == "harnessctl.py":
+            trusted = True
+
+    if trusted and ("$(" in segment or "`" in segment):
+        print("BLOCKED")
+        raise SystemExit(0)
+    if trusted and protected_shell_write.search(segment):
+        print("BLOCKED")
+        raise SystemExit(0)
+    if not trusted:
+        print("BLOCKED")
+        raise SystemExit(0)
+
+print("OK")
 PY
 )"
 
 if [[ "$BASH_WRITES_PROTECTED" == "BLOCKED" ]]; then
-  STOP_REASON="禁止通过 Bash 写入 feedback 核心产物（evidence-pack / votes / verdict / triage）。必须使用 harnessctl 标准命令：feedback evidence-pack / feedback write-vote / feedback aggregate-triage。" \
+  STOP_REASON="禁止通过非受信 Bash 写入 .harness 受控产物（状态机、task、feedback、结构化证据或 receipt）。必须使用 harnessctl 标准命令或受信 runtime adapter。" \
     python3 - <<'PY'
 import json
 import os

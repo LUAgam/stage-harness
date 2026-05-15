@@ -62,7 +62,7 @@ TRANSITIONS = {
     "DONE":    [],
 }
 
-TASK_STATUSES = ["pending", "in_progress", "done", "failed", "blocked"]
+TASK_STATUSES = ["pending", "in_progress", "done", "failed", "blocked", "cancelled"]
 PROFILE_UNKNOWN = "unknown"
 PROFILE_NEUTRAL_DEFAULTS = {
     "type": PROFILE_UNKNOWN,
@@ -855,6 +855,15 @@ def err(message: str) -> None:
     sys.exit(1)
 
 
+def recovery_hint_for_harness(h: Path) -> str:
+    """Return a recovery hint that discourages manual .harness edits."""
+    return (
+        "Recovery: if you are in a worktree or nested checkout, rerun with "
+        f"`--harness-root {h}` or `--project-root {h.parent}`. "
+        "Do not manually create or edit .harness JSON state files."
+    )
+
+
 def out_json(data) -> None:
     """Print data as JSON to stdout."""
     print(json.dumps(data, indent=2, ensure_ascii=False))
@@ -1056,7 +1065,7 @@ def load_epic(h: Path, epic_id: str) -> dict:
     """Load an epic JSON file."""
     path = h / "epics" / f"{epic_id}.json"
     if not path.exists():
-        err(f"Epic not found: {epic_id}")
+        err(f"Epic not found: {epic_id}. {recovery_hint_for_harness(h)}")
     return load_json(path)
 
 
@@ -1069,7 +1078,7 @@ def load_state(h: Path, epic_id: str) -> dict:
     """Load state JSON for an epic."""
     path = h / "features" / epic_id / "state.json"
     if not path.exists():
-        err(f"State not found for epic: {epic_id}")
+        err(f"State not found for epic: {epic_id}. {recovery_hint_for_harness(h)}")
     return load_json(path)
 
 
@@ -1157,6 +1166,106 @@ def receipt_dirs_for_epic(h: Path, epic_id: str) -> list[Path]:
 def canonical_receipts_dir(h: Path, epic_id: str) -> Path:
     """Return the canonical receipt directory for new writes."""
     return h / "features" / epic_id / "receipts"
+
+
+def find_task_receipt(h: Path, epic_id: str, task_id: str) -> tuple[dict | None, Path | None, str]:
+    """Find and parse the canonical receipt for a task."""
+    for directory in receipt_dirs_for_epic(h, epic_id):
+        receipt_path = directory / f"{task_id}.json"
+        if not receipt_path.exists():
+            continue
+        try:
+            receipt = load_json(receipt_path)
+        except SystemExit:
+            return None, receipt_path, "invalid JSON"
+        return receipt, receipt_path, ""
+    return None, None, "missing"
+
+
+def _receipt_value_passed(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return normalized in {"pass", "passed", "ok", "success", "true"}
+    return False
+
+
+def _receipt_status_is_blocking(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"skipped", "skip", "warn", "warning", "partial", "failed", "fail", "error"}
+    return False
+
+
+def _receipt_dict_has_explicit_pass(value: dict) -> bool:
+    """Return True only when a receipt result dict explicitly records a pass."""
+    status = value.get("status", "")
+    if status and _receipt_value_passed(status):
+        return True
+    if "passed" in value and _receipt_value_passed(value.get("passed")):
+        return True
+    return False
+
+
+def runtime_basics_errors(task: dict, receipt: dict | None, receipt_path: Path | None = None) -> list[str]:
+    """Validate the minimum runtime evidence required by runtime_required tasks."""
+    if not task.get("runtime_required"):
+        return []
+    task_id = task.get("id", "")
+    label = str(receipt_path) if receipt_path else f"receipt for {task_id}"
+    errors: list[str] = []
+    if not isinstance(receipt, dict):
+        return [f"{label} (runtime_required task has no receipt)"]
+
+    affected = receipt.get("affected_repos") or receipt.get("affected_repositories")
+    affected_ok = False
+    if isinstance(affected, list):
+        affected_ok = any(str(item).strip() for item in affected)
+    elif isinstance(affected, str):
+        affected_ok = bool(affected.strip())
+    if not affected_ok:
+        errors.append(f"{label} (runtime_required task missing affected_repos)")
+
+    build = receipt.get("build", receipt.get("build_status"))
+    if isinstance(build, dict):
+        status = build.get("status", "")
+        if _receipt_status_is_blocking(status):
+            errors.append(f"{label} (build.status={status})")
+        if build.get("executed") is False and not build.get("waiver"):
+            errors.append(f"{label} (build not executed without waiver)")
+        if not _receipt_dict_has_explicit_pass(build):
+            errors.append(f"{label} (runtime_required task missing passing build_status)")
+    elif _receipt_status_is_blocking(build) or not _receipt_value_passed(build):
+        errors.append(f"{label} (runtime_required task missing passing build_status)")
+
+    smoke = receipt.get("smoke", receipt.get("smoke_status", receipt.get("verify_status")))
+    if isinstance(smoke, dict):
+        status = smoke.get("status", "")
+        if _receipt_status_is_blocking(status):
+            errors.append(f"{label} (smoke/verify.status={status})")
+        if not _receipt_dict_has_explicit_pass(smoke):
+            errors.append(f"{label} (runtime_required task missing passing smoke_status or verify_status)")
+    elif _receipt_status_is_blocking(smoke) or not _receipt_value_passed(smoke):
+        errors.append(f"{label} (runtime_required task missing passing smoke_status or verify_status)")
+
+    return errors
+
+
+def task_receipt_errors(h: Path, task: dict) -> list[str]:
+    """Validate that a task has a parseable receipt and runtime evidence when required."""
+    task_id = task.get("id", "")
+    epic_id = task.get("epic_id", "")
+    receipt, receipt_path, reason = find_task_receipt(h, epic_id, task_id)
+    if receipt is None:
+        path_label = str(receipt_path) if receipt_path else f"{h / 'features' / epic_id}/receipts/{task_id}.json"
+        return [f"{path_label} (task {task_id} receipt {reason})"]
+    if not isinstance(receipt, dict):
+        return [f"{receipt_path} (task {task_id} receipt must be a JSON object)"]
+    errors: list[str] = []
+    if receipt.get("task_id") and receipt.get("task_id") != task_id:
+        errors.append(f"{receipt_path} (receipt task_id mismatch: {receipt.get('task_id')} != {task_id})")
+    errors.extend(runtime_basics_errors(task, receipt, receipt_path))
+    return errors
 
 
 def spec_path_for_epic(h: Path, epic_id: str) -> Path:
@@ -3925,6 +4034,16 @@ def cmd_task_start(args, h: Path) -> None:
 
 
 def cmd_task_done(args, h: Path) -> None:
+    task, _task_path = load_task(h, args.task_id)
+    errors = task_receipt_errors(h, task)
+    if errors:
+        if args.json:
+            out_json({"status": "error", "task_id": args.task_id, "errors": errors})
+        else:
+            print(f"Cannot mark task {args.task_id} done:", file=sys.stderr)
+            for e in errors:
+                print(f"  - {e}", file=sys.stderr)
+        sys.exit(1)
     _update_task_status(args, h, "done")
 
 
@@ -3934,6 +4053,102 @@ def cmd_task_fail(args, h: Path) -> None:
 
 def cmd_task_block(args, h: Path) -> None:
     _update_task_status(args, h, "blocked")
+
+
+def cmd_task_cancel(args, h: Path) -> None:
+    task, task_path = load_task(h, args.task_id)
+    if normalize_task_status(task.get("status", "pending")) == "done":
+        err(f"Cannot cancel completed task {args.task_id}")
+    epic_id = task.get("epic_id", "")
+    updated = dict(task)
+    updated["status"] = "cancelled"
+    if getattr(args, "reason", ""):
+        updated["cancel_reason"] = args.reason
+    updated["cancelled_at"] = now_iso()
+    atomic_write_json(task_path, updated)
+    cascaded = []
+    for dependent_file in iter_task_files(h, epic_id) or []:
+        try:
+            dependent = load_json(dependent_file)
+        except SystemExit:
+            continue
+        if args.task_id not in dependent.get("dependencies", []):
+            continue
+        status = normalize_task_status(dependent.get("status", "pending"))
+        if status not in ("pending", "blocked"):
+            continue
+        dependent = dict(dependent)
+        dependent["status"] = "cancelled"
+        dependent["cancel_reason"] = f"dependency {args.task_id} was cancelled"
+        dependent["cancelled_at"] = now_iso()
+        atomic_write_json(dependent_file, dependent)
+        cascaded.append(dependent.get("id", dependent_file.stem))
+    append_trace_event(h, _make_trace_event(
+        epic_id,
+        "task_status_changed",
+        task_id=args.task_id,
+        command_name="harnessctl task cancel",
+        summary=f"Task {args.task_id} -> cancelled",
+        payload={
+            "task_id": args.task_id,
+            "new_status": "cancelled",
+            "reason": getattr(args, "reason", ""),
+            "cascaded_cancelled": cascaded,
+        },
+    ))
+    if args.json:
+        out_json({**updated, "cascaded_cancelled": cascaded})
+    else:
+        print(f"Task {args.task_id} status -> cancelled")
+        if cascaded:
+            print(f"Cascaded cancelled: {', '.join(cascaded)}")
+
+
+def cmd_task_update_deps(args, h: Path) -> None:
+    task, task_path = load_task(h, args.task_id)
+    if not args.clear and args.dep is None:
+        err("task update-deps requires --dep or --clear")
+    task_by_id = {}
+    for task_file in iter_task_files(h, task.get("epic_id", "")) or []:
+        try:
+            existing = load_json(task_file)
+        except SystemExit:
+            continue
+        if existing.get("id"):
+            task_by_id[existing["id"]] = existing
+    deps = [] if args.clear else list(args.dep or [])
+    missing = [dep for dep in deps if dep not in task_by_id]
+    if missing:
+        err(f"Unknown dependency task(s): {', '.join(missing)}")
+    updated = dict(task)
+    updated["dependencies"] = deps
+    atomic_write_json(task_path, updated)
+    graph_path = h / "features" / task.get("epic_id", "") / "task-graph.json"
+    if graph_path.exists():
+        try:
+            graph = load_json(graph_path)
+            changed = False
+            for entry in graph.get("tasks", []):
+                if isinstance(entry, dict) and entry.get("id") == args.task_id:
+                    entry["dependencies"] = deps
+                    entry.pop("depends_on", None)
+                    changed = True
+            if changed:
+                atomic_write_json(graph_path, graph)
+        except SystemExit:
+            pass
+    append_trace_event(h, _make_trace_event(
+        task.get("epic_id", ""),
+        "task_dependencies_updated",
+        task_id=args.task_id,
+        command_name="harnessctl task update-deps",
+        summary=f"Task {args.task_id} dependencies updated",
+        payload={"task_id": args.task_id, "dependencies": deps},
+    ))
+    if args.json:
+        out_json(updated)
+    else:
+        print(f"Task {args.task_id} dependencies -> {', '.join(deps) if deps else '(none)'}")
 
 
 # ---------------------------------------------------------------------------
@@ -4034,7 +4249,7 @@ def cmd_state_next(args, h: Path) -> None:
             try:
                 t = load_json(f)
                 status = normalize_task_status(t.get("status", "pending"))
-                if status not in ("done", "blocked"):
+                if status not in ("done", "cancelled"):
                     not_done.append(t["id"])
             except SystemExit:
                 continue
@@ -4106,7 +4321,7 @@ def cmd_state_transition(args, h: Path) -> None:
             if rc_file.exists():
                 try:
                     rc_data = json.loads(rc_file.read_text(encoding="utf-8"))
-                    if rc_data.get("stage", "").upper() == current:
+                    if rc_data.get("stage", "").upper() == current and rc_data.get("validated") is True:
                         # Auto-mark as completed
                         rc_completed.append(current)
                         pending_rc["completed_stages"] = rc_completed
@@ -4337,7 +4552,8 @@ def cmd_task_next(args, h: Path) -> None:
             print("No pending tasks remaining.")
         return
 
-    # Find task whose dependencies are all done
+    # Find task whose dependencies are completed; cancelled dependencies block
+    # downstream scheduling until the plan explicitly changes those edges.
     done_ids: set = set()
     for f in iter_task_files(h, epic_id) or []:
         try:
@@ -4411,6 +4627,7 @@ STAGE_GATE_ARTIFACTS = {
         "{features_dir}/delivery-summary.md",
         "{features_dir}/release-notes.md",
         "{features_dir}/councils/verdict-release_council.json",
+        "{features_dir}/verification.json",
     ],
 }
 
@@ -4908,6 +5125,33 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
         for msg in _plan_multi_repo_repo_fanin_summary_gate_errors(features_dir, h):
             missing.append(msg)
 
+    if stage == "EXECUTE":
+        # Validate every semantically done task has a supported receipt.
+        for task_file in iter_task_files(h, epic_id) or []:
+            try:
+                task_data = load_json(task_file)
+            except SystemExit:
+                missing.append(f"{task_file} (invalid JSON)")
+                continue
+            if normalize_task_status(task_data.get("status", "pending")) == "done":
+                missing.extend(task_receipt_errors(h, task_data))
+        # Check no unresolved feedback
+        fb_dir = features_dir / "feedback"
+        if fb_dir.exists():
+            for fb_file in sorted(fb_dir.glob("HFB-*.json")):
+                if fb_file.name.endswith(".triage.json") or fb_file.name.endswith(".evidence-pack.json"):
+                    continue
+                if ".re-completion" in fb_file.name or ".related-gap-scan" in fb_file.name:
+                    continue
+                try:
+                    fb_data = json.loads(fb_file.read_text(encoding="utf-8"))
+                    fb_status = fb_data.get("status", "")
+                    if fb_status in ("submitted", "triaging", "triaged", "reopened", "amending"):
+                        fb_id = fb_data.get("feedback_id", fb_file.stem)
+                        warnings.append(f"Feedback {fb_id} still in status '{fb_status}' — resolve before VERIFY")
+                except (json.JSONDecodeError, OSError):
+                    continue
+
     if stage == "VERIFY":
         verification_path = features_dir / "verification.json"
         if verification_path.exists():
@@ -4949,6 +5193,66 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
             except SystemExit:
                 missing.append(f"{verdict_path} (invalid JSON)")
 
+        fb_dir = features_dir / "feedback"
+        if fb_dir.exists():
+            for fb_file in sorted(fb_dir.glob("HFB-*.json")):
+                if "." in fb_file.stem.replace("HFB-", ""):
+                    continue
+                try:
+                    fb_data = load_json(fb_file)
+                except SystemExit:
+                    missing.append(f"{fb_file} (invalid JSON)")
+                    continue
+                fb_status = fb_data.get("status", "")
+                if fb_status not in ("closed", "rejected", "deferred", "resolved"):
+                    fb_id = fb_data.get("feedback_id", fb_file.stem)
+                    missing.append(f"unresolved feedback {fb_id} (status={fb_status})")
+                elif fb_status == "deferred":
+                    missing_defer = _deferred_feedback_missing_fields(fb_data)
+                    if missing_defer:
+                        fb_id = fb_data.get("feedback_id", fb_file.stem)
+                        missing.append(
+                            f"deferred feedback {fb_id} incomplete "
+                            f"(missing: {', '.join(missing_defer)})"
+                        )
+
+        art_status_path = features_dir / "artifact-status.json"
+        if art_status_path.exists():
+            try:
+                art_status = load_json(art_status_path)
+                stale = [
+                    a.get("path", "<unknown>")
+                    for a in art_status.get("artifacts", [])
+                    if a.get("status") in ("stale", "invalidated", "needs_amendment")
+                ]
+                if stale:
+                    missing.append(f"{art_status_path} (blocking artifacts: {', '.join(stale)})")
+            except SystemExit:
+                missing.append(f"{art_status_path} (invalid JSON)")
+
+        verification_path = features_dir / "verification.json"
+        if verification_path.exists():
+            try:
+                verification = load_json(verification_path)
+                if not _verification_passed(verification):
+                    missing.append(f"{verification_path} (verification not passed)")
+            except SystemExit:
+                missing.append(f"{verification_path} (invalid JSON)")
+
+        for f in iter_task_files(h, epic_id) or []:
+            try:
+                task_data = load_json(f)
+            except SystemExit:
+                missing.append(f"{f} (invalid JSON)")
+                continue
+            status = normalize_task_status(task_data.get("status", "pending"))
+            if status == "cancelled":
+                continue
+            if status != "done":
+                missing.append(f"incomplete task {task_data.get('id', f.stem)} (status={status})")
+                continue
+            missing.extend(task_receipt_errors(h, task_data))
+
     # For EXECUTE stage, also verify all tasks are done and receipts exist in any supported directory.
     if stage == "EXECUTE":
         not_done = []
@@ -4956,12 +5260,22 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
             try:
                 t = load_json(f)
                 status = normalize_task_status(t.get("status", "pending"))
-                if status not in ("done", "blocked"):
+                if status not in ("done", "cancelled"):
                     not_done.append(t["id"])
             except SystemExit:
                 continue
         if not_done:
             missing.append(f"incomplete tasks: {', '.join(not_done)}")
+
+        task_by_id = {}
+        for f in iter_task_files(h, epic_id) or []:
+            try:
+                t = load_json(f)
+                if t.get("id"):
+                    task_by_id[t["id"]] = t
+            except SystemExit:
+                continue
+        missing.extend(_task_graph_orphan_errors(h, epic_id, task_by_id))
 
         if not any(directory.exists() and any(directory.iterdir()) for directory in receipt_dirs_for_epic(h, epic_id)):
             missing.append(f"{features_dir}/receipts (or runtime-receipts/runs) (empty or missing)")
@@ -5333,8 +5647,12 @@ def cmd_receipt_write(args, h: Path) -> None:
     receipts_dir.mkdir(parents=True, exist_ok=True)
     receipt_path = receipts_dir / f"{task_id}.json"
 
-    smoke_passed_raw = getattr(args, "smoke_passed", "true")
-    smoke_passed = str(smoke_passed_raw).lower() not in ("false", "0", "no")
+    smoke_passed_raw = getattr(args, "smoke_passed", "") or ""
+    affected_repos = list(getattr(args, "affected_repo", []) or [])
+    affected_repos_csv = getattr(args, "affected_repos", "") or ""
+    if affected_repos_csv:
+        affected_repos.extend([item.strip() for item in affected_repos_csv.split(",") if item.strip()])
+    build_status = getattr(args, "build_status", "") or ""
 
     receipt = {
         "task_id": task_id,
@@ -5346,11 +5664,22 @@ def cmd_receipt_write(args, h: Path) -> None:
             "head_commit": getattr(args, "head_commit", "") or "",
             "files_changed": 0,
         },
-        "smoke": {"passed": smoke_passed, "commands": []},
         "evidence": {},
         "new_risks": [],
         "timestamp": now_iso(),
     }
+    if smoke_passed_raw:
+        smoke_passed = str(smoke_passed_raw).lower() not in ("false", "0", "no")
+        receipt["smoke"] = {"passed": smoke_passed, "commands": []}
+    else:
+        smoke_passed = None
+    if affected_repos:
+        receipt["affected_repos"] = list(dict.fromkeys(affected_repos))
+    if build_status:
+        receipt["build"] = {
+            "status": build_status,
+            "passed": build_status.strip().lower() in {"pass", "passed", "ok", "success", "true"},
+        }
 
     atomic_write_json(receipt_path, receipt)
 
@@ -5358,9 +5687,9 @@ def cmd_receipt_write(args, h: Path) -> None:
     append_trace_event(h, _make_trace_event(
         epic_id, "receipt_written",
         task_id=task_id,
-        status="ok" if smoke_passed else "warn",
+        status="ok" if smoke_passed is not False else "warn",
         command_name="harnessctl receipt write",
-        summary=f"Receipt for {task_id}: smoke={'PASS' if smoke_passed else 'FAIL'}",
+        summary=f"Receipt for {task_id}: smoke={'N/A' if smoke_passed is None else ('PASS' if smoke_passed else 'FAIL')}",
         artifact_paths=[str(receipt_path)],
         payload={"smoke_passed": smoke_passed},
     ))
@@ -5368,7 +5697,7 @@ def cmd_receipt_write(args, h: Path) -> None:
     if args.json:
         out_json(receipt)
     else:
-        status = "PASS" if smoke_passed else "FAIL"
+        status = "N/A" if smoke_passed is None else ("PASS" if smoke_passed else "FAIL")
         print(f"Receipt written: {receipt_path}")
         print(f"  smoke: {status}")
         print(f"  base_commit: {receipt['implementation']['base_commit'][:8] or 'N/A'}")
@@ -6067,7 +6396,7 @@ def cmd_guard_check(args, h: Path, project_root: Path) -> None:
                         continue
                     try:
                         fb = json.loads(fb_file.read_text(encoding="utf-8"))
-                        if fb.get("status") not in ("closed", "rejected", "deferred"):
+                        if fb.get("status") not in ("closed", "rejected", "deferred", "resolved"):
                             issues.append(
                                 f"unresolved feedback {fb['feedback_id']} "
                                 f"(status: {fb['status']})"
@@ -6096,6 +6425,17 @@ def cmd_guard_check(args, h: Path, project_root: Path) -> None:
                                     f"but re-{target.lower()} not completed — "
                                     f"must run re-* before EXECUTE"
                                 )
+                            else:
+                                try:
+                                    rc_data = load_json(rc_file)
+                                    if rc_data.get("validated") is not True:
+                                        target = fb_decision.replace("REOPEN_", "")
+                                        issues.append(
+                                            f"feedback {fb_id} reopened ({fb_decision}) "
+                                            f"but re-{target.lower()} is not validated"
+                                        )
+                                except SystemExit:
+                                    issues.append(f"feedback {fb_id} re-completion marker invalid JSON")
                     except (json.JSONDecodeError, KeyError):
                         pass
 
@@ -7634,6 +7974,93 @@ def _invalidate_downstream(h: Path, epic_id: str, target_stage: str, feedback_id
     save_artifact_status(h, epic_id, data)
 
 
+def _task_graph_feedback_entries(h: Path, epic_id: str, feedback_id: str) -> tuple[list[dict], list[str]]:
+    """Return task-graph entries linked to feedback, with parse errors."""
+    task_graph_path = h / "features" / epic_id / "task-graph.json"
+    if not task_graph_path.exists():
+        return [], []
+    try:
+        task_graph = load_json(task_graph_path)
+    except SystemExit:
+        return [], [f"{task_graph_path} (invalid JSON)"]
+    tasks = task_graph.get("tasks", [])
+    if not isinstance(tasks, list):
+        return [], [f"{task_graph_path} (tasks must be a list)"]
+    return [
+        t for t in tasks
+        if isinstance(t, dict)
+        and (t.get("source_feedback") == feedback_id or t.get("added_by_feedback") == feedback_id)
+    ], []
+
+
+def _feedback_task_graph_errors(h: Path, epic_id: str, feedback_id: str, task_by_id: dict[str, dict]) -> list[str]:
+    """Validate feedback task traceability between task files and task-graph."""
+    graph_entries, errors = _task_graph_feedback_entries(h, epic_id, feedback_id)
+    file_tasks = [
+        task for task in task_by_id.values()
+        if task.get("added_by_feedback") == feedback_id or task.get("source_feedback") == feedback_id
+    ]
+    if file_tasks and not graph_entries:
+        errors.append(f"task-graph.json missing source_feedback={feedback_id} entries")
+        return errors
+
+    graph_ids = set()
+    for entry in graph_entries:
+        graph_task_id = entry.get("id", "")
+        if not graph_task_id:
+            errors.append(f"task-graph.json has source_feedback={feedback_id} entry without id")
+            continue
+        graph_ids.add(graph_task_id)
+        if graph_task_id not in task_by_id:
+            errors.append(f"task-graph task {graph_task_id} from {feedback_id} has no task file")
+
+    for task in file_tasks:
+        task_id = task.get("id", "")
+        if task_id and task_id not in graph_ids:
+            errors.append(f"feedback task {task_id} missing from task-graph.json source_feedback={feedback_id}")
+    return errors
+
+
+def _task_graph_orphan_errors(h: Path, epic_id: str, task_by_id: dict[str, dict]) -> list[str]:
+    """Return errors for task-graph entries without backing task files."""
+    task_graph_path = h / "features" / epic_id / "task-graph.json"
+    if not task_graph_path.exists():
+        return []
+    try:
+        task_graph = load_json(task_graph_path)
+    except SystemExit:
+        return [f"{task_graph_path} (invalid JSON)"]
+    tasks = task_graph.get("tasks", [])
+    if not isinstance(tasks, list):
+        return [f"{task_graph_path} (tasks must be a list)"]
+    errors = []
+    for entry in tasks:
+        if not isinstance(entry, dict):
+            continue
+        task_id = entry.get("id", "")
+        if task_id and task_id not in task_by_id:
+            errors.append(f"task-graph task {task_id} has no task file")
+    return errors
+
+
+def _deferred_feedback_missing_fields(fb: dict) -> list[str]:
+    """Return missing structured DEFER fields, with legacy read compatibility."""
+    owner = fb.get("defer_owner") or fb.get("owner")
+    target = fb.get("defer_target") or fb.get("defer_to") or fb.get("defer_until")
+    revisit = fb.get("defer_revisit") or fb.get("revisit_condition") or fb.get("defer_until")
+    evidence = fb.get("defer_evidence") or fb.get("closure_evidence")
+    missing = []
+    if not owner:
+        missing.append("defer_owner")
+    if not target:
+        missing.append("defer_target")
+    if not revisit:
+        missing.append("defer_revisit")
+    if not evidence:
+        missing.append("defer_evidence")
+    return missing
+
+
 def cmd_feedback_close(args, h: Path) -> None:
     """Close a feedback item with validation checks."""
     epic_id = args.epic_id
@@ -7641,7 +8068,16 @@ def cmd_feedback_close(args, h: Path) -> None:
     fb = _load_feedback(h, epic_id, feedback_id)
 
     # Allow closing from various states
-    closeable = ("triaged", "approved", "reopened", "amending", "implemented", "verified")
+    closeable = ("triaged", "approved", "reopened", "amending", "implemented", "verified", "resolved")
+    if fb["status"] == "submitted":
+        errors = ["Submitted feedback must be triaged before it can be closed"]
+        if args.json:
+            out_json({"status": "error", "errors": errors, "force_ignored": bool(args.force)})
+        else:
+            print(f"Cannot close {feedback_id}:", file=sys.stderr)
+            for e in errors:
+                print(f"  - {e}", file=sys.stderr)
+        sys.exit(1)
     if fb["status"] not in closeable and fb["status"] != "submitted":
         err(f"Feedback {feedback_id} is in status '{fb['status']}', cannot close")
 
@@ -7677,11 +8113,71 @@ def cmd_feedback_close(args, h: Path) -> None:
         rdiff = h / "features" / epic_id / f"revision-diff-{feedback_id}.md"
         if not rdiff.exists():
             errors.append("Revision-diff missing")
+        rc_path = d / f"{feedback_id}.re-completion.json"
+        if not rc_path.exists():
+            errors.append("Re-completion marker missing")
+        else:
+            try:
+                rc_data = load_json(rc_path)
+                if rc_data.get("stage", "").upper() != triage.get("target_stage", rc_data.get("stage", "")).upper():
+                    errors.append("Re-completion stage does not match target stage")
+                if not rc_data.get("validated"):
+                    errors.append("Re-completion marker not validated")
+            except SystemExit:
+                errors.append("Re-completion marker invalid JSON")
 
     # 5. Closure evidence
     evidence = args.evidence or []
     if not evidence and not args.reject and not args.defer:
         errors.append("Closure evidence required (--evidence)")
+
+    defer_evidence = getattr(args, "defer_evidence", "") or ""
+    if args.defer:
+        defer_data = {
+            "defer_owner": getattr(args, "defer_owner", "") or "",
+            "defer_target": getattr(args, "defer_target", "") or "",
+            "defer_revisit": getattr(args, "defer_revisit", "") or "",
+            "defer_evidence": defer_evidence or ("; ".join(evidence) if evidence else ""),
+        }
+        missing_defer = _deferred_feedback_missing_fields(defer_data)
+        if missing_defer:
+            errors.append(f"DEFER missing required fields: {', '.join(missing_defer)}")
+
+    task_by_id = {}
+    graph_entries, graph_errors = _task_graph_feedback_entries(h, epic_id, feedback_id)
+    graph_task_ids = {
+        entry.get("id")
+        for entry in graph_entries
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    for task_file in iter_task_files(h, epic_id) or []:
+        try:
+            task = load_json(task_file)
+        except SystemExit:
+            errors.append(f"{task_file} (invalid JSON)")
+            continue
+        if task.get("id"):
+            task_by_id[task["id"]] = task
+    errors.extend(graph_errors)
+    associated_task_ids = {
+        task.get("id")
+        for task in task_by_id.values()
+        if task.get("id")
+        and (task.get("added_by_feedback") == feedback_id or task.get("source_feedback") == feedback_id)
+    } | graph_task_ids
+
+    if args.reject or args.defer:
+        for task_id in sorted(associated_task_ids):
+            task = task_by_id.get(task_id)
+            if not task:
+                errors.append(f"task-graph task {task_id} from {feedback_id} has no task file")
+                continue
+            status = normalize_task_status(task.get("status", "pending"))
+            if status not in ("done", "cancelled"):
+                errors.append(
+                    f"Feedback task {task_id} must be done or cancelled before "
+                    f"{'defer' if args.defer else 'reject'} (status={status})"
+                )
 
     # 6. No blocking stale artifacts from this feedback
     if not args.reject and not args.defer:
@@ -7692,11 +8188,45 @@ def cmd_feedback_close(args, h: Path) -> None:
         if blocking:
             errors.append(f"Blocking stale artifacts remain: {[a['path'] for a in blocking]}")
 
-    if errors and not args.force:
+        errors.extend(_feedback_task_graph_errors(h, epic_id, feedback_id, task_by_id))
+
+        has_done_feedback_task = False
+        for task in task_by_id.values():
+            if (
+                task.get("added_by_feedback") != feedback_id
+                and task.get("source_feedback") != feedback_id
+                and task.get("id") not in graph_task_ids
+            ):
+                continue
+            status = normalize_task_status(task.get("status", "pending"))
+            if status == "cancelled":
+                continue
+            if status != "done":
+                errors.append(f"Feedback task {task.get('id', '<unknown>')} not done (status={status})")
+                continue
+            has_done_feedback_task = True
+            errors.extend(task_receipt_errors(h, task))
+        if associated_task_ids and not has_done_feedback_task:
+            errors.append("Feedback close requires at least one done associated task; use --reject or --defer for all-cancelled feedback")
+
+        verification_path = h / "features" / epic_id / "verification.json"
+        if not verification_path.exists():
+            errors.append("Verification missing")
+        else:
+            try:
+                verification = load_json(verification_path)
+                if not _verification_passed(verification):
+                    errors.append("Verification not passed")
+            except SystemExit:
+                errors.append("Verification invalid JSON")
+
+    if errors:
         if args.json:
-            out_json({"status": "error", "errors": errors})
+            out_json({"status": "error", "errors": errors, "force_ignored": bool(args.force)})
         else:
             print(f"Cannot close {feedback_id}:", file=sys.stderr)
+            if args.force:
+                print("  --force cannot bypass hard feedback close gates.", file=sys.stderr)
             for e in errors:
                 print(f"  - {e}", file=sys.stderr)
         sys.exit(1)
@@ -7715,13 +8245,21 @@ def cmd_feedback_close(args, h: Path) -> None:
         "closed_at": now_iso(),
         "final_status": final_status,
         "closure_evidence": evidence,
-        "forced": bool(errors and args.force),
+        "force_requested": bool(args.force),
+        "force_ignored": bool(args.force),
     }
+    if args.defer:
+        closure_data.update(defer_data)
     closure_path = d / f"{feedback_id}.closure.json"
     atomic_write_json(closure_path, closure_data)
 
     # Update main feedback
     fb["status"] = final_status
+    if args.defer:
+        fb.update(defer_data)
+        fb["closure_evidence"] = evidence
+    if args.reject:
+        fb["closure_evidence"] = evidence
     _save_feedback(h, epic_id, feedback_id, fb)
 
     if args.json:
@@ -8410,6 +8948,30 @@ def cmd_task_graph_merge(args, h: Path) -> None:
             task_id_set.add(task_id)
             created_tasks.append(task)
 
+    if created_tasks:
+        features_dir = h / "features" / epic_id
+        task_graph_path = features_dir / "task-graph.json"
+        task_graph = load_json(task_graph_path) if task_graph_path.exists() else {"tasks": []}
+        graph_tasks = task_graph.setdefault("tasks", [])
+        graph_ids = {
+            t.get("id")
+            for t in graph_tasks
+            if isinstance(t, dict)
+        }
+        for task in created_tasks:
+            if task["id"] in graph_ids:
+                continue
+            entry = {
+                "id": task["id"],
+                "title": task.get("title", ""),
+                "surface": task.get("surface", ""),
+                "dependencies": task.get("dependencies", []),
+            }
+            if feedback_id:
+                entry["source_feedback"] = feedback_id
+            graph_tasks.append(entry)
+        atomic_write_json(task_graph_path, task_graph)
+
     # Report results
     result = {
         "epic_id": epic_id,
@@ -8460,6 +9022,19 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
 
     features_dir = h / "features" / epic_id
     fb_dir = _feedback_dir(h, epic_id)
+    state_path = features_dir / "state.json"
+    state = load_json(state_path) if state_path.exists() else {}
+    pending_rc = state.get("pending_re_completion")
+    if not isinstance(pending_rc, dict):
+        err(f"No pending_re_completion found for {epic_id}; cannot re-complete {feedback_id}")
+    if pending_rc.get("feedback_id") != feedback_id:
+        err(
+            f"pending_re_completion belongs to {pending_rc.get('feedback_id')}, "
+            f"not {feedback_id}"
+        )
+    pending_stages = [s.upper() for s in pending_rc.get("stages", [])]
+    if stage not in pending_stages:
+        err(f"Stage {stage} is not pending re-completion for {feedback_id}: {pending_stages}")
 
     # --- Manifest-based validation (preferred path) ---
     manifest_path = fb_dir / f"{feedback_id}.revision-manifest.json"
@@ -8567,6 +9142,15 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
     # Update feedback status → resolved if manifest validated, else amending
     if manifest_validated:
         fb["status"] = "resolved"
+        completed_stages = [s.upper() for s in pending_rc.get("completed_stages", [])]
+        if stage not in completed_stages:
+            completed_stages.append(stage)
+        pending_rc["completed_stages"] = completed_stages
+        if all(s in completed_stages for s in pending_stages):
+            state.pop("pending_re_completion", None)
+        else:
+            state["pending_re_completion"] = pending_rc
+        atomic_write_json(state_path, state)
         # Trace: feedback_recomplete_completed
         append_trace_event(h, _make_trace_event(
             epic_id, "feedback_recomplete_completed",
@@ -8785,23 +9369,155 @@ def cmd_feedback_re_plan(args, h: Path) -> None:
 
     # 3. Merge tasks_to_add into task-graph.json
     task_graph = load_json(task_graph_path) if task_graph_path.exists() else {"tasks": []}
-    existing_ids = {t.get("id") for t in task_graph.get("tasks", [])}
+    graph_tasks = task_graph.setdefault("tasks", [])
+    existing_ids = {t.get("id") for t in graph_tasks if isinstance(t, dict)}
+    epic = load_epic(h, epic_id)
+    tasks_dir = h / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    existing_task_ids = {
+        load_json(task_file).get("id", "")
+        for task_file in sorted(tasks_dir.glob(f"{epic_id}.*.json"))
+    }
+    task_file_by_id = {}
+    for task_file in sorted(tasks_dir.glob(f"{epic_id}.*.json")):
+        try:
+            task_data = load_json(task_file)
+        except SystemExit:
+            continue
+        if task_data.get("id"):
+            task_file_by_id[task_data["id"]] = task_file
+
+    def _replan_task_key(task: dict) -> tuple[str, str, str, str]:
+        return (
+            task.get("source_feedback", feedback_id),
+            task.get("title") or task.get("subject") or "",
+            task.get("surface", ""),
+            json.dumps(task.get("acceptance_criteria", []), sort_keys=True),
+        )
+
+    existing_graph_by_source_id = {
+        t.get("source_task_id"): t
+        for t in graph_tasks
+        if isinstance(t, dict) and t.get("source_task_id")
+    }
+    existing_graph_by_key = {
+        _replan_task_key(t): t
+        for t in graph_tasks
+        if isinstance(t, dict)
+    }
+    id_map: dict[str, str] = {}
+    prepared_tasks: list[tuple[dict, dict, Path | None, list]] = []
 
     for new_task in tasks_to_add:
-        if new_task.get("id") in existing_ids:
-            continue  # skip duplicates
+        if not isinstance(new_task, dict):
+            continue
+        original_id = new_task.get("id", "")
+        raw_deps = new_task.get("depends_on", new_task.get("dependencies", []))
+        if isinstance(raw_deps, str):
+            raw_deps = [raw_deps] if raw_deps else []
+        existing_graph_task = (
+            existing_graph_by_source_id.get(original_id)
+            if original_id else None
+        )
+        if existing_graph_task is None and original_id in existing_ids:
+            existing_graph_task = next(
+                (t for t in graph_tasks if isinstance(t, dict) and t.get("id") == original_id),
+                None,
+            )
+        if existing_graph_task is None:
+            existing_graph_task = existing_graph_by_key.get(_replan_task_key(new_task))
+        if existing_graph_task and existing_graph_task.get("id"):
+            if original_id:
+                id_map[original_id] = existing_graph_task["id"]
+            new_task["id"] = existing_graph_task["id"]
+            task_path = task_file_by_id.get(existing_graph_task["id"])
+            task = load_json(task_path) if task_path else {}
+            prepared_tasks.append((existing_graph_task, task, task_path, raw_deps))
+            continue
         # Ensure traceability fields
         new_task.setdefault("source_feedback", feedback_id)
         new_task.setdefault("source_verdict", amendment.get("source_verdict", ""))
-        task_graph["tasks"].append(new_task)
+        if original_id:
+            new_task.setdefault("source_task_id", original_id)
+        task_path = None
+        if not original_id or original_id not in existing_task_ids:
+            n = next_task_number(h, epic_id)
+            task_id = make_task_id(epic_id, n)
+            if original_id:
+                id_map[original_id] = task_id
+            task = {
+                "id": task_id,
+                "epic_id": epic_id,
+                "title": new_task.get("title", new_task.get("subject", f"Feedback task {feedback_id}")),
+                "status": "pending",
+                "surface": new_task.get("surface", ""),
+                "dependencies": [],
+                "acceptance_criteria": new_task.get("acceptance_criteria", []),
+                "evidence": {},
+                "receipts": [],
+                "added_by_feedback": feedback_id,
+                "source_feedback": feedback_id,
+            }
+            task_path = tasks_dir / f"{epic_id}.{n}.json"
+            atomic_write_json(task_path, task)
+            updated_epic = dict(epic)
+            updated_epic["tasks"] = list(epic.get("tasks", [])) + [task_id]
+            save_epic(h, updated_epic)
+            epic = updated_epic
+            existing_task_ids.add(task_id)
+            task_file_by_id[task_id] = task_path
+            new_task["id"] = task_id
+            new_task.setdefault("title", task["title"])
+            new_task.setdefault("surface", task["surface"])
+        else:
+            id_map[original_id] = original_id
+            task_id = original_id
+            task_path = task_file_by_id.get(task_id)
+            task = load_json(task_path) if task_path else {}
+
+        graph_tasks.append(new_task)
+        existing_ids.add(new_task["id"])
+        prepared_tasks.append((new_task, task or {}, task_path, raw_deps))
+
+    for graph_task, task, task_path, raw_deps in prepared_tasks:
+        resolved_deps = [
+            id_map.get(dep, dep)
+            for dep in raw_deps
+            if id_map.get(dep, dep) in existing_task_ids
+        ]
+        graph_task["dependencies"] = resolved_deps
+        graph_task.pop("depends_on", None)
+        if task_path is not None:
+            task["dependencies"] = resolved_deps
+            atomic_write_json(task_path, task)
 
     atomic_write_json(task_graph_path, task_graph)
 
     # 4. Merge coverage_updates into coverage-matrix.json
     coverage = load_json(coverage_path) if coverage_path.exists() else {"coverage": []}
+    coverage_items = coverage.setdefault("coverage", [])
+    coverage_keys = {json.dumps(item, sort_keys=True) for item in coverage_items}
+
+    def _rewrite_task_refs(value, *, in_task_field: bool = False):
+        if isinstance(value, str):
+            return id_map.get(value, value) if in_task_field else value
+        if isinstance(value, list):
+            return [_rewrite_task_refs(item, in_task_field=in_task_field) for item in value]
+        if isinstance(value, dict):
+            task_keys = {"task", "task_id", "tasks", "task_ids", "depends_on", "dependencies"}
+            return {
+                key: _rewrite_task_refs(item, in_task_field=in_task_field or key in task_keys)
+                for key, item in value.items()
+            }
+        return value
+
     for update in coverage_updates:
         update.setdefault("source_feedback", feedback_id)
-        coverage["coverage"].append(update)
+        update = _rewrite_task_refs(update)
+        update_key = json.dumps(update, sort_keys=True)
+        if update_key not in coverage_keys:
+            coverage_items.append(update)
+            coverage_keys.add(update_key)
 
     atomic_write_json(coverage_path, coverage)
 
@@ -8812,7 +9528,9 @@ def cmd_feedback_re_plan(args, h: Path) -> None:
         tid = t.get("id", "T???")
         subject = t.get("subject", t.get("title", ""))
         surface = t.get("surface", "")
-        new_lines.append(f"- [ ] {tid}: {subject} [surface: {surface}] (from {feedback_id})")
+        line = f"- [ ] {tid}: {subject} [surface: {surface}] (from {feedback_id})"
+        if f"{tid}:" not in tasks_md_content:
+            new_lines.append(line)
     if new_lines:
         tasks_md_content += "\n" + "\n".join(new_lines) + "\n"
         tasks_md_path.write_text(tasks_md_content)
@@ -9854,6 +10572,7 @@ def _feedback_continuation_for_stage(epic_id: str, feedback_id: str, target_stag
     return {
         "mode": mode or cfg["mode"],
         "category": category,
+        "failed_stage": stage,
         "target_stage": stage,
         "next_action": cfg["next_action"],
         "next_command": cfg["next_command"],
@@ -9863,6 +10582,7 @@ def _feedback_continuation_for_stage(epic_id: str, feedback_id: str, target_stag
             "stage": stage,
         },
         "must_auto_continue": True,
+        "required_recompletion": [stage],
         "required_artifacts": cfg["required_artifacts"],
         "allowed_commands": [
             cfg["skill_command"],
@@ -9870,6 +10590,11 @@ def _feedback_continuation_for_stage(epic_id: str, feedback_id: str, target_stag
             "harnessctl feedback re-complete",
             "harnessctl feedback gate-check",
             "harnessctl feedback update-metadata",
+        ],
+        "blocked_commands": [
+            "harnessctl feedback close",
+            "harnessctl state transition",
+            "harnessctl stage-gate check DONE",
         ],
     }
 
@@ -10218,48 +10943,19 @@ def cmd_feedback_continue(args, h: Path) -> None:
 
 
 def cmd_feedback_close_all(args, h: Path) -> None:
-    """Close all open feedback items for an epic."""
+    """Disable bulk feedback close; each feedback must pass close gates."""
     epic_id = args.epic_id
     load_epic(h, epic_id)
-    reason = args.reason or "Batch closed"
-
-    d = _feedback_dir(h, epic_id)
-    closed_ids = []
-    skipped_ids = []
-    for f in sorted(d.glob("HFB-*.json")):
-        if f.stem.endswith((".triage", ".closure", ".evidence-pack",
-                           ".amendment-plan", ".related-gap-scan")):
-            continue
-        item = load_json(f)
-        if item.get("status") in ("closed", "rejected", "deferred"):
-            skipped_ids.append(item.get("feedback_id", f.stem))
-            continue
-        fb_id = item.get("feedback_id", f.stem)
-        item["status"] = "closed"
-        item["resolution"] = reason
-        item["closed_at"] = now_iso()
-        atomic_write_json(f, item)
-        # Write closure file
-        closure_data = {
-            "feedback_id": fb_id,
-            "closed_at": now_iso(),
-            "final_status": "closed",
-            "closure_evidence": [reason],
-            "forced": True,
-        }
-        closure_path = d / f"{fb_id}.closure.json"
-        atomic_write_json(closure_path, closure_data)
-        closed_ids.append(fb_id)
-
+    message = (
+        "feedback close-all is disabled by hard-gate policy. "
+        "Close each feedback with `harnessctl feedback close` so triage, "
+        "re-complete, task receipts, runtime evidence, and stale artifacts are checked."
+    )
     if args.json:
-        out_json({"status": "ok", "closed": closed_ids, "skipped": skipped_ids})
+        out_json({"status": "error", "epic_id": epic_id, "message": message})
     else:
-        if closed_ids:
-            print(f"Closed {len(closed_ids)} feedback items: {', '.join(closed_ids)}")
-        if skipped_ids:
-            print(f"Skipped {len(skipped_ids)} already closed: {', '.join(skipped_ids)}")
-        if not closed_ids and not skipped_ids:
-            print(f"No feedback items found for epic {epic_id}")
+        print(message, file=sys.stderr)
+    sys.exit(1)
 
 
 def cmd_feedback_clean(args, h: Path) -> None:
@@ -10521,23 +11217,14 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
                 ]
 
         elif status == "deferred":
-            # Deferred requires reason + evidence to be valid
-            has_reason = bool(fb.get("defer_reason"))
-            has_defer_to = bool(fb.get("defer_to") or fb.get("defer_until"))
-            has_evidence = bool(fb.get("defer_evidence") or fb.get("closure_evidence"))
-            if not (has_reason and has_defer_to and has_evidence):
-                missing = []
-                if not has_reason:
-                    missing.append("defer_reason")
-                if not has_defer_to:
-                    missing.append("defer_to/defer_until")
-                if not has_evidence:
-                    missing.append("evidence")
+            missing = _deferred_feedback_missing_fields(fb)
+            if missing:
                 reason = f"deferred_incomplete (missing: {', '.join(missing)})"
                 next_action = "feedback close --defer"
                 required_commands = [
                     f"feedback close --epic-id {epic_id} --feedback-id {feedback_id} "
-                    f"--defer --reason '<reason>' --evidence '<evidence>'",
+                    f"--defer --defer-owner '<owner>' --defer-target '<Backlog|None|target>' "
+                    f"--defer-revisit '<condition>' --defer-evidence '<evidence>'",
                 ]
 
         elif status == "rejected":
@@ -10614,6 +11301,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--project-root",
         metavar="DIR",
         help="Project root directory (default: auto-detect from cwd)",
+    )
+    parser.add_argument(
+        "--harness-root",
+        metavar="DIR",
+        help="Explicit .harness directory, or a project root containing .harness",
     )
 
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -10747,6 +11439,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_tblock.add_argument("task_id")
     p_tblock.add_argument("--json", action="store_true")
 
+    p_tcancel = task_sub.add_parser("cancel", help="Cancel a task with a recorded reason")
+    p_tcancel.add_argument("task_id")
+    p_tcancel.add_argument("--reason", default="")
+    p_tcancel.add_argument("--json", action="store_true")
+
+    p_tdeps = task_sub.add_parser("update-deps", help="Replace task dependencies")
+    p_tdeps.add_argument("task_id")
+    p_tdeps.add_argument("--dep", action="append", default=None, help="Dependency task id; may repeat")
+    p_tdeps.add_argument("--clear", action="store_true", help="Clear all dependencies")
+    p_tdeps.add_argument("--json", action="store_true")
+
     p_tshow = task_sub.add_parser("show", help="Show task details")
     p_tshow.add_argument("task_id")
     p_tshow.add_argument("--json", action="store_true")
@@ -10787,7 +11490,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_rwrite.add_argument("task_id")
     p_rwrite.add_argument("--base-commit", dest="base_commit", default="")
     p_rwrite.add_argument("--head-commit", dest="head_commit", default="")
-    p_rwrite.add_argument("--smoke-passed", dest="smoke_passed", default="true")
+    p_rwrite.add_argument("--smoke-passed", dest="smoke_passed", default="")
+    p_rwrite.add_argument("--affected-repo", dest="affected_repo", action="append", default=[])
+    p_rwrite.add_argument("--affected-repos", dest="affected_repos", default="")
+    p_rwrite.add_argument("--build-status", dest="build_status", default="")
     p_rwrite.add_argument("--json", action="store_true")
 
     p_rshow = receipt_sub.add_parser("show", help="Show runtime receipt for a task")
@@ -11123,7 +11829,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_close.add_argument("--evidence", nargs="*", default=[], help="Closure evidence paths")
     p_fb_close.add_argument("--reject", action="store_true", help="Reject feedback")
     p_fb_close.add_argument("--defer", action="store_true", help="Defer feedback")
-    p_fb_close.add_argument("--force", action="store_true", help="Force close despite validation errors")
+    p_fb_close.add_argument("--defer-owner", dest="defer_owner", default="", help="Owner responsible for deferred feedback")
+    p_fb_close.add_argument("--defer-target", dest="defer_target", default="", help="Deferred target, e.g. Backlog, None, or a follow-up stage")
+    p_fb_close.add_argument("--defer-revisit", dest="defer_revisit", default="", help="Condition or date for revisiting deferred feedback")
+    p_fb_close.add_argument("--defer-evidence", dest="defer_evidence", default="", help="Evidence supporting the defer decision")
+    p_fb_close.add_argument("--force", action="store_true", help="Record force intent; hard feedback gates still cannot be bypassed")
     p_fb_close.add_argument("--json", action="store_true")
 
     p_fb_epack = fb_sub.add_parser("evidence-pack", help="Collect evidence pack for triage council")
@@ -11315,8 +12025,17 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # Resolve project root
-    if args.project_root:
+    # Resolve project root / harness root
+    explicit_harness_root = None
+    if args.harness_root:
+        harness_arg = Path(args.harness_root).resolve()
+        if harness_arg.name == HARNESS_DIR:
+            explicit_harness_root = harness_arg
+            project_root = harness_arg.parent
+        else:
+            project_root = harness_arg
+            explicit_harness_root = harness_arg / HARNESS_DIR
+    elif args.project_root:
         project_root = Path(args.project_root).resolve()
     else:
         if args.command in {"init", "setup", "doctor", "repair"}:
@@ -11326,7 +12045,7 @@ def main() -> None:
         else:
             project_root = find_harness_root()
 
-    h = project_root / HARNESS_DIR
+    h = explicit_harness_root or (project_root / HARNESS_DIR)
 
     # For init we don't require .harness/ to exist yet
     if args.command == "init":
@@ -11350,7 +12069,7 @@ def main() -> None:
 
     # All other commands require .harness/ to exist
     if not h.is_dir():
-        err(f".harness/ not found at {h}. Run 'harnessctl init' first.")
+        err(f".harness/ not found at {h}. Run 'harnessctl init' first. {recovery_hint_for_harness(h)}")
 
     # Dispatch
     if args.command == "config":
@@ -11392,6 +12111,10 @@ def main() -> None:
             cmd_task_fail(args, h)
         elif args.task_action == "block":
             cmd_task_block(args, h)
+        elif args.task_action == "cancel":
+            cmd_task_cancel(args, h)
+        elif args.task_action == "update-deps":
+            cmd_task_update_deps(args, h)
         elif args.task_action == "show":
             cmd_task_show(args, h)
         elif args.task_action == "list":

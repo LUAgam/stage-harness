@@ -273,6 +273,38 @@ class TestGuardCheck(unittest.TestCase):
 
 
 class TestFeedbackClose(unittest.TestCase):
+    def test_submitted_feedback_cannot_close_without_triage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "x", "--json")
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--evidence", "manual note",
+                                    "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(any("triaged" in e for e in data["errors"]))
+
+    def test_submitted_feedback_cannot_reject_or_defer_without_triage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "x", "--json")
+
+            for flag in ("--reject", "--defer"):
+                result = run_harnessctl(tmp_path, "feedback", "close",
+                                        "--epic-id", epic_id,
+                                        "--feedback-id", "HFB-001",
+                                        flag, "--json")
+                self.assertNotEqual(result.returncode, 0, flag)
+                data = json.loads(result.stdout)
+                self.assertTrue(any("triaged" in e for e in data["errors"]))
+
     def test_close_rejects_without_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -299,6 +331,948 @@ class TestFeedbackClose(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             data = json.loads(result.stdout)
             self.assertEqual(data["final_status"], "rejected")
+
+    def test_close_defer_requires_structured_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "x", "--json")
+            run_harnessctl(tmp_path, "feedback", "triage",
+                           "--epic-id", epic_id,
+                           "--feedback-id", "HFB-001",
+                           "--classification", "question",
+                           "--json")
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--defer", "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(any("DEFER missing" in e for e in data["errors"]))
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--defer",
+                                    "--defer-owner", "pm",
+                                    "--defer-target", "Backlog",
+                                    "--defer-revisit", "next planning review",
+                                    "--defer-evidence", "Confirmed with PM",
+                                    "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["final_status"], "deferred")
+            fb = json.loads((tmp_path / ".harness" / "features" / epic_id /
+                             "feedback" / "HFB-001.json").read_text())
+            self.assertEqual(fb["defer_owner"], "pm")
+
+    def test_close_defer_requires_feedback_tasks_cancelled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "x", "--json")
+            run_harnessctl(tmp_path, "feedback", "triage",
+                           "--epic-id", epic_id,
+                           "--feedback-id", "HFB-001",
+                           "--classification", "question",
+                           "--json")
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Feedback task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["added_by_feedback"] = "HFB-001"
+            task_path.write_text(json.dumps(task, indent=2))
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--defer",
+                                    "--defer-owner", "pm",
+                                    "--defer-target", "Backlog",
+                                    "--defer-revisit", "next planning review",
+                                    "--defer-evidence", "Confirmed with PM",
+                                    "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(any("must be done or cancelled" in e for e in data["errors"]))
+
+            run_harnessctl(tmp_path, "task", "cancel", task_id,
+                           "--reason", "Deferred feedback", "--json")
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--defer",
+                                    "--defer-owner", "pm",
+                                    "--defer-target", "Backlog",
+                                    "--defer-revisit", "next planning review",
+                                    "--defer-evidence", "Confirmed with PM",
+                                    "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_close_reject_requires_feedback_tasks_cancelled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "x", "--json")
+            run_harnessctl(tmp_path, "feedback", "triage",
+                           "--epic-id", epic_id,
+                           "--feedback-id", "HFB-001",
+                           "--classification", "question",
+                           "--json")
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Feedback task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["added_by_feedback"] = "HFB-001"
+            task_path.write_text(json.dumps(task, indent=2))
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--reject", "--json")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(any("must be done or cancelled" in e for e in json.loads(result.stdout)["errors"]))
+
+            run_harnessctl(tmp_path, "task", "cancel", task_id,
+                           "--reason", "Rejected feedback", "--json")
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--reject", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_close_force_cannot_bypass_recompletion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            (fb_dir / "HFB-001.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "epic_id": epic_id,
+                "status": "reopened",
+                "text": "missing task",
+            }))
+            (fb_dir / "HFB-001.triage.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "requires_reopen": True,
+                "target_stage": "PLAN",
+            }))
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--evidence", "manual note",
+                                    "--force", "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(data["force_ignored"])
+            self.assertTrue(any("Re-completion" in e for e in data["errors"]))
+
+    def test_close_all_is_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "x", "--json")
+
+            result = run_harnessctl(tmp_path, "feedback", "close-all",
+                                    "--epic-id", epic_id, "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["status"], "error")
+
+            fb = json.loads((tmp_path / ".harness" / "features" / epic_id /
+                             "feedback" / "HFB-001.json").read_text())
+            self.assertEqual(fb["status"], "submitted")
+
+    def test_close_blocks_feedback_task_with_malformed_runtime_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            (fb_dir / "HFB-001.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "epic_id": epic_id,
+                "status": "triaged",
+                "text": "x",
+            }))
+            (fb_dir / "HFB-001.triage.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "requires_reopen": False,
+            }))
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Feedback task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["status"] = "done"
+            task["runtime_required"] = True
+            task["added_by_feedback"] = "HFB-001"
+            task_path.write_text(json.dumps(task, indent=2))
+            receipts_dir = tmp_path / ".harness" / "features" / epic_id / "receipts"
+            receipts_dir.mkdir(parents=True, exist_ok=True)
+            (receipts_dir / f"{task_id}.json").write_text(json.dumps({
+                "task_id": task_id,
+                "epic_id": epic_id,
+                "affected_repos": ["app"],
+                "build": {},
+                "smoke": {},
+            }))
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--evidence", "manual note",
+                                    "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(any("missing passing build_status" in e for e in data["errors"]))
+
+    def test_close_requires_feedback_task_in_task_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            (fb_dir / "HFB-001.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "epic_id": epic_id,
+                "status": "triaged",
+                "text": "x",
+            }))
+            (fb_dir / "HFB-001.triage.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "requires_reopen": False,
+            }))
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Feedback task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["status"] = "done"
+            task["added_by_feedback"] = "HFB-001"
+            task_path.write_text(json.dumps(task, indent=2))
+            run_harnessctl(tmp_path, "receipt", "write", task_id, "--json")
+            verification_path = tmp_path / ".harness" / "features" / epic_id / "verification.json"
+            verification_path.write_text(json.dumps({"acceptance_council": "PASS"}))
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--evidence", "manual note",
+                                    "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(any("task-graph" in e for e in data["errors"]))
+
+            task_graph_path = tmp_path / ".harness" / "features" / epic_id / "task-graph.json"
+            task_graph_path.write_text(json.dumps({
+                "tasks": [{"id": task_id, "source_feedback": "HFB-001"}]
+            }))
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--evidence", "manual note",
+                                    "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_close_checks_task_graph_only_feedback_task_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            (fb_dir / "HFB-001.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "epic_id": epic_id,
+                "status": "triaged",
+                "text": "x",
+            }))
+            (fb_dir / "HFB-001.triage.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "requires_reopen": False,
+            }))
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Feedback task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["status"] = "done"
+            # Intentionally no added_by_feedback/source_feedback on task file;
+            # task-graph is the source of feedback linkage.
+            task_path.write_text(json.dumps(task, indent=2))
+            task_graph_path = tmp_path / ".harness" / "features" / epic_id / "task-graph.json"
+            task_graph_path.write_text(json.dumps({
+                "tasks": [{"id": task_id, "source_feedback": "HFB-001"}]
+            }))
+            verification_path = tmp_path / ".harness" / "features" / epic_id / "verification.json"
+            verification_path.write_text(json.dumps({"acceptance_council": "PASS"}))
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--evidence", "manual note",
+                                    "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(any("receipt missing" in e for e in data["errors"]))
+
+            run_harnessctl(tmp_path, "receipt", "write", task_id, "--json")
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--evidence", "manual note",
+                                    "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_close_allows_done_and_cancelled_feedback_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            (fb_dir / "HFB-001.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "epic_id": epic_id,
+                "status": "triaged",
+                "text": "x",
+            }))
+            (fb_dir / "HFB-001.triage.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "requires_reopen": False,
+            }))
+            done = run_harnessctl(tmp_path, "task", "create", epic_id, "Done task", "--json")
+            done_id = json.loads(done.stdout)["id"]
+            cancelled = run_harnessctl(tmp_path, "task", "create", epic_id, "Cancelled task", "--json")
+            cancelled_id = json.loads(cancelled.stdout)["id"]
+            for task_path in (tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"):
+                task = json.loads(task_path.read_text())
+                task["added_by_feedback"] = "HFB-001"
+                task_path.write_text(json.dumps(task, indent=2))
+            run_harnessctl(tmp_path, "receipt", "write", done_id, "--json")
+            run_harnessctl(tmp_path, "task", "done", done_id, "--json")
+            run_harnessctl(tmp_path, "task", "cancel", cancelled_id,
+                           "--reason", "No longer needed", "--json")
+            task_graph_path = tmp_path / ".harness" / "features" / epic_id / "task-graph.json"
+            task_graph_path.write_text(json.dumps({
+                "tasks": [
+                    {"id": done_id, "source_feedback": "HFB-001"},
+                    {"id": cancelled_id, "source_feedback": "HFB-001"},
+                ]
+            }))
+            verification_path = tmp_path / ".harness" / "features" / epic_id / "verification.json"
+            verification_path.write_text(json.dumps({"acceptance_council": "PASS"}))
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--evidence", "manual note",
+                                    "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_close_reject_allows_done_and_cancelled_feedback_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            (fb_dir / "HFB-001.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "epic_id": epic_id,
+                "status": "triaged",
+                "text": "x",
+            }))
+            (fb_dir / "HFB-001.triage.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "requires_reopen": False,
+            }))
+            done = run_harnessctl(tmp_path, "task", "create", epic_id, "Done task", "--json")
+            done_id = json.loads(done.stdout)["id"]
+            cancelled = run_harnessctl(tmp_path, "task", "create", epic_id, "Cancelled task", "--json")
+            cancelled_id = json.loads(cancelled.stdout)["id"]
+            for task_path in (tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"):
+                task = json.loads(task_path.read_text())
+                task["added_by_feedback"] = "HFB-001"
+                task_path.write_text(json.dumps(task, indent=2))
+            run_harnessctl(tmp_path, "receipt", "write", done_id, "--json")
+            run_harnessctl(tmp_path, "task", "done", done_id, "--json")
+            run_harnessctl(tmp_path, "task", "cancel", cancelled_id, "--json")
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--reject", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_close_blocks_feedback_task_with_non_object_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            (fb_dir / "HFB-001.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "epic_id": epic_id,
+                "status": "triaged",
+                "text": "x",
+            }))
+            (fb_dir / "HFB-001.triage.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "requires_reopen": False,
+            }))
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Feedback task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["status"] = "done"
+            task["added_by_feedback"] = "HFB-001"
+            task_path.write_text(json.dumps(task, indent=2))
+            receipts_dir = tmp_path / ".harness" / "features" / epic_id / "receipts"
+            receipts_dir.mkdir(parents=True, exist_ok=True)
+            (receipts_dir / f"{task_id}.json").write_text("[]")
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--evidence", "manual note",
+                                    "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(any("JSON object" in e for e in data["errors"]))
+
+    def test_close_requires_verification_passed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "x", "--json")
+            run_harnessctl(tmp_path, "feedback", "triage",
+                           "--epic-id", epic_id,
+                           "--feedback-id", "HFB-001",
+                           "--classification", "question",
+                           "--json")
+
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--evidence", "manual note",
+                                    "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(any("Verification missing" in e for e in data["errors"]))
+
+            verification_path = tmp_path / ".harness" / "features" / epic_id / "verification.json"
+            verification_path.write_text(json.dumps({"acceptance_council": "PASS"}))
+            result = run_harnessctl(tmp_path, "feedback", "close",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--evidence", "manual note",
+                                    "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["final_status"], "closed")
+
+
+class TestTaskDoneHardGate(unittest.TestCase):
+    def test_task_done_requires_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Needs receipt", "--json")
+            task_id = json.loads(created.stdout)["id"]
+
+            result = run_harnessctl(tmp_path, "task", "done", task_id, "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["status"], "error")
+            self.assertIn("receipt missing", data["errors"][0])
+
+    def test_task_done_passes_with_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Has receipt", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            run_harnessctl(tmp_path, "receipt", "write", task_id, "--json")
+
+            result = run_harnessctl(tmp_path, "task", "done", task_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["status"], "done")
+
+    def test_runtime_required_task_done_requires_runtime_basics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Runtime task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["runtime_required"] = True
+            task_path.write_text(json.dumps(task, indent=2))
+            run_harnessctl(tmp_path, "receipt", "write", task_id, "--json")
+
+            result = run_harnessctl(tmp_path, "task", "done", task_id, "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(any("affected_repos" in e for e in data["errors"]))
+
+    def test_runtime_required_task_done_requires_explicit_smoke_or_verify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Runtime task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["runtime_required"] = True
+            task_path.write_text(json.dumps(task, indent=2))
+            run_harnessctl(tmp_path, "receipt", "write", task_id,
+                           "--affected-repo", "app",
+                           "--build-status", "passed",
+                           "--json")
+
+            result = run_harnessctl(tmp_path, "task", "done", task_id, "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(any("smoke_status or verify_status" in e for e in data["errors"]))
+
+    def test_runtime_required_task_done_rejects_malformed_runtime_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Runtime task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["runtime_required"] = True
+            task_path.write_text(json.dumps(task, indent=2))
+            receipts_dir = tmp_path / ".harness" / "features" / epic_id / "receipts"
+            receipts_dir.mkdir(parents=True, exist_ok=True)
+            (receipts_dir / f"{task_id}.json").write_text(json.dumps({
+                "task_id": task_id,
+                "epic_id": epic_id,
+                "affected_repos": ["app"],
+                "build": {},
+                "smoke": {},
+            }))
+
+            result = run_harnessctl(tmp_path, "task", "done", task_id, "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            joined = "\n".join(data["errors"])
+            self.assertIn("missing passing build_status", joined)
+            self.assertIn("missing passing smoke_status or verify_status", joined)
+
+    def test_task_done_rejects_non_object_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Bad receipt", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            receipts_dir = tmp_path / ".harness" / "features" / epic_id / "receipts"
+            receipts_dir.mkdir(parents=True, exist_ok=True)
+            (receipts_dir / f"{task_id}.json").write_text("[]")
+
+            result = run_harnessctl(tmp_path, "task", "done", task_id, "--json")
+            self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertTrue(any("JSON object" in e for e in data["errors"]))
+
+    def test_runtime_required_task_done_passes_with_runtime_basics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Runtime task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["runtime_required"] = True
+            task_path.write_text(json.dumps(task, indent=2))
+            run_harnessctl(tmp_path, "receipt", "write", task_id,
+                           "--affected-repo", "app",
+                           "--build-status", "passed",
+                           "--smoke-passed", "true",
+                           "--json")
+
+            result = run_harnessctl(tmp_path, "task", "done", task_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["status"], "done")
+
+
+class TestDoneHardGate(unittest.TestCase):
+    def test_execute_gate_checks_legacy_completed_task_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Legacy completed", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["status"] = "completed"
+            task_path.write_text(json.dumps(task, indent=2))
+
+            result = run_harnessctl(tmp_path, "stage-gate", "check", "EXECUTE",
+                                    "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["passed"])
+            self.assertTrue(any(task_id in item and "receipt missing" in item for item in data["missing"]))
+
+    def test_done_gate_blocks_unresolved_feedback_and_stale_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            features = tmp_path / ".harness" / "features" / epic_id
+            (features / "delivery-summary.md").write_text("summary")
+            (features / "release-notes.md").write_text("notes")
+            councils = features / "councils"
+            councils.mkdir(exist_ok=True)
+            (councils / "verdict-release_council.json").write_text(json.dumps({
+                "verdict": "RELEASE_READY"
+            }))
+            (features / "verification.json").write_text(json.dumps({
+                "acceptance_council": "PASS"
+            }))
+            run_harnessctl(tmp_path, "feedback", "submit",
+                           "--epic-id", epic_id, "--text", "still open", "--json")
+            run_harnessctl(tmp_path, "artifact-status", "set",
+                           "--epic-id", epic_id,
+                           "--path", "features/test/specs/",
+                           "--status", "stale", "--json")
+
+            result = run_harnessctl(tmp_path, "stage-gate", "check", "DONE",
+                                    "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["passed"])
+            missing = "\n".join(data["missing"])
+            self.assertIn("unresolved feedback", missing)
+            self.assertIn("blocking artifacts", missing)
+
+    def test_done_gate_blocks_incomplete_deferred_feedback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            features = tmp_path / ".harness" / "features" / epic_id
+            (features / "delivery-summary.md").write_text("summary")
+            (features / "release-notes.md").write_text("notes")
+            councils = features / "councils"
+            councils.mkdir(exist_ok=True)
+            (councils / "verdict-release_council.json").write_text(json.dumps({
+                "verdict": "RELEASE_READY"
+            }))
+            (features / "verification.json").write_text(json.dumps({
+                "acceptance_council": "PASS"
+            }))
+            fb_dir = features / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            (fb_dir / "HFB-001.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "epic_id": epic_id,
+                "status": "deferred",
+                "text": "later",
+                "defer_owner": "pm",
+                "defer_target": "Backlog",
+            }))
+
+            result = run_harnessctl(tmp_path, "stage-gate", "check", "DONE",
+                                    "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["passed"])
+            self.assertTrue(any("deferred feedback" in item for item in data["missing"]))
+
+    def test_done_gate_blocks_blocked_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            features = tmp_path / ".harness" / "features" / epic_id
+            (features / "delivery-summary.md").write_text("summary")
+            (features / "release-notes.md").write_text("notes")
+            councils = features / "councils"
+            councils.mkdir(exist_ok=True)
+            (councils / "verdict-release_council.json").write_text(json.dumps({
+                "verdict": "RELEASE_READY"
+            }))
+            (features / "verification.json").write_text(json.dumps({
+                "acceptance_council": "PASS"
+            }))
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Blocked task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            run_harnessctl(tmp_path, "task", "block", task_id, "--json")
+
+            result = run_harnessctl(tmp_path, "stage-gate", "check", "DONE",
+                                    "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["passed"])
+            self.assertTrue(any("incomplete task" in item for item in data["missing"]))
+
+    def test_done_gate_allows_cancelled_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            features = tmp_path / ".harness" / "features" / epic_id
+            (features / "delivery-summary.md").write_text("summary")
+            (features / "release-notes.md").write_text("notes")
+            councils = features / "councils"
+            councils.mkdir(exist_ok=True)
+            (councils / "verdict-release_council.json").write_text(json.dumps({
+                "verdict": "RELEASE_READY"
+            }))
+            (features / "verification.json").write_text(json.dumps({
+                "acceptance_council": "PASS"
+            }))
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Cancelled task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            result = run_harnessctl(tmp_path, "task", "cancel", task_id,
+                                    "--reason", "Deferred feedback", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = run_harnessctl(tmp_path, "stage-gate", "check", "DONE",
+                                    "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertTrue(data["passed"], data["missing"])
+
+    def test_execute_gate_blocks_task_graph_orphan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            features = tmp_path / ".harness" / "features" / epic_id
+            (features / "task-graph.json").write_text(json.dumps({
+                "tasks": [{"id": f"{epic_id}.99", "source_feedback": "HFB-001"}]
+            }))
+
+            result = run_harnessctl(tmp_path, "stage-gate", "check", "EXECUTE",
+                                    "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["passed"])
+            self.assertTrue(any("task-graph task" in item for item in data["missing"]))
+
+    def test_guard_execute_allows_resolved_feedback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            features = tmp_path / ".harness" / "features" / epic_id
+            (features / "bridge-spec.md").write_text("bridge")
+            (features / "coverage-matrix.json").write_text(json.dumps({"coverage": []}))
+            (features / "surface-routing.json").write_text(json.dumps({"surfaces": []}))
+            fb_dir = features / "feedback"
+            fb_dir.mkdir(parents=True, exist_ok=True)
+            (fb_dir / "HFB-001.json").write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "status": "resolved",
+                "decision": "REOPEN_PLAN",
+                "text": "fixed",
+            }))
+
+            result = run_harnessctl(tmp_path, "guard", "check",
+                                    "--epic-id", epic_id,
+                                    "--stage", "EXECUTE",
+                                    "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertTrue(data["passed"], data["issues"])
+
+    def test_state_next_treats_cancelled_as_complete_and_blocked_as_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            state_path = tmp_path / ".harness" / "features" / epic_id / "state.json"
+            state = json.loads(state_path.read_text())
+            state["current_stage"] = "EXECUTE"
+            state_path.write_text(json.dumps(state))
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Cancelled task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            run_harnessctl(tmp_path, "task", "cancel", task_id, "--json")
+
+            result = run_harnessctl(tmp_path, "state", "next", "--epic-id", epic_id)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "run_verify")
+
+            run_harnessctl(tmp_path, "task", "create", epic_id, "Blocked task", "--json")
+            blocked_task = sorted((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))[-1]
+            blocked_id = json.loads(blocked_task.read_text())["id"]
+            run_harnessctl(tmp_path, "task", "block", blocked_id, "--json")
+            result = run_harnessctl(tmp_path, "state", "next", "--epic-id", epic_id)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "run_execute")
+
+    def test_task_next_blocks_cancelled_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created_a = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                       "Cancelled dependency", "--json")
+            task_a = json.loads(created_a.stdout)["id"]
+            run_harnessctl(tmp_path, "task", "cancel", task_a, "--json")
+
+            created_b = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                       "Dependent task", "--json")
+            task_b = json.loads(created_b.stdout)["id"]
+            task_b_path = sorted((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))[-1]
+            task_b_data = json.loads(task_b_path.read_text())
+            task_b_data["dependencies"] = [task_a]
+            task_b_path.write_text(json.dumps(task_b_data, indent=2))
+
+            result = run_harnessctl(tmp_path, "task", "next", "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertIsNone(data["task_id"])
+            self.assertIn("blocked by dependencies", data["message"])
+
+            result = run_harnessctl(tmp_path, "task", "update-deps", task_b,
+                                    "--clear", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = run_harnessctl(tmp_path, "task", "next", "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["id"], task_b)
+
+    def test_task_cancel_cascades_to_pending_dependents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created_a = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                       "Dependency", "--json")
+            task_a = json.loads(created_a.stdout)["id"]
+            created_b = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                       "Dependent", "--json")
+            task_b = json.loads(created_b.stdout)["id"]
+            task_b_path = sorted((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))[-1]
+            task_b_data = json.loads(task_b_path.read_text())
+            task_b_data["dependencies"] = [task_a]
+            task_b_path.write_text(json.dumps(task_b_data, indent=2))
+
+            result = run_harnessctl(tmp_path, "task", "cancel", task_a, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(task_b, json.loads(result.stdout)["cascaded_cancelled"])
+            self.assertEqual(json.loads(task_b_path.read_text())["status"], "cancelled")
+
+    def test_task_update_deps_syncs_task_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            graph_path = tmp_path / ".harness" / "features" / epic_id / "task-graph.json"
+            graph_path.write_text(json.dumps({"tasks": [{"id": task_id, "dependencies": ["old"]}]}))
+
+            result = run_harnessctl(tmp_path, "task", "update-deps", task_id,
+                                    "--clear", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            graph = json.loads(graph_path.read_text())
+            self.assertEqual(graph["tasks"][0]["dependencies"], [])
+
+    def test_task_cancel_rejects_done_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Done task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            run_harnessctl(tmp_path, "receipt", "write", task_id, "--json")
+            run_harnessctl(tmp_path, "task", "done", task_id, "--json")
+
+            result = run_harnessctl(tmp_path, "task", "cancel", task_id,
+                                    "--reason", "nope", "--json")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Cannot cancel completed task", result.stderr)
+
+    def test_done_gate_blocks_malformed_runtime_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            features = tmp_path / ".harness" / "features" / epic_id
+            (features / "delivery-summary.md").write_text("summary")
+            (features / "release-notes.md").write_text("notes")
+            councils = features / "councils"
+            councils.mkdir(exist_ok=True)
+            (councils / "verdict-release_council.json").write_text(json.dumps({
+                "verdict": "RELEASE_READY"
+            }))
+            (features / "verification.json").write_text(json.dumps({
+                "acceptance_council": "PASS"
+            }))
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Runtime task", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["runtime_required"] = True
+            task["status"] = "done"
+            task_path.write_text(json.dumps(task, indent=2))
+            receipts_dir = features / "receipts"
+            receipts_dir.mkdir(parents=True, exist_ok=True)
+            (receipts_dir / f"{task_id}.json").write_text(json.dumps({
+                "task_id": task_id,
+                "epic_id": epic_id,
+                "affected_repos": ["app"],
+                "build": {},
+                "smoke": {},
+            }))
+
+            result = run_harnessctl(tmp_path, "stage-gate", "check", "DONE",
+                                    "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["passed"])
+            missing = "\n".join(data["missing"])
+            self.assertIn("missing passing build_status", missing)
+
+    def test_done_gate_blocks_non_object_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            features = tmp_path / ".harness" / "features" / epic_id
+            (features / "delivery-summary.md").write_text("summary")
+            (features / "release-notes.md").write_text("notes")
+            councils = features / "councils"
+            councils.mkdir(exist_ok=True)
+            (councils / "verdict-release_council.json").write_text(json.dumps({
+                "verdict": "RELEASE_READY"
+            }))
+            (features / "verification.json").write_text(json.dumps({
+                "acceptance_council": "PASS"
+            }))
+            created = run_harnessctl(tmp_path, "task", "create", epic_id,
+                                     "Bad receipt", "--json")
+            task_id = json.loads(created.stdout)["id"]
+            task_path = next((tmp_path / ".harness" / "tasks").glob(f"{epic_id}.*.json"))
+            task = json.loads(task_path.read_text())
+            task["status"] = "done"
+            task_path.write_text(json.dumps(task, indent=2))
+            receipts_dir = features / "receipts"
+            receipts_dir.mkdir(parents=True, exist_ok=True)
+            (receipts_dir / f"{task_id}.json").write_text("[]")
+
+            result = run_harnessctl(tmp_path, "stage-gate", "check", "DONE",
+                                    "--epic-id", epic_id, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["passed"])
+            self.assertTrue(any("JSON object" in item for item in data["missing"]))
 
 
 class TestArtifactStatusWaiver(unittest.TestCase):

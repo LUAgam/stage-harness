@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SESSION_START_SCRIPT = ROOT / "hooks" / "scripts" / "session-start.sh"
 PRE_TOOL_USE_SCRIPT = ROOT / "hooks" / "scripts" / "pre-tool-use.sh"
+PRE_TOOL_USE_WRITE_GUARD_SCRIPT = ROOT / "hooks" / "scripts" / "pre-tool-use-write-guard.sh"
 STAGE_REMINDER_SCRIPT = ROOT / "hooks" / "scripts" / "stage-reminder.sh"
 
 
@@ -20,6 +21,420 @@ def make_executable(path: Path, content: str) -> None:
 
 
 class HookScriptTests(unittest.TestCase):
+    def test_pre_tool_use_write_guard_blocks_multiedit_managed_task(self) -> None:
+        payload = {
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "file_path": ".harness/tasks/sh-1-demo.1.json",
+                "edits": [{"old_string": "pending", "new_string": "done"}],
+            },
+        }
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_WRITE_GUARD_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+        self.assertIn(".harness", response["stopReason"])
+
+    def test_pre_tool_use_write_guard_blocks_multiedit_edit_path(self) -> None:
+        payload = {
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "edits": [
+                    {"path": ".harness/features/sh-1-demo/state.json",
+                     "old_string": "PLAN", "new_string": "DONE"}
+                ],
+            },
+        }
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_WRITE_GUARD_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_write_guard_normalizes_managed_path(self) -> None:
+        payload = {
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "foo/../.harness/./tasks//sh-1-demo.1.json"},
+        }
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_WRITE_GUARD_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_write_guard_blocks_state_file(self) -> None:
+        payload = {
+            "tool_name": "Edit",
+            "tool_input": {"file_path": ".harness/features/sh-1-demo/state.json"},
+        }
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_WRITE_GUARD_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_write_guard_blocks_delete_tool(self) -> None:
+        payload = {
+            "tool_name": "Delete",
+            "tool_input": {"path": ".harness/features/sh-1-demo/state.json"},
+        }
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_WRITE_GUARD_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_bash_blocks_untrusted_protected_write(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "python3 -c \"open('.harness/tasks/sh-1-demo.1.json','w').write('{}')\""
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+        self.assertIn("非受信 Bash", response["stopReason"])
+
+    def test_pre_tool_use_bash_blocks_absolute_protected_write(self) -> None:
+        protected_path = ROOT / ".harness" / "tasks" / "sh-1-demo.1.json"
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": f"python3 -c \"open('{protected_path}','w').write('{{}}')\""
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_bash_blocks_no_space_redirect_to_protected_path(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "echo '{}'>.harness/tasks/sh-1-demo.1.json"
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_bash_blocks_untrusted_segment_with_trusted_segment(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "scripts/harnessctl --version && python3 -c \"open('.harness/tasks/sh-1-demo.1.json','w').write('{}')\""
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_bash_blocks_pipe_mixed_trusted_untrusted_write(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "scripts/harnessctl --version | python3 -c \"open('.harness/tasks/sh-1-demo.1.json','w').write('{}')\""
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_bash_blocks_cd_into_harness_then_write(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "cd .harness/tasks && echo '{}' > sh-1-demo.1.json"
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_bash_tracks_relative_cd_inside_harness(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "cd .harness && cd tasks && echo '{}' > sh-1-demo.1.json"
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_bash_blocks_trusted_command_redirect_to_protected_path(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "scripts/harnessctl --version > .harness/epics/sh-1-demo.json"
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_bash_blocks_trusted_no_space_redirect_to_protected_path(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "scripts/harnessctl --version>.harness/epics/sh-1-demo.json"
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_bash_allows_trusted_command_redirect_to_safe_path(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "scripts/harnessctl feedback close --epic-id sh-1-demo --feedback-id HFB-001 --evidence .harness/features/sh-1-demo/feedback/HFB-001.json > /tmp/harnessctl.out"
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertTrue(response["continue"])
+
+    def test_pre_tool_use_bash_blocks_trusted_command_substitution_write(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "scripts/harnessctl epic show $(python3 -c \"open('.harness/tasks/sh-1-demo.1.json','w').write('{}')\")"
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_bash_blocks_tee_to_protected_path(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "printf '{}' | tee .harness/tasks/sh-1-demo.1.json"
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertFalse(response["continue"])
+
+    def test_pre_tool_use_bash_does_not_keep_protected_cd_after_leaving(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "cd .harness && cd .. && echo ok > notes.txt"
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertTrue(response["continue"])
+
+    def test_pre_tool_use_bash_allows_trusted_harnessctl_write(self) -> None:
+        result = subprocess.run(
+            ["bash", str(PRE_TOOL_USE_SCRIPT)],
+            cwd=str(ROOT),
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "scripts/harnessctl feedback close --epic-id sh-1-demo --feedback-id HFB-001 --evidence .harness/features/sh-1-demo/feedback/HFB-001.json"
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response = json.loads(result.stdout)
+        self.assertTrue(response["continue"])
+
     def test_stage_reminder_skips_start_prompts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

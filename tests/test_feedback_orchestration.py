@@ -157,7 +157,9 @@ class TestGateCheckDeferred(unittest.TestCase):
                 "text": "some feedback",
                 "candidate_type": "correction",
                 "defer_reason": "Not in scope for this sprint",
+                "defer_owner": "pm",
                 "defer_to": "next_sprint",
+                "defer_revisit": "next planning review",
                 "defer_evidence": "Confirmed with PM",
             }
             (fb_dir / "HFB-001.json").write_text(json.dumps(fb_data, indent=2))

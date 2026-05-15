@@ -47,6 +47,24 @@
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pre-tool-use-write-guard.sh"
           }
         ]
+      },
+      {
+        "matcher": "MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pre-tool-use-write-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Delete",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/scripts/pre-tool-use-write-guard.sh"
+          }
+        ]
       }
     ],
     "Stop": [
