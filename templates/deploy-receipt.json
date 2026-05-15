@@ -1,0 +1,21 @@
+{
+  "epic_id": "",
+  "deploy_mode": "",
+  "deploy_command": "",
+  "deploy_type": "",
+  "deploy_target": "",
+  "detected_by": "",
+  "status": "PASS",
+  "exit_code": 0,
+  "stdout": "",
+  "stderr": "",
+  "started_at": "",
+  "completed_at": "",
+  "error_summary": "",
+  "remote_host": "",
+  "remote_user": "",
+  "remote_project_path": "",
+  "service_status": "",
+  "remote_logs": "",
+  "log_source": ""
+}

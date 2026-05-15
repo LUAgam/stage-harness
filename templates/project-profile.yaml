@@ -20,3 +20,26 @@ coupling_role_ids: []
 detected_at: ""
 confidence: 0.0
 overrides: {}
+
+# CI/CD 命令配置（供 BUILD / DEPLOY / E2E 阶段使用）
+# 留空时 harness 会自动扫描项目代码推断命令，推断失败再询问用户
+# build_command: ""    # 编译命令，例如: "npm run build" / "go build ./..." / "mvn package -DskipTests"
+# deploy_command: ""   # 本地部署命令，例如: "docker compose up -d --build" / "kubectl apply -f k8s/"
+# e2e_command: ""      # 端到端测试命令，例如: "npx playwright test" / "pytest tests/e2e/"
+build_command: ""
+deploy_command: ""
+e2e_command: ""
+
+# 远程部署配置（本地无法部署时使用，由 harness-deploy 阶段自动填充或手动配置）
+# 密码（auth_type: password）不持久化，仅在会话内存中使用
+remote_deploy:
+  enabled: false
+  host: ""           # 服务器地址，如 192.168.1.100 或 example.com
+  user: ""           # SSH 用户名，如 ubuntu / root / deploy
+  auth_type: "key"   # key（推荐）或 password（仅会话内使用，不写入此文件）
+  key_path: ""       # SSH 私钥路径，如 ~/.ssh/id_rsa（auth_type=key 时填写）
+  project_path: ""   # 远程项目路径，如 /opt/myapp / /var/www/html/myapp
+  service_type: ""   # systemd | pm2 | docker-compose | docker | custom
+  service_name: ""   # 服务名/容器名，用于重启命令和日志采集
+  deploy_script: ""  # 自定义远程部署脚本（留空则根据 service_type 自动生成）
+  log_paths: []      # 额外日志文件路径列表，如 ["/var/log/myapp/app.log"]
