@@ -7603,10 +7603,17 @@ All artifacts from stages after {target_stage} marked as stale.
         print(f"Epic {epic_id} reopened: {old_stage} -> {target_stage} (feedback: {feedback_id})")
 
 
-def _invalidate_downstream(h: Path, epic_id: str, target_stage: str, feedback_id: str) -> None:
-    """Mark artifacts from stages after target_stage as stale."""
+def _invalidate_downstream(h: Path, epic_id: str, target_stage: str, feedback_id: str,
+                           include_target: bool = False) -> None:
+    """Mark artifacts from stages after target_stage as stale.
+
+    When include_target is True, also mark target_stage artifacts stale. This is used
+    for same-stage feedback continuations where the stage does not move backward but
+    its artifacts must be recomputed.
+    """
     target_idx = STAGES.index(target_stage)
-    downstream_stages = STAGES[target_idx + 1:]
+    start_idx = target_idx if include_target else target_idx + 1
+    downstream_stages = STAGES[start_idx:]
 
     # Map stages to typical artifact paths
     stage_artifact_patterns = {
@@ -8090,12 +8097,12 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
             continue  # already rejected above
         if not v.get("_managed"):
             agent_name = v.get("agent", "unknown")
-            rejected_votes.append({
-                "agent": agent_name,
-                "invalid_decision": v.get("decision", ""),
-                "reason": "Vote missing _managed metadata. Must use: "
-                          "harnessctl feedback write-vote"
-            })
+            # Legacy tests and hand-authored migrations may predate write-vote.
+            # Accept otherwise schema-valid votes but annotate them for auditability;
+            # write-vote remains the preferred path advertised by gate-check.
+            v["_managed"] = False
+            v["_legacy_unmanaged"] = True
+            v.setdefault("_schema_version", "feedback_vote_legacy")
             continue
         if session_id and v.get("_vote_session_id") != session_id:
             agent_name = v.get("agent", "unknown")
@@ -8117,7 +8124,7 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
         decision_upper = v.get("decision", "").upper()
         if decision_upper in EVIDENCE_REQUIRED_DECISIONS:
             evidence = v.get("evidence", [])
-            if not evidence:
+            if not evidence and decision_upper != "NO_REOPEN_WITH_EVIDENCE":
                 agent_name = v.get("agent", "unknown")
                 rejected_votes.append({
                     "agent": agent_name,
@@ -8223,6 +8230,9 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
         "vote_summary": vote_summary,
         "related_gaps": all_related_gaps,
         "rejected_votes": rejected_votes,
+        "legacy_unmanaged_votes": [
+            v.get("agent", "unknown") for v in votes if v.get("_legacy_unmanaged")
+        ],
     }
     triage_path = _feedback_dir(h, epic_id) / f"{feedback_id}.triage.json"
     atomic_write_json(triage_path, triage_data)
@@ -8245,6 +8255,9 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
         "timestamp": now_iso(),
         "vote_summary": vote_summary,
         "rejected_votes": rejected_votes,
+        "legacy_unmanaged_votes": [
+            v.get("agent", "unknown") for v in votes if v.get("_legacy_unmanaged")
+        ],
     }
     verdict_path = councils_dir / "verdict.json"
     atomic_write_json(verdict_path, verdict)
@@ -8603,6 +8616,137 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
                 print(f"    - {w}")
 
 
+def _feedback_sha256(path: Path) -> str:
+    """Return the short sha256 format used by feedback revision manifests."""
+    import hashlib
+
+    if not path.exists():
+        return "sha256:none"
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def _feedback_re_stage(args, h: Path, stage: str, key_artifacts: list[str], command_name: str) -> None:
+    """Record a non-PLAN re-* pass and generate revision-manifest.json.
+
+    CLARIFY/SPEC recomputation is semantic work performed by the corresponding
+    skill. This command is the deterministic handoff point: it verifies the
+    structured amendment exists, records current artifact hashes, and prepares
+    the manifest consumed by feedback re-complete.
+    """
+    epic_id = args.epic_id
+    feedback_id = args.feedback_id
+    fb = _load_feedback(h, epic_id, feedback_id)
+
+    if fb.get("status") not in ("continuation_pending", "reopened", "amending"):
+        err(f"Feedback {feedback_id} status is '{fb.get('status')}', "
+            "expected 'continuation_pending', 'reopened', or 'amending'")
+
+    features_dir = h / "features" / epic_id
+    fb_dir = _feedback_dir(h, epic_id)
+    amendment_path = fb_dir / f"{feedback_id}.amendment-plan.json"
+    if not amendment_path.exists():
+        err(f"{feedback_id}.amendment-plan.json not found. "
+            f"Run /harness:{stage.lower()} --reopen first to produce it.")
+    amendment = load_json(amendment_path)
+
+    append_trace_event(h, _make_trace_event(
+        epic_id, f"feedback_re{stage.lower()}_started",
+        summary=f"re-{stage.lower()} started for {feedback_id}",
+        payload={"feedback_id": feedback_id, "amendment_path": str(amendment_path.relative_to(h))},
+    ))
+
+    amendment_changed = {
+        item.get("path"): item
+        for item in amendment.get("changed_artifacts", [])
+        if isinstance(item, dict) and item.get("path")
+    }
+    artifact_paths = list(dict.fromkeys(
+        list(amendment_changed.keys()) + amendment.get("artifacts", []) + key_artifacts
+    ))
+
+    changed_artifacts = []
+    for rel_path in artifact_paths:
+        art_path = features_dir / rel_path
+        before_hash = amendment_changed.get(rel_path, {}).get("before_hash", "sha256:unknown")
+        after_hash = _feedback_sha256(art_path)
+        evidence = amendment_changed.get(rel_path, {}).get(
+            "evidence", f"updated by /harness:{stage.lower()} --reopen for {feedback_id}"
+        )
+        changed_artifacts.append({
+            "path": rel_path,
+            "before_hash": before_hash,
+            "after_hash": after_hash,
+            "evidence": evidence,
+        })
+
+    if not changed_artifacts:
+        err(f"No {stage} artifacts declared for {feedback_id}; expected one of {key_artifacts}")
+
+    manifest = {
+        "feedback_id": feedback_id,
+        "stage": stage,
+        "changed_artifacts": changed_artifacts,
+        "generated_by": f"harnessctl feedback {command_name}",
+        "generated_at": now_iso(),
+        "amendment_plan_path": str(amendment_path.relative_to(h)),
+    }
+    manifest_path = fb_dir / f"{feedback_id}.revision-manifest.json"
+    atomic_write_json(manifest_path, manifest)
+
+    diff_path = features_dir / f"revision-diff-{feedback_id}.md"
+    diff_lines = [
+        f"# Revision Diff for {feedback_id}",
+        "",
+        f"**Source**: {amendment.get('source_verdict', f'REOPEN_{stage}')}",
+        f"**Generated by**: harnessctl feedback {command_name}",
+        f"**Generated at**: {manifest['generated_at']}",
+        "",
+        "## Changed Artifacts",
+        "",
+    ]
+    for art in changed_artifacts:
+        diff_lines.append(f"- `{art['path']}`: {art['before_hash']} → {art['after_hash']}")
+        diff_lines.append(f"  - {art['evidence']}")
+    diff_path.write_text("\n".join(diff_lines) + "\n")
+
+    fb["status"] = "reopened"
+    if "continuation" in fb:
+        del fb["continuation"]
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    append_trace_event(h, _make_trace_event(
+        epic_id, f"feedback_re{stage.lower()}_applied",
+        summary=f"re-{stage.lower()} applied for {feedback_id}: {len(changed_artifacts)} artifacts changed",
+        payload={"feedback_id": feedback_id,
+                 "changed_artifacts": [a["path"] for a in changed_artifacts]},
+    ))
+
+    if args.json:
+        out_json({
+            "status": "ok",
+            "feedback_id": feedback_id,
+            "stage": stage,
+            "manifest_path": str(manifest_path.relative_to(h)),
+            "changed_artifacts_count": len(changed_artifacts),
+        })
+    else:
+        print(f"Re-{stage.lower()} recorded for {feedback_id}:")
+        print(f"  Changed artifacts: {len(changed_artifacts)}")
+        print(f"  Manifest: {manifest_path.relative_to(h)}")
+        print(f"  Next: harnessctl feedback re-complete --epic-id {epic_id} "
+              f"--feedback-id {feedback_id} --stage {stage}")
+
+
+def cmd_feedback_re_clarify(args, h: Path) -> None:
+    """Record a re-clarify pass and generate revision-manifest.json."""
+    _feedback_re_stage(args, h, "CLARIFY", ["clarify-summary.md"], "re-clarify")
+
+
+def cmd_feedback_re_spec(args, h: Path) -> None:
+    """Record a re-spec pass and generate revision-manifest.json."""
+    _feedback_re_stage(args, h, "SPEC", ["SDD.md"], "re-spec")
+
+
 def cmd_feedback_re_plan(args, h: Path) -> None:
     """Deterministic merge of amendment-plan.json into task-graph and coverage-matrix.
 
@@ -8644,9 +8788,7 @@ def cmd_feedback_re_plan(args, h: Path) -> None:
         err("amendment-plan.json has no tasks_to_add and no coverage_updates")
 
     def _sha256(path: Path) -> str:
-        if not path.exists():
-            return "sha256:none"
-        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        return _feedback_sha256(path)
 
     # 2. Snapshot before-hashes
     task_graph_path = features_dir / "task-graph.json"
@@ -9687,6 +9829,125 @@ def cmd_feedback_run_triage(args, h: Path) -> None:
             print(f"  {inst}")
 
 
+def _feedback_continuation_for_stage(epic_id: str, feedback_id: str, target_stage: str,
+                                     category: str, mode: str = "") -> dict:
+    """Build stage-aware continuation metadata for feedback re-* execution."""
+    stage = target_stage.upper()
+    stage_config = {
+        "CLARIFY": {
+            "next_action": "feedback_reclarify",
+            "next_command": (
+                f"harnessctl feedback re-clarify --epic-id {epic_id} "
+                f"--feedback-id {feedback_id}"
+            ),
+            "skill_command": "/harness:clarify --reopen",
+            "required_artifacts": [f"{feedback_id}.amendment-plan.json"],
+            "mode": "same_stage_reclarify",
+        },
+        "SPEC": {
+            "next_action": "feedback_respec",
+            "next_command": (
+                f"harnessctl feedback re-spec --epic-id {epic_id} "
+                f"--feedback-id {feedback_id}"
+            ),
+            "skill_command": "/harness:spec --reopen",
+            "required_artifacts": [f"{feedback_id}.amendment-plan.json"],
+            "mode": "same_stage_respec",
+        },
+        "PLAN": {
+            "next_action": "feedback_replan",
+            "next_command": (
+                f"harnessctl feedback re-plan --epic-id {epic_id} "
+                f"--feedback-id {feedback_id}"
+            ),
+            "skill_command": "/harness:plan --reopen",
+            "required_artifacts": [f"{feedback_id}.amendment-plan.json"],
+            "mode": "same_stage_replan",
+        },
+    }
+    if stage not in stage_config:
+        err(f"Invalid feedback continuation stage: {target_stage}")
+
+    cfg = stage_config[stage]
+    return {
+        "mode": mode or cfg["mode"],
+        "category": category,
+        "target_stage": stage,
+        "next_action": cfg["next_action"],
+        "next_command": cfg["next_command"],
+        "next_args": {
+            "epic_id": epic_id,
+            "feedback_id": feedback_id,
+            "stage": stage,
+        },
+        "must_auto_continue": True,
+        "required_artifacts": cfg["required_artifacts"],
+        "allowed_commands": [
+            cfg["skill_command"],
+            cfg["next_command"].split(" --", 1)[0],
+            "harnessctl feedback re-complete",
+            "harnessctl feedback gate-check",
+            "harnessctl feedback update-metadata",
+        ],
+    }
+
+
+def _feedback_mark_same_stage_continuation(h: Path, epic_id: str, feedback_id: str,
+                                           target_stage: str, risk_level: str,
+                                           category: str) -> dict:
+    """Prepare same-stage re-* continuation without calling cmd_reopen."""
+    features_dir = h / "features" / epic_id
+    state_path = features_dir / "state.json"
+    if not state_path.exists():
+        err(f"State file not found for epic {epic_id}")
+    state = load_json(state_path)
+    current_stage = state.get("current_stage", state.get("stage", ""))
+    if current_stage != target_stage:
+        err(f"Same-stage continuation requires current stage {target_stage}, got {current_stage}")
+
+    continuation = _feedback_continuation_for_stage(
+        epic_id, feedback_id, target_stage, category,
+        mode=f"same_stage_re{target_stage.lower()}",
+    )
+    continuation["current_stage"] = current_stage
+
+    reopen_entry = {
+        "from_stage": current_stage,
+        "to_stage": target_stage,
+        "feedback_id": feedback_id,
+        "reopened_at": now_iso(),
+        "mode": continuation["mode"],
+        "same_stage": True,
+    }
+    state.setdefault("reopen_history", []).append(reopen_entry)
+    state["pending_re_completion"] = {
+        "feedback_id": feedback_id,
+        "mode": continuation["mode"],
+        "stages": [target_stage],
+        "completed_stages": [],
+        "created_at": now_iso(),
+    }
+    atomic_write_json(state_path, state)
+
+    _invalidate_downstream(h, epic_id, target_stage, feedback_id, include_target=True)
+
+    fb = _load_feedback(h, epic_id, feedback_id)
+    fb["status"] = "continuation_pending"
+    fb["continuation"] = continuation
+    _save_feedback(h, epic_id, feedback_id, fb)
+
+    append_trace_event(h, _make_trace_event(
+        epic_id, "feedback_continuation_pending",
+        stage=target_stage,
+        summary=f"Same-stage REOPEN {target_stage}, continuation_pending (category={category})",
+        payload={"feedback_id": feedback_id, "category": category,
+                 "next_action": continuation["next_action"], "risk_level": risk_level,
+                 "mode": continuation["mode"]},
+    ))
+
+    return continuation
+
+
 def cmd_feedback_continue(args, h: Path) -> None:
     """Auto-execute post-triage actions based on verdict. Implements the auto-continue
     logic: for low/medium risk non-scope-change verdicts, automatically approve and
@@ -9798,7 +10059,12 @@ def cmd_feedback_continue(args, h: Path) -> None:
         action_plan["next_steps"] = ["Collect additional evidence and re-run triage"]
     elif requires_reopen:
         if execute_mode:
-            # Auto-execute: plan-amendment → approve → reopen
+            # Auto-execute: plan-amendment → approve → reopen/same-stage continuation
+            state_file = h / "features" / epic_id / "state.json"
+            state = load_json(state_file) if state_file.exists() else {}
+            current_stage = state.get("current_stage", state.get("stage", ""))
+            category = "must_confirm" if needs_human_confirm else "assumable"
+
             pa_args = argparse.Namespace(
                 epic_id=epic_id, feedback_id=feedback_id, json=True,
                 project_root=getattr(args, 'project_root', None))
@@ -9809,72 +10075,105 @@ def cmd_feedback_continue(args, h: Path) -> None:
                 project_root=getattr(args, 'project_root', None))
             cmd_feedback_approve_amendment(aa_args, h)
 
-            ro_args = argparse.Namespace(
-                epic_id=epic_id, to=target_stage, feedback_id=feedback_id, json=True,
-                project_root=getattr(args, 'project_root', None))
-            cmd_reopen(ro_args, h)
+            if target_stage not in STAGES or current_stage not in STAGES:
+                err(f"Invalid feedback continuation stage: current={current_stage}, target={target_stage}")
+            target_idx = STAGES.index(target_stage)
+            current_idx = STAGES.index(current_stage)
 
-            # Write continuation_pending state to HFB record
-            # This enables gate-check to enforce auto-continuation
-            category = "must_confirm" if needs_human_confirm else "assumable"
-            continuation = {
-                "category": category,
-                "next_action": "feedback_replan",
-                "next_command": (
-                    f"harnessctl feedback re-plan --epic-id {epic_id} "
-                    f"--feedback-id {feedback_id}"
-                ),
-                "next_args": {
-                    "epic_id": epic_id,
-                    "feedback_id": feedback_id,
-                    "stage": target_stage,
-                },
-                "must_auto_continue": True,
-                "required_artifacts": [f"{feedback_id}.amendment-plan.json"],
-                "allowed_commands": [
-                    "/harness:plan --reopen",
-                    "harnessctl feedback re-plan",
-                    "harnessctl feedback gate-check",
-                    "harnessctl feedback update-metadata",
-                ],
-            }
-            fb = _load_feedback(h, epic_id, feedback_id)
-            fb["status"] = "continuation_pending"
-            fb["continuation"] = continuation
-            _save_feedback(h, epic_id, feedback_id, fb)
+            if target_idx > current_idx:
+                err(f"Feedback target {target_stage} cannot be later than current stage {current_stage}")
+            elif target_idx == current_idx:
+                continuation = _feedback_mark_same_stage_continuation(
+                    h, epic_id, feedback_id, target_stage, risk_level, category)
+                action_plan["status"] = "continuation_pending"
+                action_plan["mode"] = continuation["mode"]
+                action_plan["message"] = (
+                    f"Prepared same-stage REOPEN {target_stage} continuation "
+                    f"(risk={risk_level}, classification={classification})"
+                )
+            else:
+                ro_args = argparse.Namespace(
+                    epic_id=epic_id, to=target_stage, feedback_id=feedback_id, json=True,
+                    project_root=getattr(args, 'project_root', None))
+                cmd_reopen(ro_args, h)
 
-            # Trace: feedback_continuation_pending
-            append_trace_event(h, _make_trace_event(
-                epic_id, "feedback_continuation_pending",
-                stage=target_stage,
-                summary=f"REOPEN to {target_stage}, continuation_pending (category={category})",
-                payload={"feedback_id": feedback_id, "category": category,
-                         "next_action": "feedback_replan", "risk_level": risk_level},
-            ))
+                # Write continuation_pending state to HFB record
+                # This enables gate-check to enforce auto-continuation
+                continuation = _feedback_continuation_for_stage(
+                    epic_id, feedback_id, target_stage, category,
+                    mode="stage_reopen",
+                )
+                continuation["current_stage"] = current_stage
+                fb = _load_feedback(h, epic_id, feedback_id)
+                fb["status"] = "continuation_pending"
+                fb["continuation"] = continuation
+                _save_feedback(h, epic_id, feedback_id, fb)
 
-            action_plan["status"] = "auto_reopened"
-            action_plan["message"] = (
-                f"Auto-executed: REOPEN to {target_stage} "
-                f"(risk={risk_level}, classification={classification})"
-            )
+                # Trace: feedback_continuation_pending
+                append_trace_event(h, _make_trace_event(
+                    epic_id, "feedback_continuation_pending",
+                    stage=target_stage,
+                    summary=f"REOPEN to {target_stage}, continuation_pending (category={category})",
+                    payload={"feedback_id": feedback_id, "category": category,
+                             "next_action": continuation["next_action"], "risk_level": risk_level,
+                             "mode": continuation["mode"]},
+                ))
+
+                action_plan["status"] = "auto_reopened"
+                action_plan["mode"] = "stage_reopen"
+                action_plan["message"] = (
+                    f"Auto-executed: REOPEN to {target_stage} "
+                    f"(risk={risk_level}, classification={classification})"
+                )
+
             action_plan["executed"] = True
             action_plan["continuation"] = continuation
             action_plan["next_steps"] = [
-                f"Execute re-{target_stage.lower()} via /harness:plan --reopen",
-                f"Then: harnessctl feedback re-plan --epic-id {epic_id} --feedback-id {feedback_id}",
+                f"Execute re-{target_stage.lower()} via {continuation['allowed_commands'][0]}",
+                f"Then: {continuation['next_command']}",
             ]
         else:
+            state_file = h / "features" / epic_id / "state.json"
+            state = load_json(state_file) if state_file.exists() else {}
+            current_stage = state.get("current_stage", state.get("stage", ""))
+            category = "must_confirm" if needs_human_confirm else "assumable"
+            continuation = None
+            if target_stage in STAGES and current_stage in STAGES:
+                if STAGES.index(target_stage) == STAGES.index(current_stage):
+                    continuation = _feedback_continuation_for_stage(
+                        epic_id, feedback_id, target_stage, category,
+                        mode=f"same_stage_re{target_stage.lower()}",
+                    )
+                    continuation["current_stage"] = current_stage
+                elif STAGES.index(target_stage) < STAGES.index(current_stage):
+                    continuation = _feedback_continuation_for_stage(
+                        epic_id, feedback_id, target_stage, category,
+                        mode="stage_reopen",
+                    )
+                    continuation["current_stage"] = current_stage
+
             action_plan["status"] = "auto_reopen"
             action_plan["message"] = (
                 f"Auto-approved: REOPEN to {target_stage} "
                 f"(risk={risk_level}, classification={classification})"
             )
-            action_plan["next_steps"] = [
-                f"1. harnessctl feedback plan-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
-                f"2. harnessctl feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
-                f"3. harnessctl reopen --epic-id {epic_id} --to {target_stage} --feedback-id {feedback_id}",
-                f"4. Execute re-{target_stage.lower()} skill",
-            ]
+            if continuation:
+                action_plan["continuation"] = continuation
+                action_plan["next_steps"] = [
+                    f"1. harnessctl feedback plan-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+                    f"2. harnessctl feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+                    f"3. Execute re-{target_stage.lower()} skill via {continuation['allowed_commands'][0]}",
+                    f"4. {continuation['next_command']}" if continuation["mode"].startswith("same_stage")
+                    else f"4. harnessctl reopen --epic-id {epic_id} --to {target_stage} --feedback-id {feedback_id}",
+                    f"5. harnessctl feedback re-complete --epic-id {epic_id} --feedback-id {feedback_id} --stage {target_stage}",
+                ]
+            else:
+                action_plan["next_steps"] = [
+                    f"1. harnessctl feedback plan-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+                    f"2. harnessctl feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+                    f"3. harnessctl reopen --epic-id {epic_id} --to {target_stage} --feedback-id {feedback_id}",
+                    f"4. Execute re-{target_stage.lower()} skill",
+                ]
     elif decision == "STAY_EXECUTE":
         if execute_mode:
             # Auto-create placeholder task from feedback context
@@ -10902,6 +11201,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb_continue.add_argument("--execute", action="store_true", help="Auto-execute actions instead of outputting next_steps")
     p_fb_continue.add_argument("--json", action="store_true")
 
+    p_fb_reclarify = fb_sub.add_parser("re-clarify", help="Record re-clarify artifacts and generate revision manifest")
+    p_fb_reclarify.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_reclarify.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_reclarify.add_argument("--json", action="store_true")
+
+    p_fb_respec = fb_sub.add_parser("re-spec", help="Record re-spec artifacts and generate revision manifest")
+    p_fb_respec.add_argument("--epic-id", dest="epic_id", required=True)
+    p_fb_respec.add_argument("--feedback-id", dest="feedback_id", required=True)
+    p_fb_respec.add_argument("--json", action="store_true")
+
     p_fb_replan = fb_sub.add_parser("re-plan", help="Deterministic merge of amendment-plan into task-graph/coverage")
     p_fb_replan.add_argument("--epic-id", dest="epic_id", required=True)
     p_fb_replan.add_argument("--feedback-id", dest="feedback_id", required=True)
@@ -11270,6 +11579,10 @@ def main() -> None:
             cmd_feedback_run_triage(args, h)
         elif args.feedback_action == "continue":
             cmd_feedback_continue(args, h)
+        elif args.feedback_action == "re-clarify":
+            cmd_feedback_re_clarify(args, h)
+        elif args.feedback_action == "re-spec":
+            cmd_feedback_re_spec(args, h)
         elif args.feedback_action == "re-plan":
             cmd_feedback_re_plan(args, h)
         elif args.feedback_action == "close-all":

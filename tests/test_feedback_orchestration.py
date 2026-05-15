@@ -262,6 +262,184 @@ class TestRelatedGapScanTrigger(unittest.TestCase):
             self.assertIn("related-gap-scan is required", result.stderr)
 
 
+class TestContinueReopenRouting(unittest.TestCase):
+    """continue --execute should route REOPEN_* by current/target stage."""
+
+    def _write_triaged_reopen(self, tmp_path: Path, epic_id: str, feedback_id: str,
+                              decision: str, target_stage: str,
+                              classification: str = "plan_patch") -> None:
+        fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+        fb_dir.mkdir(parents=True, exist_ok=True)
+        (fb_dir / f"{feedback_id}.json").write_text(json.dumps({
+            "feedback_id": feedback_id,
+            "epic_id": epic_id,
+            "status": "triaged",
+            "text": "missing docs task",
+            "candidate_type": classification,
+        }, indent=2))
+        (fb_dir / f"{feedback_id}.triage.json").write_text(json.dumps({
+            "feedback_id": feedback_id,
+            "classification": classification,
+            "target_stage": target_stage,
+            "requires_reopen": True,
+            "confidence": 0.9,
+        }, indent=2))
+        (fb_dir / f"{feedback_id}.related-gap-scan.json").write_text(json.dumps({
+            "gaps": [],
+            "scanned_categories": ["docs", "tests"],
+        }, indent=2))
+        councils_dir = (tmp_path / ".harness" / "features" / epic_id /
+                        "councils" / "feedback_triage_council" / feedback_id)
+        councils_dir.mkdir(parents=True, exist_ok=True)
+        (councils_dir / "verdict.json").write_text(json.dumps({
+            "decision": decision,
+            "classification": classification,
+            "target_stage": target_stage,
+            "requires_reopen": True,
+        }, indent=2))
+
+    def _set_stage(self, tmp_path: Path, epic_id: str, stage: str) -> None:
+        state_path = tmp_path / ".harness" / "features" / epic_id / "state.json"
+        state = json.loads(state_path.read_text())
+        state["current_stage"] = stage
+        state["risk_level"] = "low"
+        state_path.write_text(json.dumps(state, indent=2))
+
+    def test_same_stage_plan_continue_does_not_call_reopen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            self._set_stage(tmp_path, epic_id, "PLAN")
+            self._write_triaged_reopen(tmp_path, epic_id, "HFB-001", "REOPEN_PLAN", "PLAN")
+
+            result = run_harnessctl(tmp_path, "feedback", "continue",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", "HFB-001",
+                                    "--execute", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            decoder = json.JSONDecoder()
+            objects = []
+            pos = 0
+            stdout = result.stdout
+            while pos < len(stdout):
+                start = stdout.find("{", pos)
+                if start == -1:
+                    break
+                try:
+                    obj, end = decoder.raw_decode(stdout[start:])
+                    objects.append(obj)
+                    pos = start + end
+                except json.JSONDecodeError:
+                    pos = start + 1
+            self.assertTrue(objects, result.stdout)
+            data = objects[-1]
+            self.assertEqual(data["status"], "continuation_pending")
+            self.assertEqual(data["mode"], "same_stage_replan")
+            self.assertEqual(data["continuation"]["next_action"], "feedback_replan")
+            self.assertIn("feedback re-plan", data["continuation"]["next_command"])
+            self.assertTrue(data["continuation"]["must_auto_continue"])
+
+            state = json.loads((tmp_path / ".harness" / "features" / epic_id / "state.json").read_text())
+            self.assertEqual(state["current_stage"], "PLAN")
+            self.assertEqual(state["pending_re_completion"]["stages"], ["PLAN"])
+            self.assertTrue(state["reopen_history"][-1]["same_stage"])
+
+            fb = json.loads((tmp_path / ".harness" / "features" / epic_id /
+                             "feedback" / "HFB-001.json").read_text())
+            self.assertEqual(fb["status"], "continuation_pending")
+            self.assertEqual(fb["continuation"]["mode"], "same_stage_replan")
+
+            gate = run_harnessctl(tmp_path, "feedback", "gate-check",
+                                  "--epic-id", epic_id, "--json")
+            self.assertEqual(gate.returncode, 1)
+            gate_data = json.loads(gate.stdout)
+            self.assertEqual(gate_data["blocked_items"][0]["reason"], "continuation_pending")
+
+    def test_continue_reopen_next_command_is_stage_aware(self):
+        cases = [
+            ("CLARIFY", "REOPEN_CLARIFY", "feedback_reclarify", "feedback re-clarify"),
+            ("SPEC", "REOPEN_SPEC", "feedback_respec", "feedback re-spec"),
+            ("PLAN", "REOPEN_PLAN", "feedback_replan", "feedback re-plan"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            for idx, (target_stage, decision, next_action, cmd_fragment) in enumerate(cases, start=1):
+                feedback_id = f"HFB-{idx:03d}"
+                self._write_triaged_reopen(tmp_path, epic_id, feedback_id, decision, target_stage)
+                result = run_harnessctl(tmp_path, "feedback", "continue",
+                                        "--epic-id", epic_id,
+                                        "--feedback-id", feedback_id,
+                                        "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                data = json.loads(result.stdout)
+                cont = data["continuation"]
+                self.assertEqual(cont["next_action"], next_action)
+                self.assertIn(cmd_fragment, cont["next_command"])
+
+    def test_reclarify_and_respec_commands_generate_manifest(self):
+        cases = [
+            ("CLARIFY", "REOPEN_CLARIFY", "re-clarify", "clarify-summary.md"),
+            ("SPEC", "REOPEN_SPEC", "re-spec", "SDD.md"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            features_dir = tmp_path / ".harness" / "features" / epic_id
+            for idx, (target_stage, decision, command, artifact) in enumerate(cases, start=1):
+                feedback_id = f"HFB-{idx:03d}"
+                self._set_stage(tmp_path, epic_id, target_stage)
+                self._write_triaged_reopen(tmp_path, epic_id, feedback_id, decision, target_stage)
+                run_harnessctl(tmp_path, "feedback", "continue",
+                               "--epic-id", epic_id,
+                               "--feedback-id", feedback_id,
+                               "--execute", "--json")
+                artifact_path = features_dir / artifact
+                artifact_path.write_text(f"updated {artifact} for {feedback_id}\n")
+                amendment_path = features_dir / "feedback" / f"{feedback_id}.amendment-plan.json"
+                amendment_path.write_text(json.dumps({
+                    "target_stage": target_stage,
+                    "source_verdict": decision,
+                    "changed_artifacts": [{
+                        "path": artifact,
+                        "before_hash": "sha256:before",
+                        "evidence": f"updated {artifact}",
+                    }],
+                }, indent=2))
+
+                result = run_harnessctl(tmp_path, "feedback", command,
+                                        "--epic-id", epic_id,
+                                        "--feedback-id", feedback_id,
+                                        "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                data = json.loads(result.stdout)
+                self.assertEqual(data["stage"], target_stage)
+
+                manifest = json.loads((features_dir / "feedback" /
+                                       f"{feedback_id}.revision-manifest.json").read_text())
+                self.assertEqual(manifest["stage"], target_stage)
+                self.assertEqual(manifest["changed_artifacts"][0]["path"], artifact)
+
+    def test_plain_reopen_still_rejects_same_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            self._set_stage(tmp_path, epic_id, "PLAN")
+            self._write_triaged_reopen(tmp_path, epic_id, "HFB-001", "REOPEN_PLAN", "PLAN")
+            run_harnessctl(tmp_path, "feedback", "plan-amendment",
+                           "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+            run_harnessctl(tmp_path, "feedback", "approve-amendment",
+                           "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+
+            result = run_harnessctl(tmp_path, "reopen",
+                                    "--epic-id", epic_id,
+                                    "--to", "PLAN",
+                                    "--feedback-id", "HFB-001",
+                                    "--json")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must be earlier than current stage", result.stderr)
+
+
 class TestContinueAutoExecute(unittest.TestCase):
     """Test that continue --execute auto-creates tasks for STAY_EXECUTE."""
 
