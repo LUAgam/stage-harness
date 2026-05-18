@@ -33,6 +33,14 @@ $HARNESSCTL stage-gate check SPEC --epic-id <epic-id>
 
 若检查失败，展示缺失产物列表，提示先完成 `/harness:spec <epic-id>`，终止。
 
+## 注册调度来源
+
+前置检查通过后，立即注册 dispatch 记录：
+
+```bash
+$HARNESSCTL dispatch register <epic-id> PLAN --via=skill:harness-plan
+```
+
 ## 执行步骤
 
 ### Step 1：运行 bridge 脚本

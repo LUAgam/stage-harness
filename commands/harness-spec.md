@@ -46,6 +46,14 @@ $HARNESSCTL bundle check-confirmed --epic-id <epic-id>
 - 提示用户逐一确认或标注为 `assumable`
 - 等待用户确认后继续
 
+## 注册调度来源
+
+前置检查通过后，立即注册 dispatch 记录：
+
+```bash
+$HARNESSCTL dispatch register <epic-id> SPEC --via=skill:harness-spec
+```
+
 ## 执行步骤
 
 ### Step 1：转换 Decision Bundle 为规格输入

@@ -42,6 +42,14 @@ $HARNESSCTL stage-gate check E2E --epic-id <epic-id>
 若 E2E 检查失败，提示先完成 `/stage-harness:harness-e2e <epic-id>`，终止。
 若 VERIFY 检查失败，提示先完成 `/stage-harness:harness-review <epic-id>`，终止。
 
+## 注册调度来源
+
+前置检查通过后，立即注册 dispatch 记录：
+
+```bash
+$HARNESSCTL dispatch register <epic-id> DONE --via=skill:harness-done
+```
+
 ## 执行步骤
 
 ### Step 1：发布议会

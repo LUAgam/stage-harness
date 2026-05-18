@@ -155,8 +155,8 @@ if [ "$RISK_LEVEL" = "high" ]; then
   # 执行：Skill(skill="stage-harness:harness-review", args="<epic-id>")
 else
   # low/medium：跳过 VERIFY 议会，直接进入 BUILD
-  $HARNESSCTL state transition <epic-id> VERIFY
-  $HARNESSCTL state transition <epic-id> BUILD
+  $HARNESSCTL state transition <epic-id> VERIFY --skip-dispatch-check
+  $HARNESSCTL state transition <epic-id> BUILD --skip-dispatch-check
   export HARNESS_SKIP_VERIFY_GATE=1
   # 执行：Skill(skill="stage-harness:harness-build", args="<epic-id>")
 fi

@@ -37,6 +37,14 @@ $HARNESSCTL stage-gate check EXECUTE --epic-id <epic-id>
 
 若检查失败，列出未完成任务，提示先完成 `/harness:work <epic-id>`，终止。
 
+## 注册调度来源
+
+前置检查通过后，立即注册 dispatch 记录：
+
+```bash
+$HARNESSCTL dispatch register <epic-id> VERIFY --via=skill:harness-review
+```
+
 ## 执行步骤
 
 **REQUIRED SKILL:** Use `harness:review` skill

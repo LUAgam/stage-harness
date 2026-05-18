@@ -75,6 +75,14 @@ fi
 若手动模式检查失败，提示先完成 `/stage-harness:harness-review <epic-id>`，终止。
 若 auto 模式检查失败，提示先完成 `/harness:work <epic-id>`，终止。
 
+## 注册调度来源
+
+前置检查通过后，立即注册 dispatch 记录：
+
+```bash
+$HARNESSCTL dispatch register <epic-id> BUILD --via=skill:harness-build
+```
+
 ## 读取/推断编译命令
 
 **REQUIRED SKILL:** Use `stage-harness:build` skill

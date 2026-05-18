@@ -50,6 +50,14 @@ $HARNESSCTL stage-gate check BUILD --epic-id <epic-id>
 
 若检查失败，提示先完成 `/stage-harness:harness-build <epic-id>`，终止。
 
+## 注册调度来源
+
+前置检查通过后，立即注册 dispatch 记录：
+
+```bash
+$HARNESSCTL dispatch register <epic-id> DEPLOY --via=skill:harness-deploy
+```
+
 ## 确定部署方式
 
 **REQUIRED SKILL:** Use `stage-harness:deploy` skill

@@ -4338,6 +4338,15 @@ def cmd_state_transition(args, h: Path) -> None:
         if all(s in rc_completed for s in rc_stages):
             state.pop("pending_re_completion", None)
 
+    # Dispatch ledger verification: ensure current stage was dispatched via skill
+    if not getattr(args, "skip_dispatch_check", False):
+        passed, msg = _dispatch_verify(h, epic_id, current)
+        if not passed:
+            err(
+                f"Dispatch verification failed for {current}: {msg}\n"
+                f"Use --skip-dispatch-check to bypass (manual recovery only)."
+            )
+
     # Build transition log entry
     log_entry = {
         "from": current,
@@ -6308,6 +6317,193 @@ def cmd_budget_consume(args, h: Path) -> None:
         out_json({"consumed": budget["consumed"], "remaining": budget["remaining"]})
     else:
         print(f"Consumed 1 interrupt. Remaining: {budget['remaining']}/{budget['total']}")
+
+
+# ---------------------------------------------------------------------------
+# dispatch ledger — skill dispatch verification for harness-auto
+# ---------------------------------------------------------------------------
+
+# Stage → expected skill mapping
+_STAGE_SKILL_MAP = {
+    "CLARIFY": "harness-clarify",
+    "SPEC": "harness-spec",
+    "PLAN": "harness-plan",
+    "EXECUTE": "harness-work",
+    "VERIFY": "harness-review",
+    "BUILD": "harness-build",
+    "DEPLOY": "harness-deploy",
+    "E2E": "harness-e2e-test",
+    "FIX": "harness-fix",
+    "DONE": "harness-done",
+}
+
+# Stages exempt from dispatch verification
+_DISPATCH_EXEMPT_STAGES = {"IDEA"}
+
+
+def _dispatch_ledger_path(h: Path, epic_id: str) -> Path:
+    return h / "features" / epic_id / "dispatch-ledger.json"
+
+
+def _load_dispatch_ledger(h: Path, epic_id: str) -> dict:
+    p = _dispatch_ledger_path(h, epic_id)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {"epic_id": epic_id, "entries": {}}
+
+
+def _save_dispatch_ledger(h: Path, epic_id: str, ledger: dict) -> None:
+    p = _dispatch_ledger_path(h, epic_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(p, ledger)
+
+
+def _dispatch_verify(h: Path, epic_id: str, stage: str) -> tuple[bool, str]:
+    """Verify that a stage has a valid dispatch record. Returns (passed, message)."""
+    if stage in _DISPATCH_EXEMPT_STAGES:
+        return True, f"{stage} is exempt from dispatch verification"
+
+    ledger = _load_dispatch_ledger(h, epic_id)
+    entry = ledger.get("entries", {}).get(stage)
+
+    if not entry:
+        return False, f"No dispatch record for {stage}. Stage work must be done via Skill plugin."
+
+    via = entry.get("dispatched_via", "")
+    if not via.startswith("skill:"):
+        return False, f"Invalid dispatch source for {stage}: '{via}'. Must start with 'skill:'"
+
+    return True, f"{stage} dispatched via {via}"
+
+
+def cmd_dispatch_register(args, h: Path) -> None:
+    """Register that a stage is being executed via a specific skill."""
+    epic_id = args.epic_id
+    stage = args.stage.upper()
+    via = args.via
+
+    if stage not in STAGES:
+        err(f"Unknown stage: {stage}. Valid: {STAGES}")
+    if not via.startswith("skill:"):
+        err(f"--via must start with 'skill:' (got: '{via}')")
+
+    ledger = _load_dispatch_ledger(h, epic_id)
+    ledger["entries"][stage] = {
+        "dispatched_via": via,
+        "registered_at": now_iso(),
+    }
+    _save_dispatch_ledger(h, epic_id, ledger)
+
+    append_trace_event(h, _make_trace_event(
+        epic_id, "dispatch_registered",
+        stage=stage,
+        command_name="harnessctl dispatch register",
+        summary=f"Dispatch registered: {stage} via {via}",
+        payload={"stage": stage, "via": via},
+    ))
+
+    if args.json:
+        out_json({"status": "ok", "epic_id": epic_id, "stage": stage, "via": via})
+    else:
+        print(f"✅ Dispatch registered: {stage} via {via}")
+
+
+def cmd_dispatch_verify(args, h: Path) -> None:
+    """Verify that a stage has a valid dispatch record."""
+    epic_id = args.epic_id
+    stage = args.stage.upper()
+
+    passed, message = _dispatch_verify(h, epic_id, stage)
+
+    append_trace_event(h, _make_trace_event(
+        epic_id, "dispatch_verified" if passed else "dispatch_verify_failed",
+        stage=stage,
+        command_name="harnessctl dispatch verify",
+        summary=message,
+        payload={"stage": stage, "passed": passed, "message": message},
+    ))
+
+    if args.json:
+        out_json({"epic_id": epic_id, "stage": stage, "passed": passed, "message": message})
+    else:
+        if passed:
+            print(f"✅ {message}")
+        else:
+            print(f"❌ {message}")
+            sys.exit(1)
+
+
+def cmd_dispatch_check(args, h: Path) -> None:
+    """Check dispatch status for a stage (non-blocking, informational)."""
+    epic_id = args.epic_id
+    stage = args.stage.upper()
+
+    ledger = _load_dispatch_ledger(h, epic_id)
+    entry = ledger.get("entries", {}).get(stage)
+
+    if args.json:
+        out_json({
+            "epic_id": epic_id,
+            "stage": stage,
+            "has_record": entry is not None,
+            "entry": entry,
+        })
+    else:
+        if entry:
+            print(f"✅ {stage}: dispatched_via={entry['dispatched_via']} at {entry['registered_at']}")
+        else:
+            print(f"⚠  {stage}: no dispatch record")
+
+
+def cmd_dispatch_reset(args, h: Path) -> None:
+    """Clear dispatch record for one or more stages (used by FIX for re-flow)."""
+    epic_id = args.epic_id
+    stages = [s.upper() for s in args.stages]
+
+    ledger = _load_dispatch_ledger(h, epic_id)
+    cleared = []
+    for stage in stages:
+        if stage in ledger.get("entries", {}):
+            del ledger["entries"][stage]
+            cleared.append(stage)
+    _save_dispatch_ledger(h, epic_id, ledger)
+
+    append_trace_event(h, _make_trace_event(
+        epic_id, "dispatch_reset",
+        stage=",".join(stages),
+        command_name="harnessctl dispatch reset",
+        summary=f"Dispatch reset: {cleared or 'none to clear'}",
+        payload={"stages_requested": stages, "stages_cleared": cleared},
+    ))
+
+    if args.json:
+        out_json({"status": "ok", "epic_id": epic_id, "cleared": cleared})
+    else:
+        if cleared:
+            print(f"✅ Dispatch records cleared: {', '.join(cleared)}")
+        else:
+            print(f"⚠  No dispatch records to clear for: {', '.join(stages)}")
+
+
+def cmd_dispatch_dump(args, h: Path) -> None:
+    """Dump the full dispatch ledger for an epic."""
+    epic_id = args.epic_id
+    ledger = _load_dispatch_ledger(h, epic_id)
+
+    if args.json:
+        out_json(ledger)
+    else:
+        entries = ledger.get("entries", {})
+        if not entries:
+            print(f"Dispatch ledger for {epic_id}: (empty)")
+            return
+        print(f"Dispatch ledger for {epic_id}:")
+        for stage in STAGES:
+            entry = entries.get(stage)
+            if entry:
+                print(f"  {stage:10s} → {entry['dispatched_via']} ({entry['registered_at']})")
+            else:
+                print(f"  {stage:10s} → (none)")
 
 
 # ---------------------------------------------------------------------------
@@ -11625,6 +11821,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_strans = state_sub.add_parser("transition", help="Transition epic to new stage")
     p_strans.add_argument("epic_id")
     p_strans.add_argument("new_stage")
+    p_strans.add_argument("--skip-dispatch-check", dest="skip_dispatch_check", action="store_true",
+                          help="Skip dispatch ledger verification (manual recovery only)")
     p_strans.add_argument("--json", action="store_true")
 
     p_spatch = state_sub.add_parser("patch", help="Patch specific state fields with --set key=value")
@@ -12004,6 +12202,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_dec_check.add_argument("--decision-id", dest="decision_id", required=True)
     p_dec_check.add_argument("--json", action="store_true")
 
+    # ---- dispatch ----
+    p_dispatch = sub.add_parser("dispatch", help="Dispatch ledger — skill dispatch verification")
+    dispatch_sub = p_dispatch.add_subparsers(dest="dispatch_action", metavar="ACTION")
+    dispatch_sub.required = True
+
+    p_disp_register = dispatch_sub.add_parser("register", help="Register skill dispatch for a stage")
+    p_disp_register.add_argument("epic_id")
+    p_disp_register.add_argument("stage", help="Stage name (CLARIFY, SPEC, PLAN, ...)")
+    p_disp_register.add_argument("--via", required=True, help="Dispatch source (must start with 'skill:')")
+    p_disp_register.add_argument("--json", action="store_true")
+
+    p_disp_verify = dispatch_sub.add_parser("verify", help="Verify dispatch record exists for a stage")
+    p_disp_verify.add_argument("epic_id")
+    p_disp_verify.add_argument("stage")
+    p_disp_verify.add_argument("--json", action="store_true")
+
+    p_disp_check = dispatch_sub.add_parser("check", help="Check dispatch status (non-blocking)")
+    p_disp_check.add_argument("epic_id")
+    p_disp_check.add_argument("stage")
+    p_disp_check.add_argument("--json", action="store_true")
+
+    p_disp_reset = dispatch_sub.add_parser("reset", help="Clear dispatch records for stages (FIX re-flow)")
+    p_disp_reset.add_argument("epic_id")
+    p_disp_reset.add_argument("stages", nargs="+", help="Stage names to clear")
+    p_disp_reset.add_argument("--json", action="store_true")
+
+    p_disp_dump = dispatch_sub.add_parser("dump", help="Dump full dispatch ledger")
+    p_disp_dump.add_argument("epic_id")
+    p_disp_dump.add_argument("--json", action="store_true")
+
     # ---- validate ----
     p_validate = sub.add_parser("validate", help="Validate .harness/ directory integrity")
     p_validate.add_argument("--json", action="store_true")
@@ -12316,6 +12544,18 @@ def main() -> None:
 
     elif args.command == "feedback-coverage":
         cmd_feedback_coverage_check(args, h)
+
+    elif args.command == "dispatch":
+        if args.dispatch_action == "register":
+            cmd_dispatch_register(args, h)
+        elif args.dispatch_action == "verify":
+            cmd_dispatch_verify(args, h)
+        elif args.dispatch_action == "check":
+            cmd_dispatch_check(args, h)
+        elif args.dispatch_action == "reset":
+            cmd_dispatch_reset(args, h)
+        elif args.dispatch_action == "dump":
+            cmd_dispatch_dump(args, h)
 
     elif args.command == "decisions":
         if args.decisions_action == "add":

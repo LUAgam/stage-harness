@@ -76,6 +76,14 @@ $HARNESSCTL budget check --epic-id <epic-id>
 
 ---
 
+## 注册调度来源
+
+前置检查通过后，立即注册 dispatch 记录：
+
+```bash
+$HARNESSCTL dispatch register <epic-id> CLARIFY --via=skill:harness-clarify
+```
+
 ## 执行步骤
 
 **REQUIRED SKILL:** Use `harness:clarify` skill

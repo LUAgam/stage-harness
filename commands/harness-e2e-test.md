@@ -66,6 +66,14 @@ $HARNESSCTL stage-gate check DEPLOY --epic-id <epic-id>
 
 若检查失败，提示先完成 `/stage-harness:harness-deploy <epic-id>`，终止。
 
+## 注册调度来源
+
+前置检查通过后，立即注册 dispatch 记录：
+
+```bash
+$HARNESSCTL dispatch register <epic-id> E2E --via=skill:harness-e2e-test
+```
+
 ## 最小上下文加载（硬性）
 
 orchestrator 在调度 skill 前**只允许**读取以下文件用于路径拼接与门禁判断：

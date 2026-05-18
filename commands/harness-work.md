@@ -37,6 +37,14 @@ $HARNESSCTL stage-gate check PLAN --epic-id <epic-id>
 
 若检查失败，提示先完成 `/harness:plan <epic-id>`，终止。
 
+## 注册调度来源
+
+前置检查通过后，立即注册 dispatch 记录：
+
+```bash
+$HARNESSCTL dispatch register <epic-id> EXECUTE --via=skill:harness-work
+```
+
 ## 确定执行目标
 
 根据 `$ARGUMENTS` 的格式：

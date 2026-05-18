@@ -39,6 +39,14 @@ $HARNESSCTL state get <epic-id> --field current_stage
 - 正常流程通过 `/harness:review` 触发（议会 REJECTED 时自动转 FIX）
 - 手动执行时需先确认 epic 处于 FIX 状态
 
+## 注册调度来源
+
+前置检查通过后，立即注册 dispatch 记录：
+
+```bash
+$HARNESSCTL dispatch register <epic-id> FIX --via=skill:harness-fix
+```
+
 ## 执行步骤
 
 ### Step 1：提取待修复问题
@@ -94,6 +102,19 @@ $HARNESSCTL task list <epic-id> --status pending
 ```bash
 # 读取 FIX 来源阶段
 FIX_SOURCE=$($HARNESSCTL state get <epic-id> --field fix_source_stage)
+```
+
+**清除回流阶段的 dispatch 记录**（确保重新执行时必须再次通过 Skill 调度）：
+
+```bash
+case "$FIX_SOURCE" in
+  VERIFY)
+    $HARNESSCTL dispatch reset <epic-id> VERIFY
+    ;;
+  BUILD|DEPLOY|E2E)
+    $HARNESSCTL dispatch reset <epic-id> BUILD DEPLOY E2E
+    ;;
+esac
 ```
 
 | `fix_source_stage` | 回流目标 | 执行命令 |
