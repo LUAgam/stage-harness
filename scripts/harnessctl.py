@@ -3732,7 +3732,16 @@ def _derive_start_title(requirements: str, explicit_title: str = "") -> str:
 
 def _create_epic(h: Path, title: str, risk_level: str, description: str = "") -> dict:
     """Create epic metadata and initial state, then persist both."""
-    config = load_json(h / CONFIG_FILE)
+    config_path = h / CONFIG_FILE
+    if not config_path.exists():
+        _auto_config = {
+            "project_root": str(h.parent),
+            "harness_version": VERSION,
+            "created_at": now_iso(),
+            "auto_created": True,
+        }
+        atomic_write_json(config_path, _auto_config)
+    config = load_json(config_path)
     if risk_level not in RISK_LEVELS:
         err(f"Invalid risk_level: {risk_level}. Must be one of {RISK_LEVELS}")
 
@@ -3932,6 +3941,130 @@ def cmd_epic_create(args, h: Path) -> None:
             print(f"  description:{' ' * 4}{description}")
         print(f"  state:      CLARIFY")
         print(f"  risk_level: {risk_level}")
+
+
+def cmd_epic_register(args, h: Path) -> None:
+    """Register existing artifacts under a specified epic ID.
+
+    This is useful when artifacts were created in a previous session
+    (e.g., under .harness/features/{id}/) but the epic was never formally
+    registered in .harness/epics/.
+    """
+    epic_id = args.id
+    features_dir = h / "features" / epic_id
+
+    # Validate: artifacts directory must exist
+    if not features_dir.exists():
+        specs_glob = list((h / "specs").glob(f"{epic_id}.*")) if (h / "specs").exists() else []
+        tasks_glob = list((h / "tasks").glob(f"{epic_id}.*")) if (h / "tasks").exists() else []
+        if not specs_glob and not tasks_glob:
+            err(f"No artifacts found for epic '{epic_id}'. "
+                f"Expected at least one of: features/{epic_id}/, specs/{epic_id}.*, tasks/{epic_id}.*")
+        # Create features dir if only specs/tasks exist
+        features_dir.mkdir(parents=True, exist_ok=True)
+
+    # Validate: not already registered
+    epic_path = h / "epics" / f"{epic_id}.json"
+    if epic_path.exists():
+        err(f"Epic '{epic_id}' is already registered.")
+
+    # Auto-create config if missing
+    config_path = h / CONFIG_FILE
+    if not config_path.exists():
+        _auto_config = {
+            "project_root": str(h.parent),
+            "harness_version": VERSION,
+            "created_at": now_iso(),
+            "auto_created": True,
+        }
+        atomic_write_json(config_path, _auto_config)
+    config = load_json(config_path)
+
+    # Detect profile type
+    profile_path = h / PROFILE_FILE
+    profile_type = "unknown"
+    if profile_path.exists():
+        parsed = _parse_simple_yaml(profile_path.read_text(encoding="utf-8"))
+        profile_type = parsed.get("type", "unknown")
+
+    # Detect current state from existing state.json if available
+    state_path = features_dir / "state.json"
+    current_stage = args.state or "CLARIFY"
+    if state_path.exists() and not args.state:
+        try:
+            existing_state = load_json(state_path)
+            current_stage = existing_state.get("current_stage", "CLARIFY")
+        except SystemExit:
+            pass
+
+    title = args.title or epic_id
+    description = getattr(args, "description", "") or ""
+    risk_level = args.risk_level or config.get("risk_level", "medium")
+    interrupt_budget_total = config.get("interrupt_budget", 2)
+
+    epic = {
+        "id": epic_id,
+        "title": title,
+        "description": description,
+        "state": current_stage,
+        "risk_level": risk_level,
+        "profile_type": profile_type,
+        "created_at": now_iso(),
+        "registered_from_existing": True,
+        "interrupt_budget": {
+            "total": interrupt_budget_total,
+            "consumed": 0,
+        },
+        "tasks": [],
+        "repo_worktrees": {},
+    }
+
+    # Ensure epics dir exists
+    epic_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(epic_path, epic)
+
+    # Create state.json only if it doesn't already exist
+    if not state_path.exists():
+        state = {
+            "version": VERSION,
+            "current_stage": current_stage,
+            "epic_id": epic_id,
+            "risk_level": risk_level,
+            "project_profile": profile_type,
+            "interrupt_budget": {
+                "total": interrupt_budget_total,
+                "consumed": 0,
+                "remaining": interrupt_budget_total,
+            },
+            "stage_history": [
+                {
+                    "from": None,
+                    "to": current_stage,
+                    "at": now_iso(),
+                    "actor": "harnessctl-register",
+                }
+            ],
+            "pending_decisions": [],
+            "runtime_health": {
+                "consecutive_failures": 0,
+                "drift_detected": False,
+                "last_smoke_pass": None,
+            },
+            "updated_at": now_iso(),
+        }
+        features_dir.mkdir(parents=True, exist_ok=True)
+        save_state(h, state)
+
+    if args.json:
+        out_json(epic)
+    else:
+        print(f"Registered epic: {epic_id}")
+        print(f"  title:      {title}")
+        print(f"  state:      {current_stage}")
+        print(f"  risk_level: {risk_level}")
+        if description:
+            print(f"  description: {description}")
+        print(f"  artifacts:  {features_dir.relative_to(h)}/")
 
 
 def cmd_epic_show(args, h: Path) -> None:
@@ -7568,8 +7701,8 @@ def _update_rules_index(h: Path) -> None:
 # ---------------------------------------------------------------------------
 
 FEEDBACK_STATUSES = [
-    "submitted", "triaged", "amendment_planned", "approved",
-    "reopened", "amending", "implemented", "verified",
+    "submitted", "triaging", "triaged", "amendment_planned", "approved",
+    "reopened", "amending", "continuation_pending", "implemented", "verified",
     "closed", "rejected", "deferred",
 ]
 
@@ -9908,15 +10041,76 @@ def _auto_discover_related_gaps(h: Path, epic_id: str, feedback_id: str,
     # 3. Analyze tasks: find if related tasks are missing
     tasks_dir = h / "tasks"
     task_surfaces: set[str] = set()
+    task_titles: list[str] = []
     if tasks_dir.exists():
-        for tf in tasks_dir.glob(f"{epic_id}.*.json"):
+        for tf in tasks_dir.glob(f"{epic_id}*.json"):
             try:
-                task = json.loads(tf.read_text(encoding="utf-8"))
-                surface = task.get("surface", "")
-                title = task.get("title", "")
-                if any(kw in title.lower() for kw in keywords):
-                    task_surfaces.add(surface)
+                task_data = json.loads(tf.read_text(encoding="utf-8"))
+                # Handle both formats: individual task files and tasks.json with embedded tasks
+                task_list = []
+                if "tasks" in task_data and isinstance(task_data["tasks"], list):
+                    task_list = task_data["tasks"]
+                else:
+                    task_list = [task_data]
+                for task in task_list:
+                    surface = task.get("surface", "")
+                    title = task.get("title", "")
+                    task_titles.append(title)
+                    if surface:
+                        task_surfaces.add(surface)
+                    # Also collect surfaces from surfaces array
+                    for s in task.get("surfaces", []):
+                        if isinstance(s, str):
+                            task_surfaces.add(s.split("/")[0])  # top-level repo/dir
             except (json.JSONDecodeError, OSError):
+                pass
+
+    # 3b. Cross-reference spec impact section against task surfaces
+    spec_dir = h / "specs"
+    if spec_dir.exists():
+        for sp in spec_dir.glob(f"{epic_id}*"):
+            try:
+                spec_text = sp.read_text(encoding="utf-8")
+                # Extract repos/modules mentioned in impact/影响 sections
+                in_impact = False
+                spec_repos: set[str] = set()
+                for line in spec_text.splitlines():
+                    ll = line.lower().strip()
+                    if "影响" in ll or "impact" in ll:
+                        in_impact = True
+                    elif ll.startswith("## ") and in_impact:
+                        in_impact = False
+                    elif in_impact and "|" in line:
+                        # Extract first column from table row (likely repo name)
+                        cols = [c.strip() for c in line.split("|") if c.strip()]
+                        if cols and not cols[0].startswith("-") and cols[0] not in ("仓库", "Repo", "仓库名"):
+                            repo_name = cols[0].strip()
+                            if repo_name and len(repo_name) < 60:
+                                spec_repos.add(repo_name)
+
+                # Find repos in spec impact but not covered by any task surface
+                for repo in spec_repos:
+                    repo_lower = repo.lower().replace("/", "").replace("-", "")
+                    covered = False
+                    for ts in task_surfaces:
+                        ts_lower = ts.lower().replace("/", "").replace("-", "")
+                        if repo_lower in ts_lower or ts_lower in repo_lower:
+                            covered = True
+                            break
+                    # Also check if repo appears in any task title
+                    for tt in task_titles:
+                        if repo.lower() in tt.lower():
+                            covered = True
+                            break
+                    if not covered:
+                        gaps.append({
+                            "category": _classify_surface(repo),
+                            "description": f"Repo/module '{repo}' mentioned in spec impact section but no task covers it",
+                            "confidence": 0.8,
+                            "evidence": [f"spec: {sp.name}", f"repo: {repo}"],
+                            "source": "spec_task_crossref",
+                        })
+            except OSError:
                 pass
 
     # Check if feedback keywords appear in surfaces but no task covers them
@@ -10863,8 +11057,46 @@ def cmd_feedback_continue(args, h: Path) -> None:
     feedback_id = args.feedback_id
     fb = _load_feedback(h, epic_id, feedback_id)
 
-    if fb["status"] not in ("triaged", "amending"):
-        err(f"Feedback {feedback_id} is in status '{fb['status']}', expected 'triaged'")
+    if fb["status"] not in ("triaged", "amending", "approved"):
+        err(f"Feedback {feedback_id} is in status '{fb['status']}', expected 'triaged', 'amending', or 'approved'")
+
+    # If approved, skip verdict check and proceed to reopen execution
+    if fb["status"] == "approved":
+        # Load amendment plan to determine target stage
+        amendment_path = _feedback_dir(h, epic_id) / f"{feedback_id}.amendment-plan.md"
+        if not amendment_path.exists():
+            err(f"Amendment plan not found for approved feedback {feedback_id}")
+
+        # Load verdict (may still be needed for classification/decision)
+        councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council" / feedback_id
+        verdict_path = councils_dir / "verdict.json"
+        verdict = load_json(verdict_path) if verdict_path.exists() else {}
+        decision = verdict.get("decision", "REOPEN_PLAN")
+        classification = verdict.get("classification", "")
+
+        result = {
+            "status": "ok",
+            "feedback_id": feedback_id,
+            "decision": decision,
+            "classification": classification,
+            "from_approved": True,
+            "executed": True,
+            "message": f"Continuing from approved state. Decision: {decision}",
+            "next_steps": [
+                f"Execute amendment: /harness:work or re-plan as needed for {decision}",
+            ],
+        }
+        # Update status to indicate continuation
+        fb["status"] = "amending"
+        _save_feedback(h, epic_id, feedback_id, fb)
+
+        if args.json:
+            out_json(result)
+        else:
+            print(f"Feedback {feedback_id}: continuing from approved → amending")
+            print(f"  Decision: {decision}")
+            print(f"  Next: Execute amendment plan")
+        return
 
     # Load verdict
     councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council" / feedback_id
@@ -11597,6 +11829,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_elist = epic_sub.add_parser("list", help="List all epics")
     p_elist.add_argument("--json", action="store_true")
 
+    p_eregister = epic_sub.add_parser("register", help="Register existing artifacts as an epic")
+    p_eregister.add_argument("--id", required=True, help="Exact epic ID (must match existing artifact directory names)")
+    p_eregister.add_argument("--title", default="", help="Epic title (defaults to epic ID)")
+    p_eregister.add_argument("--description", default="", help="Optional epic description")
+    p_eregister.add_argument("--state", default=None, choices=STAGES, help="Current stage (auto-detected from state.json if omitted)")
+    p_eregister.add_argument("--risk-level", dest="risk_level", choices=RISK_LEVELS)
+    p_eregister.add_argument("--json", action="store_true")
+
     p_esetwt = epic_sub.add_parser("set-worktree", help="Record worktree path for an epic")
     p_esetwt.add_argument("epic_id")
     p_esetwt.add_argument("worktree_path")
@@ -12323,6 +12563,8 @@ def main() -> None:
             cmd_epic_show(args, h)
         elif args.epic_action == "list":
             cmd_epic_list(args, h)
+        elif args.epic_action == "register":
+            cmd_epic_register(args, h)
         elif args.epic_action == "set-worktree":
             cmd_epic_set_worktree(args, h)
         elif args.epic_action == "show-worktrees":

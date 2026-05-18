@@ -346,6 +346,14 @@ feedback_candidate 检测
   → hook 自动 submit HFB-xxx
   → Guard 阻断（submitted feedback 存在，禁止 idle）
   → harnessctl feedback run-triage（自动执行 evidence-pack + council-triage init）
+  → ⚠️ run-triage 仅完成准备工作，返回 council_dispatch_required 信号
+  → 调用方（Claude 主会话）必须接续完成以下步骤：
+      1. 解析返回 JSON 中的 agents 列表
+      2. 使用 Agent 工具并行调度 6 个评审 agent（每个通过 write-vote 提交投票）
+      3. 等待全部 agent 完成
+      4. harnessctl feedback aggregate-triage
+      5. harnessctl feedback continue --execute
+  → 以上 5 步是 run-triage 的完整语义，不可部分执行
   → 6 agent 并行评审（必须使用 Agent 工具，禁止手工生成 vote JSON）
   → harnessctl feedback aggregate-triage（v2 严格 schema 校验）
   → harnessctl feedback continue（自动执行后续）：
