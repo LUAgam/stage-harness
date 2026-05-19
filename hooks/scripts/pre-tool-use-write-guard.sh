@@ -53,13 +53,9 @@ protected_patterns = [
     r"(?:^|/)\.harness/features/[^/]+/feedback/HFB-[^/]+\.json$",
     r"(?:^|/)\.harness/features/[^/]+/artifact-status\.json$",
     r"(?:^|/)\.harness/features/[^/]+/coverage-matrix\.json$",
-    r"(?:^|/)\.harness/features/[^/]+/task-graph\.json$",
-    r"(?:^|/)\.harness/features/[^/]+/surface-routing\.json$",
-    r"(?:^|/)\.harness/features/[^/]+/domain-frame\.json$",
     r"(?:^|/)\.harness/features/[^/]+/receipts/[^/]+\.json$",
     r"(?:^|/)\.harness/features/[^/]+/runtime-receipts/[^/]+\.json$",
     r"(?:^|/)\.harness/features/[^/]+/runs/[^/]+\.json$",
-    r"(?:^|/)\.harness/features/[^/]+/verification\.json$",
     r"(?:^|/)\.harness/features/[^/]+/councils/.*/(?:verdict|metadata)\.json$",
     r"(?:^|/)\.harness/features/[^/]+/councils/.*/votes/[^/]+\.json$",
     # Backward-compatible relative snippets seen in older hook tests/commands.
