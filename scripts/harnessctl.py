@@ -7740,6 +7740,130 @@ FEEDBACK_TRIAGE_COUNCIL_AGENTS = [
     "code-reviewer",
 ]
 
+AMENDMENT_PLAN_JSON_SCHEMA_VERSION = 1
+
+
+def _default_amendment_plan_json_scaffold() -> dict:
+    """Minimal machine-merge scaffold; humans/skills fill before approve-amendment."""
+    return {
+        "schema_version": AMENDMENT_PLAN_JSON_SCHEMA_VERSION,
+        "confirmed": False,
+        "tasks_to_add": [],
+        "tasks_to_update": [],
+        "coverage_updates": [],
+        "dependency_updates": [],
+        "preserve": [],
+        "invalidate": [],
+        "changed_artifacts": [],
+    }
+
+
+def _validate_amendment_plan_json_for_approve(
+    amendment: dict,
+    *,
+    target_stage: str,
+    requires_reopen: bool,
+) -> list[str]:
+    """Return human-readable validation errors; empty means OK."""
+    errors: list[str] = []
+    if not isinstance(amendment, dict):
+        return ["root must be a JSON object"]
+
+    sv = amendment.get("schema_version", AMENDMENT_PLAN_JSON_SCHEMA_VERSION)
+    if sv not in (1, "1"):
+        errors.append(f"unsupported schema_version {sv!r} (expected 1)")
+
+    list_fields = (
+        "tasks_to_add",
+        "tasks_to_update",
+        "coverage_updates",
+        "preserve",
+        "invalidate",
+        "changed_artifacts",
+    )
+    for lf in list_fields:
+        if lf in amendment and not isinstance(amendment[lf], list):
+            errors.append(f"{lf} must be a list")
+
+    du = amendment.get("dependency_updates")
+    if du is not None and not isinstance(du, (dict, list)):
+        errors.append("dependency_updates must be an object or list")
+
+    if not requires_reopen or target_stage not in ("CLARIFY", "SPEC", "PLAN"):
+        return errors
+
+    if not amendment.get("confirmed"):
+        errors.append(
+            'set "confirmed": true in amendment-plan.json after reviewing markdown + JSON '
+            "(human gate)"
+        )
+
+    tgt = target_stage.upper()
+    if tgt == "PLAN":
+        tasks = amendment.get("tasks_to_add") or []
+        cov = amendment.get("coverage_updates") or []
+        if not tasks and not cov:
+            errors.append(
+                "PLAN reopen requires non-empty tasks_to_add or coverage_updates "
+                "(inputs for harnessctl feedback re-plan)"
+            )
+        for i, t in enumerate(tasks):
+            if not isinstance(t, dict):
+                errors.append(f"tasks_to_add[{i}] must be an object")
+                continue
+            if not (str(t.get("title") or "").strip() or str(t.get("subject") or "").strip()):
+                errors.append(f"tasks_to_add[{i}] needs title or subject")
+
+    return errors
+
+
+def _feedback_fill_amendment_plan_json_for_continue_execute(
+    h: Path, epic_id: str, feedback_id: str, verdict: dict,
+) -> None:
+    """Triaged `feedback continue --execute` runs plan-amendment then approve-amendment.
+
+    approve-amendment now requires reviewed amendment-plan.json; this helper performs the
+    deterministic machine-side minimum so automation stays usable (humans still gate via
+    standalone approve-amendment).
+    """
+    triage_path = _feedback_dir(h, epic_id) / f"{feedback_id}.triage.json"
+    triage = load_json(triage_path) if triage_path.exists() else {}
+    target_stage = (triage.get("target_stage") or verdict.get("target_stage") or "").strip().upper()
+    path = _feedback_dir(h, epic_id) / f"{feedback_id}.amendment-plan.json"
+    if not path.exists():
+        atomic_write_json(path, _default_amendment_plan_json_scaffold())
+    data = load_json(path)
+    data["confirmed"] = True
+    if target_stage == "PLAN":
+        tasks = data.get("tasks_to_add") or []
+        cov = data.get("coverage_updates") or []
+        if not tasks and not cov:
+            fb = _load_feedback(h, epic_id, feedback_id)
+            snippet = (fb.get("text") or "").strip().replace("\n", " ")[:120]
+            title = (
+                f"{feedback_id} amendment: {snippet}"
+                if snippet else f"{feedback_id} amendment task"
+            )
+            data.setdefault("tasks_to_add", []).append({
+                "title": title,
+                "surface": "",
+                "acceptance_criteria": [f"Resolve scope captured in {feedback_id}"],
+            })
+    atomic_write_json(path, data)
+
+
+def _pending_recompletion_first_stage(state: dict, feedback_id: str) -> str:
+    """Return next pending stage label for feedback_id, or ''."""
+    pending_rc = state.get("pending_re_completion")
+    if not isinstance(pending_rc, dict) or pending_rc.get("feedback_id") != feedback_id:
+        return ""
+    stages = [str(s).upper() for s in pending_rc.get("stages", [])]
+    completed = {str(s).upper() for s in pending_rc.get("completed_stages", [])}
+    for st in stages:
+        if st not in completed:
+            return st
+    return ""
+
 
 def _feedback_dir(h: Path, epic_id: str) -> Path:
     """Return the feedback directory for an epic, creating if needed."""
@@ -8069,8 +8193,23 @@ def cmd_feedback_plan_amendment(args, h: Path) -> None:
 
 ## Risk
 medium
+
+## Machine JSON ({feedback_id}.amendment-plan.json)
+Human-readable sections above inform review; **execution** uses parallel JSON consumed by `harnessctl feedback re-plan` / `re-spec` / `re-clarify`:
+
+- `schema_version`: **1**
+- `confirmed`: **true** after review (required before `harnessctl feedback approve-amendment` for reopen flows)
+- `tasks_to_add`, `tasks_to_update`, `coverage_updates` — PLAN merges (`re-plan` requires tasks or coverage updates)
+- `changed_artifacts` — CLARIFY/SPEC manifest inputs (`re-clarify` / `re-spec`)
+- Optional: `preserve`, `invalidate`, `dependency_updates`
+
+Scaffold is created by `harnessctl feedback plan-amendment` if missing; align markdown ## Amend with JSON fields before approve.
 """
     atomic_write(plan_path, plan_content)
+
+    json_path = _feedback_dir(h, epic_id) / f"{feedback_id}.amendment-plan.json"
+    if not json_path.exists():
+        atomic_write_json(json_path, _default_amendment_plan_json_scaffold())
 
     # Update status
     fb["status"] = "amendment_planned"
@@ -8078,9 +8217,11 @@ medium
 
     if args.json:
         out_json({"status": "ok", "feedback_id": feedback_id, "plan_path": str(plan_path),
-                  "related_gaps_included": related_gaps_section != "None"})
+                  "related_gaps_included": related_gaps_section != "None",
+                  "amendment_json_path": str(json_path)})
     else:
         print(f"Amendment plan created: {plan_path}")
+        print(f"  Machine scaffold (edit before approve): {json_path}")
         if related_gaps_section != "None":
             print(f"  ⚠ Related gaps auto-populated — review before approve")
 
@@ -8154,6 +8295,41 @@ def cmd_feedback_approve_amendment(args, h: Path) -> None:
                        f"not addressed in ## Amend or deferred with reason in ## Deferred Related Gaps:\n"
                        + "\n".join(f"  - {g}" for g in unaddressed))
                 err(msg)
+
+    triage_path = _feedback_dir(h, epic_id) / f"{feedback_id}.triage.json"
+    triage = load_json(triage_path) if triage_path.exists() else {}
+    target_stage = (triage.get("target_stage") or "").strip().upper()
+    requires_reopen = bool(triage.get("requires_reopen"))
+    if not target_stage:
+        target_stage = (verdict.get("target_stage") or "").strip().upper()
+    if not requires_reopen:
+        requires_reopen = bool(verdict.get("requires_reopen", False))
+
+    fb_dir_a = _feedback_dir(h, epic_id)
+    amendment_json_path = fb_dir_a / f"{feedback_id}.amendment-plan.json"
+    if requires_reopen and target_stage in ("CLARIFY", "SPEC", "PLAN"):
+        if not amendment_json_path.exists():
+            hs = target_stage.lower()
+            err(
+                f"{feedback_id}.amendment-plan.json not found under "
+                f".harness/features/{epic_id}/feedback/.\n"
+                + _format_recovery_block(_feedback_amendment_plan_recovery_commands(epic_id, feedback_id, hs))
+            )
+        amendment_doc = load_json(amendment_json_path)
+        aj_errors = _validate_amendment_plan_json_for_approve(
+            amendment_doc,
+            target_stage=target_stage,
+            requires_reopen=True,
+        )
+        if aj_errors:
+            err(
+                "amendment-plan.json failed validation:\n  - "
+                + "\n  - ".join(aj_errors) + "\n"
+                + _format_recovery_block([
+                    f"Edit .harness/features/{epic_id}/feedback/{feedback_id}.amendment-plan.json to fix the errors",
+                    f"harnessctl feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+                ])
+            )
 
     fb["status"] = "approved"
     _save_feedback(h, epic_id, feedback_id, fb)
@@ -8759,7 +8935,7 @@ def cmd_feedback_write_vote(args, h: Path) -> None:
     councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council" / feedback_id
     meta_path = councils_dir / "metadata.json"
     if not meta_path.exists():
-        err(f"Council not initialized for {feedback_id}. Run: feedback council-triage first")
+        err(f"Council not initialized for {feedback_id}. Run: harnessctl feedback council-triage first")
     meta = load_json(meta_path)
 
     if agent_name not in FEEDBACK_TRIAGE_COUNCIL_AGENTS:
@@ -8835,7 +9011,7 @@ def cmd_feedback_council_triage(args, h: Path) -> None:
     # Verify evidence-pack exists
     pack_path = _feedback_dir(h, epic_id) / f"{feedback_id}.evidence-pack.json"
     if not pack_path.exists():
-        err(f"Evidence pack not found for {feedback_id}. Run: feedback evidence-pack first")
+        err(f"Evidence pack not found for {feedback_id}. Run: harnessctl feedback evidence-pack first")
 
     # Initialize votes directory (scoped by feedback-id)
     councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council" / feedback_id
@@ -9350,8 +9526,25 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
     stage = args.stage.upper()
     fb = _load_feedback(h, epic_id, feedback_id)
 
+    if fb["status"] == "continuation_pending":
+        err(
+            f"Feedback {feedback_id} is continuation_pending. Apply the amendment merge first:\n"
+            f"  PLAN: harnessctl feedback re-plan --epic-id {epic_id} --feedback-id {feedback_id}\n"
+            f"  SPEC: harnessctl feedback re-spec --epic-id {epic_id} --feedback-id {feedback_id}\n"
+            f"  CLARIFY: harnessctl feedback re-clarify --epic-id {epic_id} --feedback-id {feedback_id}\n"
+            "Then run harnessctl feedback re-complete with the matching --stage."
+        )
+
     if fb["status"] not in ("reopened", "amending"):
-        err(f"Feedback {feedback_id} is in status '{fb['status']}', expected 'reopened' or 'amending'")
+        err(
+            f"Feedback {feedback_id} is '{fb['status']}', expected 'reopened' or 'amending'. "
+            "Run harnessctl feedback re-plan / re-clarify / re-spec first if you have not merged yet.\n"
+            + _format_recovery_block([
+                f"harnessctl feedback gate-check --epic-id {epic_id} --json",
+                f"harnessctl feedback re-plan --epic-id {epic_id} --feedback-id {feedback_id} "
+                "(or re-spec / re-clarify as appropriate)",
+            ])
+        )
 
     if stage not in ("CLARIFY", "SPEC", "PLAN"):
         err(f"Invalid re-* stage: {stage}. Must be CLARIFY, SPEC, or PLAN")
@@ -9362,15 +9555,36 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
     state = load_json(state_path) if state_path.exists() else {}
     pending_rc = state.get("pending_re_completion")
     if not isinstance(pending_rc, dict):
-        err(f"No pending_re_completion found for {epic_id}; cannot re-complete {feedback_id}")
-    if pending_rc.get("feedback_id") != feedback_id:
         err(
-            f"pending_re_completion belongs to {pending_rc.get('feedback_id')}, "
-            f"not {feedback_id}"
+            f"No pending_re_completion for epic {epic_id}; cannot re-complete {feedback_id}.\n"
+            + _format_recovery_block([
+                f"harnessctl feedback gate-check --epic-id {epic_id} --json",
+                f"harnessctl feedback continue --epic-id {epic_id} --feedback-id {feedback_id} --execute",
+            ])
+        )
+    if pending_rc.get("feedback_id") != feedback_id:
+        other = pending_rc.get("feedback_id")
+        err(
+            f"pending_re_completion belongs to {other}, not {feedback_id}.\n"
+            + _format_recovery_block([
+                f"harnessctl feedback gate-check --epic-id {epic_id} --json",
+                f"Finish re-completion for {other} first, or fix state.json pending_re_completion",
+                f"harnessctl feedback continue --epic-id {epic_id} --feedback-id {feedback_id} --execute",
+            ])
         )
     pending_stages = [s.upper() for s in pending_rc.get("stages", [])]
     if stage not in pending_stages:
-        err(f"Stage {stage} is not pending re-completion for {feedback_id}: {pending_stages}")
+        err(
+            f"Stage {stage} is not pending re-completion for {feedback_id}: {pending_stages}. "
+            "Use --stage from pending list (see .harness/features/<epic>/state.json "
+            "pending_re_completion.stages).\n"
+            + _format_recovery_block([
+                f"cat .harness/features/{epic_id}/state.json  # inspect pending_re_completion",
+                f"harnessctl feedback re-complete --epic-id {epic_id} --feedback-id {feedback_id} "
+                f"--stage {pending_stages[0]}" if pending_stages else
+                f"harnessctl feedback continue --epic-id {epic_id} --feedback-id {feedback_id} --execute",
+            ])
+        )
 
     # --- Manifest-based validation (preferred path) ---
     manifest_path = fb_dir / f"{feedback_id}.revision-manifest.json"
@@ -9390,7 +9604,17 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
         # 1. changed_artifacts must be non-empty
         changed_artifacts = manifest.get("changed_artifacts", [])
         if not changed_artifacts:
-            err(f"revision-manifest for {feedback_id} has no changed_artifacts")
+            err(
+                f"revision-manifest for {feedback_id} has no changed_artifacts.\n"
+                + _format_recovery_block([
+                    f"harnessctl feedback re-plan --epic-id {epic_id} --feedback-id {feedback_id} "
+                    "(PLAN) or re-spec / re-clarify for other stages",
+                    f"Or edit .harness/features/{epic_id}/feedback/{feedback_id}.revision-manifest.json "
+                    "to list changed files with matching after_hash values",
+                    f"harnessctl feedback re-complete --epic-id {epic_id} --feedback-id {feedback_id} "
+                    f"--stage {stage}",
+                ])
+            )
 
         # 2. Verify after_hash matches current file content
         for art in changed_artifacts:
@@ -9439,8 +9663,15 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
         # --- Legacy path: revision-diff only ---
         rdiff_path = features_dir / f"revision-diff-{feedback_id}.md"
         if not rdiff_path.exists():
-            err(f"Neither revision-manifest nor revision-diff-{feedback_id}.md found. "
-                "Run 'harnessctl feedback re-plan' first.")
+            err(
+                f"Neither revision-manifest nor revision-diff-{feedback_id}.md found under "
+                f".harness/features/{epic_id}/.\n"
+                + _format_recovery_block([
+                    f"harnessctl feedback re-plan --epic-id {epic_id} --feedback-id {feedback_id}",
+                    f"harnessctl feedback re-spec --epic-id {epic_id} --feedback-id {feedback_id}",
+                    f"harnessctl feedback re-clarify --epic-id {epic_id} --feedback-id {feedback_id}",
+                ])
+            )
         warnings.append("legacy_mode: no revision-manifest, using revision-diff only")
 
     # Parse canonical artifacts from args (legacy compat)
@@ -9458,6 +9689,14 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
                 if entry_status in ("stale", "invalidated", "needs_amendment"):
                     warnings.append(f"'{art_entry_path}' is still '{entry_status}'")
 
+    recovery_commands: list[str] = []
+    if warnings:
+        recovery_commands = [
+            f"harnessctl feedback gate-check --epic-id {epic_id} --json",
+            "Resolve validation warnings (hashes, key artifacts, task-graph source_feedback, artifact-status)",
+            f"harnessctl feedback re-complete --epic-id {epic_id} --feedback-id {feedback_id} --stage {stage}",
+        ]
+
     completion = {
         "feedback_id": feedback_id,
         "epic_id": epic_id,
@@ -9470,6 +9709,7 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
         ] if use_manifest else [],
         "validation_warnings": warnings,
         "validated": len(warnings) == 0,
+        "recovery_commands": recovery_commands,
     }
 
     completion_path = fb_dir / f"{feedback_id}.re-completion.json"
@@ -9516,6 +9756,10 @@ def cmd_feedback_re_complete(args, h: Path) -> None:
             print(f"  Warnings ({len(warnings)}):")
             for w in warnings:
                 print(f"    - {w}")
+            if completion.get("recovery_commands"):
+                print("  Recovery:")
+                for rc in completion["recovery_commands"]:
+                    print(f"    - {rc}")
 
 
 def _feedback_sha256(path: Path) -> str:
@@ -9525,6 +9769,32 @@ def _feedback_sha256(path: Path) -> str:
     if not path.exists():
         return "sha256:none"
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def _feedback_amendment_plan_recovery_commands(
+    epic_id: str,
+    feedback_id: str,
+    harness_skill: str,
+) -> list[str]:
+    """Canonical CLI recovery steps when amendment-plan.json is missing or incomplete."""
+    hs = harness_skill.lower()
+    re_cmd = {"plan": "re-plan", "spec": "re-spec", "clarify": "re-clarify"}[hs]
+    rel_json = f".harness/features/{epic_id}/feedback/{feedback_id}.amendment-plan.json"
+    return [
+        f"harnessctl feedback plan-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+        f"Edit {rel_json} or run /harness:{hs} --reopen to populate tasks/changes",
+        f"harnessctl feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+        f"harnessctl feedback {re_cmd} --epic-id {epic_id} --feedback-id {feedback_id}",
+    ]
+
+
+def _format_recovery_block(commands: list[str]) -> str:
+    if not commands:
+        return ""
+    lines = ["Recovery:"]
+    for c in commands:
+        lines.append(f"  - {c}")
+    return "\n".join(lines) + "\n"
 
 
 def _feedback_re_stage(args, h: Path, stage: str, key_artifacts: list[str], command_name: str) -> None:
@@ -9547,8 +9817,12 @@ def _feedback_re_stage(args, h: Path, stage: str, key_artifacts: list[str], comm
     fb_dir = _feedback_dir(h, epic_id)
     amendment_path = fb_dir / f"{feedback_id}.amendment-plan.json"
     if not amendment_path.exists():
-        err(f"{feedback_id}.amendment-plan.json not found. "
-            f"Run /harness:{stage.lower()} --reopen first to produce it.")
+        hs = stage.lower()
+        err(
+            f"{feedback_id}.amendment-plan.json not found under "
+            f".harness/features/{epic_id}/feedback/\n"
+            + _format_recovery_block(_feedback_amendment_plan_recovery_commands(epic_id, feedback_id, hs))
+        )
     amendment = load_json(amendment_path)
 
     append_trace_event(h, _make_trace_event(
@@ -9582,7 +9856,16 @@ def _feedback_re_stage(args, h: Path, stage: str, key_artifacts: list[str], comm
         })
 
     if not changed_artifacts:
-        err(f"No {stage} artifacts declared for {feedback_id}; expected one of {key_artifacts}")
+        hs = stage.lower()
+        err(
+            f"No {stage} artifacts declared for {feedback_id}; expected one of {key_artifacts}.\n"
+            + _format_recovery_block(
+                _feedback_amendment_plan_recovery_commands(epic_id, feedback_id, hs)
+                + [
+                    f"In amendment-plan.json set changed_artifacts and/or artifacts covering {key_artifacts}",
+                ],
+            )
+        )
 
     manifest = {
         "feedback_id": feedback_id,
@@ -9672,8 +9955,11 @@ def cmd_feedback_re_plan(args, h: Path) -> None:
     # 1. Read amendment-plan.json (must exist, produced by Agent/Skill)
     amendment_path = fb_dir / f"{feedback_id}.amendment-plan.json"
     if not amendment_path.exists():
-        err(f"{feedback_id}.amendment-plan.json not found. "
-            "Run /harness:plan --reopen first to produce it.")
+        err(
+            f"{feedback_id}.amendment-plan.json not found under "
+            f".harness/features/{epic_id}/feedback/\n"
+            + _format_recovery_block(_feedback_amendment_plan_recovery_commands(epic_id, feedback_id, "plan"))
+        )
     amendment = load_json(amendment_path)
 
     # Trace: feedback_replan_started
@@ -9687,7 +9973,13 @@ def cmd_feedback_re_plan(args, h: Path) -> None:
     tasks_to_add = amendment.get("tasks_to_add", [])
     coverage_updates = amendment.get("coverage_updates", [])
     if not tasks_to_add and not coverage_updates:
-        err("amendment-plan.json has no tasks_to_add and no coverage_updates")
+        err(
+            "amendment-plan.json has no tasks_to_add and no coverage_updates.\n"
+            + _format_recovery_block(
+                _feedback_amendment_plan_recovery_commands(epic_id, feedback_id, "plan")
+                + ["Populate tasks_to_add and/or coverage_updates before re-plan"],
+            )
+        )
 
     def _sha256(path: Path) -> str:
         return _feedback_sha256(path)
@@ -11069,17 +11361,109 @@ def cmd_feedback_continue(args, h: Path) -> None:
 
     # If approved, skip verdict check and proceed to reopen execution
     if fb["status"] == "approved":
-        # Load amendment plan to determine target stage
         amendment_path = _feedback_dir(h, epic_id) / f"{feedback_id}.amendment-plan.md"
         if not amendment_path.exists():
             err(f"Amendment plan not found for approved feedback {feedback_id}")
 
-        # Load verdict (may still be needed for classification/decision)
         councils_dir = h / "features" / epic_id / "councils" / "feedback_triage_council" / feedback_id
         verdict_path = councils_dir / "verdict.json"
         verdict = load_json(verdict_path) if verdict_path.exists() else {}
         decision = verdict.get("decision", "REOPEN_PLAN")
         classification = verdict.get("classification", "")
+
+        execute_mode = getattr(args, "execute", False)
+        if not execute_mode:
+            result = {
+                "status": "ok",
+                "feedback_id": feedback_id,
+                "decision": decision,
+                "classification": classification,
+                "from_approved": True,
+                "executed": False,
+                "message": (
+                    "Amendment approved. Run continue --execute to materialize same-stage "
+                    "or cross-stage reopen and set continuation_pending."
+                ),
+                "next_steps": [
+                    f"harnessctl feedback continue --epic-id {epic_id} "
+                    f"--feedback-id {feedback_id} --execute",
+                ],
+            }
+            if args.json:
+                out_json(result)
+            else:
+                print(f"Feedback {feedback_id}: approved (awaiting continue --execute)")
+                print(f"  Decision: {decision}")
+                print(f"  Next: harnessctl feedback continue --epic-id {epic_id} "
+                      f"--feedback-id {feedback_id} --execute")
+            return
+
+        # Post-approval execute: same contract as triaged path (high-risk human gate goes through here).
+        triage_path = _feedback_dir(h, epic_id) / f"{feedback_id}.triage.json"
+        if not triage_path.exists():
+            err(f"Triage file not found for {feedback_id}")
+        triage = load_json(triage_path)
+        if not triage.get("requires_reopen"):
+            err(
+                f"Feedback {feedback_id} is approved but triage.requires_reopen is false. "
+                "Use `harnessctl feedback close` or the appropriate non-reopen workflow."
+            )
+        target_stage = triage.get("target_stage", "")
+        if not target_stage:
+            err(f"Triage for {feedback_id} missing target_stage")
+
+        state_file_approved = h / "features" / epic_id / "state.json"
+        if not state_file_approved.exists():
+            err(f"State file not found for epic {epic_id}")
+        state_a = load_json(state_file_approved)
+        current_stage_a = state_a.get("current_stage", state_a.get("stage", ""))
+        risk_level_a = state_a.get("risk_level", "low")
+        category_a = "must_confirm"
+
+        if target_stage not in STAGES or current_stage_a not in STAGES:
+            err(f"Invalid feedback continuation stage: current={current_stage_a}, target={target_stage}")
+        target_idx_a = STAGES.index(target_stage)
+        current_idx_a = STAGES.index(current_stage_a)
+        if target_idx_a > current_idx_a:
+            err(f"Feedback target {target_stage} cannot be later than current stage {current_stage_a}")
+
+        if target_idx_a == current_idx_a:
+            continuation = _feedback_mark_same_stage_continuation(
+                h, epic_id, feedback_id, target_stage, risk_level_a, category_a)
+            action_status = "continuation_pending"
+            action_mode = continuation["mode"]
+            action_message = (
+                f"Prepared same-stage REOPEN {target_stage} continuation after approval "
+                f"(risk={risk_level_a}, classification={classification})"
+            )
+        else:
+            ro_args = argparse.Namespace(
+                epic_id=epic_id, to=target_stage, feedback_id=feedback_id, json=True,
+                project_root=getattr(args, "project_root", None))
+            cmd_reopen(ro_args, h)
+            continuation = _feedback_continuation_for_stage(
+                epic_id, feedback_id, target_stage, category_a,
+                mode="stage_reopen",
+            )
+            continuation["current_stage"] = current_stage_a
+            fb_r = _load_feedback(h, epic_id, feedback_id)
+            fb_r["status"] = "continuation_pending"
+            fb_r["continuation"] = continuation
+            _save_feedback(h, epic_id, feedback_id, fb_r)
+            append_trace_event(h, _make_trace_event(
+                epic_id, "feedback_continuation_pending",
+                stage=target_stage,
+                summary=f"REOPEN to {target_stage}, continuation_pending (category={category_a})",
+                payload={"feedback_id": feedback_id, "category": category_a,
+                         "next_action": continuation["next_action"], "risk_level": risk_level_a,
+                         "mode": continuation["mode"]},
+            ))
+            action_status = "auto_reopened"
+            action_mode = "stage_reopen"
+            action_message = (
+                f"Executed: REOPEN to {target_stage} after approval "
+                f"(risk={risk_level_a}, classification={classification})"
+            )
 
         result = {
             "status": "ok",
@@ -11088,21 +11472,22 @@ def cmd_feedback_continue(args, h: Path) -> None:
             "classification": classification,
             "from_approved": True,
             "executed": True,
-            "message": f"Continuing from approved state. Decision: {decision}",
+            "continuation_status": action_status,
+            "mode": action_mode,
+            "message": action_message,
+            "continuation": continuation,
             "next_steps": [
-                f"Execute amendment: /harness:work or re-plan as needed for {decision}",
+                f"Execute re-{target_stage.lower()} via {continuation['allowed_commands'][0]}",
+                f"Then: {continuation['next_command']}",
             ],
         }
-        # Update status to indicate continuation
-        fb["status"] = "amending"
-        _save_feedback(h, epic_id, feedback_id, fb)
-
         if args.json:
             out_json(result)
         else:
-            print(f"Feedback {feedback_id}: continuing from approved → amending")
-            print(f"  Decision: {decision}")
-            print(f"  Next: Execute amendment plan")
+            print(f"Feedback {feedback_id}: approved → {action_status} ({action_mode})")
+            print(f"  {action_message}")
+            for step in result["next_steps"]:
+                print(f"  - {step}")
         return
 
     # Load verdict
@@ -11211,6 +11596,8 @@ def cmd_feedback_continue(args, h: Path) -> None:
                 epic_id=epic_id, feedback_id=feedback_id, json=True,
                 project_root=getattr(args, 'project_root', None))
             cmd_feedback_plan_amendment(pa_args, h)
+
+            _feedback_fill_amendment_plan_json_for_continue_execute(h, epic_id, feedback_id, verdict)
 
             aa_args = argparse.Namespace(
                 epic_id=epic_id, feedback_id=feedback_id, json=True,
@@ -11459,8 +11846,28 @@ def cmd_feedback_update_metadata(args, h: Path) -> None:
     if not isinstance(metadata, dict):
         err("--metadata-json must be a JSON object (dict)")
 
-    # Protected fields that cannot be overwritten via update-metadata
-    protected = {"feedback_id", "epic_id", "status", "text", "created_at"}
+    # Protected fields: flow-control / lifecycle only (see docs/feedback-stage-reopen-loop-reform-plan.md).
+    protected = frozenset({
+        "feedback_id",
+        "epic_id",
+        "text",
+        "created_at",
+        "updated_at",
+        "status",
+        "resolution",
+        "closed_at",
+        "verified_at",
+        "continuation",
+        "reopen_history",
+        "closure_evidence",
+        "defer_owner",
+        "defer_target",
+        "defer_revisit",
+        "defer_evidence",
+        "re_completion_done",
+        "verified",
+        "observations",
+    })
     violations = set(metadata.keys()) & protected
     if violations:
         err(f"Cannot overwrite protected fields via update-metadata: {sorted(violations)}")
@@ -11555,8 +11962,8 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
                 reason = "submitted_without_evidence_pack"
                 next_action = "feedback evidence-pack"
                 required_commands = [
-                    f"feedback evidence-pack --epic-id {epic_id} --feedback-id {feedback_id}",
-                    f"feedback council-triage --epic-id {epic_id} --feedback-id {feedback_id}",
+                    f"harnessctl feedback evidence-pack --epic-id {epic_id} --feedback-id {feedback_id}",
+                    f"harnessctl feedback council-triage --epic-id {epic_id} --feedback-id {feedback_id}",
                 ]
 
         elif status == "triaging":
@@ -11576,17 +11983,17 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
                     reason = f"triage_incomplete (missing votes: {', '.join(sorted(missing_agents))})"
                     next_action = "feedback triage (resume missing votes)"
                     required_commands = [
-                        f"feedback write-vote --epic-id {epic_id} --feedback-id {feedback_id} "
+                        f"harnessctl feedback write-vote --epic-id {epic_id} --feedback-id {feedback_id} "
                         f"--agent {agent}" for agent in sorted(missing_agents)
                     ]
                     required_commands.append(
-                        f"feedback aggregate-triage --epic-id {epic_id} --feedback-id {feedback_id}"
+                        f"harnessctl feedback aggregate-triage --epic-id {epic_id} --feedback-id {feedback_id}"
                     )
                 else:
                     reason = "triaging_without_verdict"
                     next_action = "feedback aggregate-triage"
                     required_commands = [
-                        f"feedback aggregate-triage --epic-id {epic_id} --feedback-id {feedback_id}",
+                        f"harnessctl feedback aggregate-triage --epic-id {epic_id} --feedback-id {feedback_id}",
                     ]
 
         elif status == "triaged":
@@ -11602,15 +12009,41 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
                 reason = "triaged_without_continue"
                 next_action = "feedback continue"
                 required_commands = [
-                    f"feedback continue --epic-id {epic_id} --feedback-id {feedback_id} --execute",
+                    f"harnessctl feedback continue --epic-id {epic_id} --feedback-id {feedback_id} --execute",
                 ]
 
         elif status == "amendment_planned":
             reason = "amendment_planned_not_approved"
             next_action = "feedback approve-amendment"
             required_commands = [
-                f"feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
+                f"harnessctl feedback approve-amendment --epic-id {epic_id} --feedback-id {feedback_id}",
             ]
+
+        elif status == "approved":
+            triage_ap = fb_dir / f"{feedback_id}.triage.json"
+            triage_ap_data = load_json(triage_ap) if triage_ap.exists() else {}
+            if triage_ap_data.get("requires_reopen"):
+                reason = "approved_await_continue_execute"
+                next_action = "feedback continue --execute"
+                required_commands = [
+                    f"harnessctl feedback continue --epic-id {epic_id} --feedback-id {feedback_id} --execute",
+                ]
+
+        elif status == "amending":
+            reason = "amending_requires_follow_up"
+            next_action = "re-run re-complete after fixing validation warnings"
+            state_file_am = h / "features" / epic_id / "state.json"
+            required_commands = []
+            if state_file_am.exists():
+                state_am = load_json(state_file_am)
+                st_next = _pending_recompletion_first_stage(state_am, feedback_id)
+                if st_next:
+                    required_commands.append(
+                        f"harnessctl feedback re-complete --epic-id {epic_id} "
+                        f"--feedback-id {feedback_id} --stage {st_next}"
+                    )
+            if not required_commands:
+                required_commands.append(f"harnessctl feedback gate-check --epic-id {epic_id} --json")
 
         elif status == "continuation_pending":
             # Continuation pending: only allowed_commands can proceed
@@ -11618,6 +12051,7 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
             next_action_name = cont.get("next_action", "feedback_replan")
             allowed = cont.get("allowed_commands", [])
             required_art = cont.get("required_artifacts", [])
+            tgt_stage = (cont.get("target_stage") or "PLAN").lower()
             reason = "continuation_pending"
             next_action = f"Execute continuation: {next_action_name}"
             required_commands = []
@@ -11626,9 +12060,14 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
                 art_path = fb_dir / art
                 if not art_path.exists():
                     required_commands.append(
-                        f"/harness:plan --reopen (to produce {art})"
+                        f"harnessctl feedback plan-amendment --epic-id {epic_id} --feedback-id {feedback_id}"
                     )
-            required_commands.append(cont.get("next_command", ""))
+                    required_commands.append(
+                        f"/harness:{tgt_stage} --reopen (produce {art})"
+                    )
+            nc = (cont.get("next_command") or "").strip()
+            if nc:
+                required_commands.append(nc)
             # Include allowlist in blocked item for stage-reminder
             blocked_items.append({
                 "feedback_id": feedback_id,
@@ -11642,14 +12081,23 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
             continue
 
         elif status == "reopened":
-            # Check for re-complete
             rc_path = fb_dir / f"{feedback_id}.re-completion.json"
+            state_file_ro = h / "features" / epic_id / "state.json"
+            stage_hint = ""
+            if state_file_ro.exists():
+                stage_hint = _pending_recompletion_first_stage(load_json(state_file_ro), feedback_id)
             if not rc_path.exists():
                 reason = "reopened_without_re_complete"
                 next_action = "feedback re-complete"
-                required_commands = [
-                    f"feedback re-complete --epic-id {epic_id} --feedback-id {feedback_id}",
-                ]
+                if stage_hint:
+                    required_commands = [
+                        f"harnessctl feedback re-complete --epic-id {epic_id} "
+                        f"--feedback-id {feedback_id} --stage {stage_hint}",
+                    ]
+                else:
+                    required_commands = [
+                        f"harnessctl feedback gate-check --epic-id {epic_id} --json",
+                    ]
 
         elif status == "deferred":
             missing = _deferred_feedback_missing_fields(fb)
@@ -11657,7 +12105,7 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
                 reason = f"deferred_incomplete (missing: {', '.join(missing)})"
                 next_action = "feedback close --defer"
                 required_commands = [
-                    f"feedback close --epic-id {epic_id} --feedback-id {feedback_id} "
+                    f"harnessctl feedback close --epic-id {epic_id} --feedback-id {feedback_id} "
                     f"--defer --defer-owner '<owner>' --defer-target '<Backlog|None|target>' "
                     f"--defer-revisit '<condition>' --defer-evidence '<evidence>'",
                 ]
@@ -11668,7 +12116,7 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
                 reason = "rejected_without_evidence"
                 next_action = "feedback close --reject"
                 required_commands = [
-                    f"feedback close --epic-id {epic_id} --feedback-id {feedback_id} "
+                    f"harnessctl feedback close --epic-id {epic_id} --feedback-id {feedback_id} "
                     f"--reject --evidence '<evidence>'",
                 ]
 
@@ -11691,11 +12139,14 @@ def cmd_feedback_gate_check(args, h: Path) -> None:
         }
         if args.json:
             out_json(result)
-        else:
-            print(f"Feedback gate-check: BLOCKED ({len(blocked_items)} item(s))")
-            for item in blocked_items:
-                print(f"  {item['feedback_id']} [{item['status']}]: {item['reason']}")
-                print(f"    Next: {item['next_action']}")
+            sys.exit(1)
+        print(f"Feedback gate-check: BLOCKED ({len(blocked_items)} item(s))")
+        for item in blocked_items:
+            print(f"  {item['feedback_id']} [{item['status']}]: {item['reason']}")
+            print(f"    Next: {item['next_action']}")
+            for cmd in item.get("required_commands") or []:
+                if cmd.strip():
+                    print(f"    Run: {cmd.strip()}")
         sys.exit(1)
     else:
         result = {"status": "pass", "blocked_count": 0, "blocked_items": []}

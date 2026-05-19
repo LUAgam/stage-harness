@@ -41,6 +41,28 @@ def setup_harness_with_epic(tmp_path: Path) -> str:
     return epic_id
 
 
+def _confirm_amendment_plan_json(
+    tmp_path: Path,
+    epic_id: str,
+    feedback_id: str,
+    *,
+    plan_merge_inputs: bool = False,
+) -> None:
+    """Mark amendment-plan.json confirmed; optionally add PLAN re-plan inputs."""
+    p = tmp_path / ".harness" / "features" / epic_id / "feedback" / f"{feedback_id}.amendment-plan.json"
+    data = json.loads(p.read_text(encoding="utf-8"))
+    data["confirmed"] = True
+    if plan_merge_inputs:
+        data["tasks_to_add"] = [
+            {
+                "title": "Amendment task (test)",
+                "surface": "test",
+                "acceptance_criteria": ["placeholder"],
+            },
+        ]
+    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 class TestGateCheckPass(unittest.TestCase):
     """gate-check should pass when no feedback exists."""
 
@@ -264,6 +286,72 @@ class TestRelatedGapScanTrigger(unittest.TestCase):
             self.assertIn("related-gap-scan is required", result.stderr)
 
 
+class TestApproveAmendmentJsonContract(unittest.TestCase):
+    """P1: approve-amendment validates amendment-plan.json for reopen flows."""
+
+    def test_rejects_unconfirmed_plan_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            out = run_harnessctl(tmp_path, "feedback", "submit",
+                                 "--epic-id", epic_id, "--stage", "PLAN",
+                                 "--text", "gap", "--json")
+            fid = json.loads(out.stdout)["feedback_id"]
+            self.assertEqual(run_harnessctl(tmp_path, "feedback", "triage",
+                            "--epic-id", epic_id, "--feedback-id", fid,
+                            "--classification", "plan_defect",
+                            "--target-stage", "PLAN", "--requires-reopen", "--json").returncode, 0)
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            (fb_dir / f"{fid}.related-gap-scan.json").write_text(
+                json.dumps({"gaps": [], "scanned_categories": []}), encoding="utf-8")
+            councils_dir = (tmp_path / ".harness" / "features" / epic_id /
+                            "councils" / "feedback_triage_council" / fid)
+            councils_dir.mkdir(parents=True, exist_ok=True)
+            (councils_dir / "verdict.json").write_text(json.dumps({
+                "decision": "REOPEN_PLAN",
+                "classification": "plan_defect",
+                "target_stage": "PLAN",
+                "requires_reopen": True,
+            }), encoding="utf-8")
+            self.assertEqual(run_harnessctl(tmp_path, "feedback", "plan-amendment",
+                            "--epic-id", epic_id, "--feedback-id", fid, "--json").returncode, 0)
+            result = run_harnessctl(tmp_path, "feedback", "approve-amendment",
+                                      "--epic-id", epic_id, "--feedback-id", fid, "--json")
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("confirmed", result.stderr.lower())
+
+    def test_accepts_confirmed_plan_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            out = run_harnessctl(tmp_path, "feedback", "submit",
+                                 "--epic-id", epic_id, "--stage", "PLAN",
+                                 "--text", "gap", "--json")
+            fid = json.loads(out.stdout)["feedback_id"]
+            self.assertEqual(run_harnessctl(tmp_path, "feedback", "triage",
+                            "--epic-id", epic_id, "--feedback-id", fid,
+                            "--classification", "plan_defect",
+                            "--target-stage", "PLAN", "--requires-reopen", "--json").returncode, 0)
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            (fb_dir / f"{fid}.related-gap-scan.json").write_text(
+                json.dumps({"gaps": [], "scanned_categories": []}), encoding="utf-8")
+            councils_dir = (tmp_path / ".harness" / "features" / epic_id /
+                            "councils" / "feedback_triage_council" / fid)
+            councils_dir.mkdir(parents=True, exist_ok=True)
+            (councils_dir / "verdict.json").write_text(json.dumps({
+                "decision": "REOPEN_PLAN",
+                "classification": "plan_defect",
+                "target_stage": "PLAN",
+                "requires_reopen": True,
+            }), encoding="utf-8")
+            self.assertEqual(run_harnessctl(tmp_path, "feedback", "plan-amendment",
+                            "--epic-id", epic_id, "--feedback-id", fid, "--json").returncode, 0)
+            _confirm_amendment_plan_json(tmp_path, epic_id, fid, plan_merge_inputs=True)
+            result = run_harnessctl(tmp_path, "feedback", "approve-amendment",
+                                      "--epic-id", epic_id, "--feedback-id", fid, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class TestContinueReopenRouting(unittest.TestCase):
     """continue --execute should route REOPEN_* by current/target stage."""
 
@@ -357,6 +445,75 @@ class TestContinueReopenRouting(unittest.TestCase):
             gate_data = json.loads(gate.stdout)
             self.assertEqual(gate_data["blocked_items"][0]["reason"], "continuation_pending")
 
+    def test_continue_execute_after_human_approve_same_stage_replan(self):
+        """High-risk paths that end in `approved` must still set pending_re_completion on --execute."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+            state_path = tmp_path / ".harness" / "features" / epic_id / "state.json"
+            state = json.loads(state_path.read_text())
+            state["current_stage"] = "PLAN"
+            state["risk_level"] = "high"
+            state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+            out = run_harnessctl(tmp_path, "feedback", "submit",
+                                 "--epic-id", epic_id,
+                                 "--stage", "PLAN",
+                                 "--text", "missing docs task",
+                                 "--json")
+            self.assertEqual(out.returncode, 0)
+            fid = json.loads(out.stdout)["feedback_id"]
+
+            out = run_harnessctl(tmp_path, "feedback", "triage",
+                                 "--epic-id", epic_id,
+                                 "--feedback-id", fid,
+                                 "--classification", "plan_defect",
+                                 "--target-stage", "PLAN",
+                                 "--requires-reopen",
+                                 "--json")
+            self.assertEqual(out.returncode, 0)
+
+            fb_dir = tmp_path / ".harness" / "features" / epic_id / "feedback"
+            (fb_dir / f"{fid}.related-gap-scan.json").write_text(
+                json.dumps({"gaps": [], "scanned_categories": []}), encoding="utf-8"
+            )
+
+            councils_dir = (tmp_path / ".harness" / "features" / epic_id /
+                            "councils" / "feedback_triage_council" / fid)
+            councils_dir.mkdir(parents=True, exist_ok=True)
+            (councils_dir / "verdict.json").write_text(
+                json.dumps({
+                    "decision": "REOPEN_PLAN",
+                    "classification": "plan_defect",
+                    "target_stage": "PLAN",
+                    "requires_reopen": True,
+                }),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(run_harnessctl(tmp_path, "feedback", "plan-amendment",
+                            "--epic-id", epic_id, "--feedback-id", fid, "--json").returncode, 0)
+            _confirm_amendment_plan_json(tmp_path, epic_id, fid, plan_merge_inputs=True)
+            self.assertEqual(run_harnessctl(tmp_path, "feedback", "approve-amendment",
+                            "--epic-id", epic_id, "--feedback-id", fid, "--json").returncode, 0)
+
+            result = run_harnessctl(tmp_path, "feedback", "continue",
+                                    "--epic-id", epic_id,
+                                    "--feedback-id", fid,
+                                    "--execute", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertTrue(data.get("executed"))
+            self.assertEqual(data.get("continuation_status"), "continuation_pending")
+            self.assertEqual(data.get("mode"), "same_stage_replan")
+
+            state2 = json.loads(state_path.read_text())
+            self.assertEqual(state2["pending_re_completion"]["stages"], ["PLAN"])
+            self.assertEqual(state2["pending_re_completion"]["feedback_id"], fid)
+
+            fb = json.loads((fb_dir / f"{fid}.json").read_text())
+            self.assertEqual(fb["status"], "continuation_pending")
+
     def test_continue_reopen_next_command_is_stage_aware(self):
         cases = [
             ("CLARIFY", "REOPEN_CLARIFY", "feedback_reclarify", "feedback re-clarify"),
@@ -430,6 +587,7 @@ class TestContinueReopenRouting(unittest.TestCase):
             self._write_triaged_reopen(tmp_path, epic_id, "HFB-001", "REOPEN_PLAN", "PLAN")
             run_harnessctl(tmp_path, "feedback", "plan-amendment",
                            "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
+            _confirm_amendment_plan_json(tmp_path, epic_id, "HFB-001", plan_merge_inputs=True)
             run_harnessctl(tmp_path, "feedback", "approve-amendment",
                            "--epic-id", epic_id, "--feedback-id", "HFB-001", "--json")
 
@@ -578,6 +736,29 @@ class TestUpdateMetadata(unittest.TestCase):
             self.assertEqual(stored["priority"], "high")
             # Core fields preserved
             self.assertEqual(stored["text"], "test metadata update")
+
+    def test_update_metadata_rejects_flow_control_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+
+            result = run_harnessctl(tmp_path, "feedback", "submit",
+                                    "--epic-id", epic_id,
+                                    "--stage", "EXECUTE",
+                                    "--text", "x",
+                                    "--json")
+            fb_data = json.loads(result.stdout)
+            feedback_id = fb_data["feedback_id"]
+
+            result = run_harnessctl(
+                tmp_path, "feedback", "update-metadata",
+                "--epic-id", epic_id,
+                "--feedback-id", feedback_id,
+                '--metadata-json', '{"continuation": {"fake": true}, "nice": true}',
+                "--json",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("protected", result.stderr.lower())
 
     def test_update_metadata_rejects_protected_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

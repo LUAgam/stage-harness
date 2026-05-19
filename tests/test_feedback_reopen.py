@@ -136,6 +136,10 @@ class TestReopen(unittest.TestCase):
                        "--target-stage", "CLARIFY", "--requires-reopen", "--json")
         run_harnessctl(tmp_path, "feedback", "plan-amendment", "--epic-id", epic_id,
                        "--feedback-id", "HFB-001", "--json")
+        ap = tmp_path / ".harness" / "features" / epic_id / "feedback" / "HFB-001.amendment-plan.json"
+        aj = json.loads(ap.read_text(encoding="utf-8"))
+        aj["confirmed"] = True
+        ap.write_text(json.dumps(aj, indent=2), encoding="utf-8")
         run_harnessctl(tmp_path, "feedback", "approve-amendment", "--epic-id", epic_id,
                        "--feedback-id", "HFB-001", "--json")
 

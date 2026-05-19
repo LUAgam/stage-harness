@@ -166,6 +166,56 @@ class TestReCompletionMarker(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("pending_re_completion", result.stderr)
 
+    def test_re_complete_outputs_recovery_commands_on_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            epic_id = setup_harness_with_epic(tmp_path)
+
+            run_harnessctl(tmp_path, "feedback", "submit",
+                          "--epic-id", epic_id, "--text", "Missing feature")
+            fb_path = (tmp_path / ".harness" / "features" / epic_id /
+                      "feedback" / "HFB-001.json")
+            fb = json.loads(fb_path.read_text())
+            fb["status"] = "reopened"
+            fb["decision"] = "REOPEN_PLAN"
+            fb_path.write_text(json.dumps(fb))
+
+            state_path = tmp_path / ".harness" / "features" / epic_id / "state.json"
+            state = json.loads(state_path.read_text())
+            state["pending_re_completion"] = {
+                "feedback_id": "HFB-001",
+                "stages": ["PLAN"],
+                "completed_stages": [],
+                "created_at": "2026-05-13T10:00:00Z",
+            }
+            state_path.write_text(json.dumps(state))
+
+            # Missing task-graph and other artifacts, but manifest exists
+            manifest = tmp_path / ".harness" / "features" / epic_id / "feedback" / "HFB-001.revision-manifest.json"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(json.dumps({
+                "feedback_id": "HFB-001",
+                "stage": "PLAN",
+                "changed_artifacts": [{
+                    "path": "task-graph.json",
+                    "before_hash": "sha256:old",
+                    "after_hash": "sha256:new",
+                    "evidence": "test",
+                }],
+            }))
+
+            result = run_harnessctl(tmp_path, "feedback", "re-complete",
+                                   "--epic-id", epic_id, "--feedback-id", "HFB-001",
+                                   "--stage", "PLAN", "--json")
+            self.assertEqual(result.returncode, 0)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["status"], "ok")
+            self.assertFalse(data["validated"])
+            self.assertTrue(len(data["validation_warnings"]) > 0)
+            self.assertIn("recovery_commands", data)
+            self.assertTrue(len(data["recovery_commands"]) > 0)
+            self.assertIn("harnessctl feedback gate-check", data["recovery_commands"][0])
+
     def test_re_plan_creates_backing_task_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
