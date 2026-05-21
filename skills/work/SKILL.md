@@ -50,9 +50,47 @@ ls .harness/memory/
 cat .harness/memory/<epic-id>-*.md 2>/dev/null || true
 ```
 
+**Context Depth Loading（上下文深度加载）**：
+
+在基础 re-anchor 之后，根据 task JSON 补充精确上下文：
+
+```bash
+# 读取 SPEC 中对应章节（根据 task 的 spec_refs 字段定位）
+cat .harness/specs/<epic-id>.md  # 定向阅读 spec_refs 列出的 REQ/FR 段落
+
+# 若 task 含 source_context_hint，读取原始需求对应段落
+cat .harness/features/<epic-id>/source-materials.md  # 按 hint 定位行范围
+```
+
+加载规则：
+- 若 task JSON 含 `spec_refs`（如 `["REQ-001", "REQ-003"]`），读取 SPEC 文件中对应编号的段落
+- 若 task JSON 含 `source_context_hint`（如 `"SRC-001:L42-L58"`），读取 `source-materials.md` 中对应行范围
+- 若 `requirement-index.json` 存在且 `input_density` 为 `rich` 但无 `source_context_hint`，快速浏览 `source-materials.md` 的 Inline Requirements 段落
+
+**Contract Context Loading（接口契约加载）**：
+
+若 `.harness/features/<epic-id>/contracts/` 目录存在且非空，检查当前 TASK 是否为某 contract 的 provider 或 consumer：
+
+```bash
+# 查找与当前 TASK 相关的 contract 文件
+ls .harness/features/<epic-id>/contracts/ 2>/dev/null | grep -i "<task-id>" || true
+```
+
+加载规则：
+- 若当前 TASK 是 contract 的 **provider**（提供数据/服务的一端）：
+  - 实现时 response 结构必须符合 `contract.response_schema`
+  - 共享枚举字段的取值必须属于 `contract.shared_enums` 定义的集合
+  - 不得返回 contract 未声明的必填字段
+- 若当前 TASK 是 contract 的 **consumer**（消费方）：
+  - 实现时 request 构造必须包含 `contract.required_fields` 中列出的所有字段
+  - 枚举字段赋值必须属于 `contract.shared_enums` 定义的集合
+  - 不得假设 contract 未声明的响应字段存在
+- 若当前 TASK 不涉及任何 contract → 跳过此步骤，无额外开销
+
 Re-anchor 输出：
 - 当前 task 目标（来自 task JSON 的 `acceptance_criteria`）
 - 上下文摘要（依赖、承载面、已知风险）
+- 相关 contracts 列表及当前 TASK 的角色（provider/consumer），若无则省略
 - BASE_COMMIT（当前 HEAD）
 
 ---
@@ -125,6 +163,11 @@ ls <evidence_path>  # 来自 task JSON 的 evidence 字段
 - [ ] 测试全部通过
 - [ ] 没有新增的编译/类型错误
 - [ ] 证据完整性（`evidence` 字段中列出的文件均存在）
+- [ ] 接口契约一致性（若存在相关 contract）：
+  - provider 端：代码中 response 结构的字段名/类型与 `contract.response_schema` 一致
+  - consumer 端：代码中 request 构造包含 `contract.required_fields` 的所有字段
+  - 双方：代码中对共享枚举字段的赋值属于 `contract.shared_enums` 定义的集合（通过 grep/静态分析验证）
+  - 无相关 contract 时跳过此项
 
 Task Smoke 失败：
 - 记录失败信息

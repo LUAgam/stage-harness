@@ -158,6 +158,31 @@ deploy skill 内部执行以下流程：
 - HTTP 端点返回预期状态码（2xx 或 3xx 重定向到登录页）
 - 前后端联通性验证（前端能访问后端 API）
 
+**Step 3 是 PASS 的必要条件（硬性门禁）**：
+
+deploy-receipt.json 的整体 `status` 不可仅凭 Step 2 的部署命令退出码判定。必须在 Step 3 全部验证通过后才能写入 `status: "PASS"`。具体要求：
+
+1. receipt 中必须包含 `health_check` 字段，记录每项验证的结果
+2. 若任何健康检查项失败，整体 status 必须为 `FAIL`，即使部署命令本身成功
+3. 禁止仅凭"进程存活"就标记子项目为 PASS——必须同时通过端口可达 + HTTP 响应验证
+
+```json
+{
+  "health_check": {
+    "executed": true,
+    "results": [
+      {"check": "backend_port_9000", "status": "pass"},
+      {"check": "frontend_port_5173", "status": "pass"},
+      {"check": "frontend_http_200", "status": "pass", "url": "http://localhost:5173/app/", "response_code": 200},
+      {"check": "api_proxy_reachable", "status": "pass", "url": "http://localhost:5173/api/v1/health", "response_code": 200}
+    ],
+    "overall": "pass"
+  }
+}
+```
+
+若 `health_check.executed` 为 false 或 `health_check` 字段不存在，deploy-receipt 视为不合规，DEPLOY 门禁不通过。
+
 **前端强制验证（存在前端子项目时必须执行）**：
 
 | 验证项 | 方法 | 失败处理 |
@@ -253,7 +278,7 @@ deploy skill 内部执行以下流程：
 - `frontend.routes`：可访问的路由列表
 - `frontend.auth_required`：是否需要登录才能使用
 
-整体 `status` 判定：所有需部署子项目均 PASS → `PASS`；任一 FAIL → `FAIL`；全部 SKIPPED → `SKIPPED`。
+整体 `status` 判定：所有需部署子项目均 PASS **且** `health_check.overall` 为 `pass` → `PASS`；任一 FAIL 或 health_check 未执行 → `FAIL`；全部 SKIPPED → `SKIPPED`。
 
 ## 出口条件
 

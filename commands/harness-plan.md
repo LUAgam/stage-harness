@@ -102,10 +102,32 @@ skill 内部并行执行：
 
 **coverage matrix 生成：**
 - 规格需求 → task 映射
-- 验收标准覆盖率统计
-- 覆盖率 < 80% 时告警
+- **验收标准级覆盖率统计（硬性）**：coverage-matrix 必须映射到每条验收标准（AC）粒度，而非仅映射到 FR/REQ 级别。格式为 `FR-001.AC-1 → TASK-xxx`，确保每条验收标准有且仅有一个 TASK 负责实现
+- 覆盖率计算公式：`已分配的验收标准数 / requirements-draft 中总验收标准数 × 100%`
+- 覆盖率 < 80% 时告警；覆盖率 < 100% 时在议会审查中标记为 HIGH 问题
 - 若规格或 `domain-frame` 摘要中含「场景矩阵 / 事件序列 / 高风险时序」，应在任务或测试映射中显式覆盖（与 `_spec_semantic_warnings` 建议一致）
 - 每个需求条目必须包含 `verified_by_stage` 字段，标明该需求的验证归属阶段（`EXECUTE` / `BUILD` / `DEPLOY` / `E2E-TEST`）。归属非 EXECUTE 阶段的需求无需对应 task 文件，由对应阶段的 skill 自动生成验证用例
+
+**TASK 描述必须自包含验收标准原文（硬性）**：
+
+每个 TASK 的 JSON 描述中必须包含 `acceptance_criteria_full` 字段，逐条列出该 TASK 负责的所有验收标准原文。Worker 执行时以此为唯一实现依据，不再需要回溯 bridge-spec 或 requirements-draft。
+
+格式示例：
+```json
+{
+  "task_id": "TASK-005",
+  "title": "前端进度条组件实现",
+  "acceptance_criteria_full": [
+    "FR-008.AC-1: 进行中状态：蓝色，显示「正在打包（已完成 X / N）」，X和N实时更新",
+    "FR-008.AC-2: 完成状态：绿色，显示「导出已就绪 · 点击下载」+ [下载] 按钮",
+    "FR-008.AC-3: 失败状态：红色，显示「导出失败，请重试」+ [重试] 按钮",
+    "FR-008.AC-4: 点击 [下载] 触发浏览器下载，下载完成后提示条自动消失",
+    "FR-008.AC-5: 点击 [重试] 以相同参数重新发起打包"
+  ]
+}
+```
+
+**为什么这是硬性要求**：Worker 在独立 context 中执行，无法访问完整的需求文档。若 TASK 描述中不含验收标准原文，Worker 只能依据模糊的 title 实现，导致细节丢失。
 
 **计划议会（5 reviewer）：**
 
@@ -114,8 +136,8 @@ skill 内部并行执行：
 | code-reviewer | 计划与代码落点是否一致，任务粒度是否可实施 |
 | security-reviewer | 高风险任务是否覆盖安全约束 |
 | logic-reviewer | 任务依赖关系是否合理，有无循环依赖 |
-| test-reviewer | coverage matrix 是否达到 80%+，测试任务是否充分 |
-| plan-reviewer | 任务点数估算、关键路径与整体计划可执行性；**阶段归属分类是否正确**（EXECUTE task 中不得包含需要运行态系统的验证项） |
+| test-reviewer | coverage matrix 是否达到 80%+，**验收标准级覆盖率是否达到 100%**（每条 AC 均有 TASK 负责），测试任务是否充分 |
+| plan-reviewer | 任务点数估算、关键路径与整体计划可执行性；**阶段归属分类是否正确**（EXECUTE task 中不得包含需要运行态系统的验证项）；**每个 TASK 的 `acceptance_criteria_full` 字段是否完整包含其负责的所有验收标准原文** |
 
 议会 REJECT 时，重新触发任务分解，最多 2 轮。
 

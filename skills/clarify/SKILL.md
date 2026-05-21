@@ -46,6 +46,16 @@ Lead Orchestrator reads:
 
 Output: Structured idea summary with initial assumption list.
 
+### Step 1.5 — Source Material Loading（自适应）
+
+Lead 检查 `.harness/features/<epic-id>/requirement-index.json` 是否存在：
+
+- **存在且 `input_density: "rich"`**：读取 `source-materials.md` 全文，提取关键需求条目，将其作为后续所有 agent 的显式输入上下文。Lead 在派发 Step 2/3 的每个 agent 时，prompt 中必须包含 `source-materials.md` 的路径引用或内容摘要。
+- **存在且 `input_density: "minimal"`**：跳过本步骤，仅使用 epic description 作为输入。
+- **不存在**（旧 epic 或手动创建）：跳过本步骤，行为与 minimal 一致。
+
+本步骤零开销适配：对简单口述需求无任何额外动作；对富文档需求则确保原始精度在后续阶段可追溯。
+
 ### Step 2 — Domain Scout（固定前置，在代码影响扫描之前）
 
 - 调度 `domain-scout`：仅基于需求文案、`project-profile.yaml`、可选领域标签（可附带 Step 1 摘要）。
@@ -72,11 +82,13 @@ domain-scout 完成后、Step 3 并行分析之前，Lead **必须**读取项目
 Launch in parallel:
 
 ```
-Agent 1 (requirement-analyst): Description: decompose requirements, Input includes domain-frame.json → requirements-draft.md
+Agent 1 (requirement-analyst): Description: decompose requirements, Input includes domain-frame.json + source-materials.md (if rich) → requirements-draft.md
 Agent 2 (impact-analyst):      Description: map codebase blast radius, Scan codebase surfaces + read project-profile.yaml → `impact-scan.md`；`workspace_mode: multi-repo` 时另写 `cross-repo-impact-index.json`（契约优先、深扫仓数受 `scan.max_repos_deep_scan` 约束）
-Agent 3 (challenger):          Description: stress test assumptions, Input includes domain-frame.json → challenge-report.md
-Agent 4 (scenario-expander):   Description: expand edge cases, Input includes domain-frame.json → generated-scenarios.json
+Agent 3 (challenger):          Description: stress test assumptions, Input includes domain-frame.json + source-materials.md (if rich) → challenge-report.md
+Agent 4 (scenario-expander):   Description: expand edge cases, Input includes domain-frame.json + source-materials.md (if rich) → generated-scenarios.json
 ```
+
+**Source Material 传递规则**：当 `requirement-index.json` 的 `input_density` 为 `rich` 时，Agent 1/3/4 的 dispatch prompt 中必须包含 `source-materials.md` 的文件路径，要求 agent 读取原文并在产出中保留对源文档的精确引用（如 `[SRC-001:L42]`）。`input_density` 为 `minimal` 时不传递该文件。
 
 Wait for all four to complete.
 
@@ -109,6 +121,8 @@ Lead 在路由代码承载面之前，交叉核对 `domain-frame.json`、`genera
 
 合并矛盾语义、将未闭合组合升级为 **must_confirm / UNK / DEC**，并产出 `scenario-coverage.json`。`generated-scenarios.json` 必须使用 canonical `scenarios[]` 结构，且高/中置信度场景应带 `scenario_id`、`pattern`、`source_signals`、`scenario`、`why_it_matters`、`expected_followup`；`scenario-coverage.json` 则使用 canonical `{ epic_id, version, scenarios, signals? }`，记录每个 `SCN-xxx` 的覆盖状态与映射去向，并在需要时通过 `signals[]` 显式闭合高/中置信度语义信号。`clarification-notes.md` 中则追加简短 **Semantic Reconciliation / 语义归并** 小节（可与 Traceability 合并）。
 
+**REQ 编号对齐规则**：`scenario-coverage.json` 和 `clarification-notes.md` 中引用的 REQ 编号必须与 `requirements-draft.md` 的最终编号一致。若并行 agent 使用了临时编号，Lead 必须在进入 Step 5 前完成对齐。
+
 ### Step 5 — Surface Routing
 
 - `project-surface-router` reads `requirements-draft.md` + `impact-scan.md`，将 REQ 映射到具体文件 → `surface-map.md`（按需）。
@@ -134,6 +148,14 @@ Budget limits (from project-profile.yaml):
 - low risk: max 1 user interrupt
 - medium risk: max 2 user interrupts
 - high risk: max 3 user interrupts
+
+**DEC ↔ UNK 同步规则**：同一问题同时出现在 `decision-bundle.json`（DEC-xxx）和 `unknowns-ledger.json`（UNK-xxx）时，两条记录必须通过 `linked_unk` / `linked_dec` 互相引用，且状态必须一致。Lead 在进入 Step 8 前须验证同步。
+
+### Step 7.5 — Source Coverage Audit（源文档覆盖审计，仅 rich 模式）
+
+当 `requirement-index.json` 的 `input_density` 为 `rich` 时，Lead 必须在定稿前验证源文档的每个章节/段落都被至少一个 CLARIFY 产物引用或显式排除。未覆盖的章节为 gap，Lead 须逐条处置（纳入 REQ / 延后到 SPEC / 标记为 non-goal / 记入 unknowns-ledger）。审计结果写入 `clarification-notes.md` 的 `## Source Coverage Audit` 小节。
+
+`input_density` 为 `minimal` 或文件不存在时跳过本步骤。
 
 ### Step 8 — CLARIFY Summary & Gate
 
@@ -168,7 +190,7 @@ Before proceeding to SPEC:
 | `challenge-report.md` | challenger | 挑战报告（须含 `## Summary`） |
 | `scenario-coverage.json` | Lead 汇总 | `SCN-xxx` 到 REQ/CHK/DEC/UNK 的结构化映射 |
 | `surface-map.md` | project-surface-router | 需求→代码路由（若执行路由步骤） |
-| `clarification-notes.md` | Lead 汇总 | 澄清笔记（**须含 `## Domain Frame` 或 `## 领域框架`**） |
+| `clarification-notes.md` | Lead 汇总 | 澄清笔记（**须含 `## Domain Frame` 或 `## 领域框架`**；须含 `## Deferred to SPEC` 小节；`input_density=rich` 时须含 `## Source Coverage Audit`） |
 | `unknowns-ledger.json` | `unknowns-ledger-update.sh init/add` | 未知问题台账 |
 | `decision-bundle.json` | `decision-bundle.sh generate/add` | 全量决策分类 |
 | `decision-packet.json` | `decision-bundle.sh packet` | must_confirm 打包 |

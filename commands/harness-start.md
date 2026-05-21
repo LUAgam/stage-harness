@@ -33,6 +33,21 @@ test -n "${HARNESSCTL:-}" && test -x "$HARNESSCTL" || {
 "$HARNESSCTL" start "$ARGUMENTS"
 ```
 
+### 参数构造规则（调用方 — Lead / auto orchestrator）
+
+`$ARGUMENTS` 由调用方根据用户输入自适应构造：
+
+| 用户输入形态 | 构造方式 |
+|-------------|---------|
+| 纯口述一句话 | `"<需求文本>"` — 无 `--source-doc` |
+| 口述 + 提及文件路径 | `"<需求文本>" --source-doc <path1> [--source-doc <path2> ...]` |
+| 用户直接贴了大段文本 | 将全文作为 requirements 参数传入；若超过 2000 字符，建议先写入临时文件再用 `--source-doc` |
+| 用户引用了多个文件 | `"<简短摘要>" --source-doc <path1> --source-doc <path2> ...` |
+
+`--source-doc` 可重复使用，每个指向一个需求来源文件（需求文档、设计稿、会议纪要等）。这些文件的完整内容会被保存到 `source-materials.md`，供后续所有阶段直接引用原文，避免信息在阶段传递中丢失。
+
+当用户未提供任何文件引用时，不添加 `--source-doc`，系统自动标记为 `input_density: minimal`，后续阶段以轻量模式运行，无额外开销。
+
 完成后只做两件事：
 - 展示 `harnessctl start` 输出里的 `epic_id`、`next_step`、`manual_step`
 - 结束当前命令，不再自动进入 CLARIFY

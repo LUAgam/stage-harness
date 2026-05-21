@@ -82,7 +82,7 @@ Feedback 列表 (epic: <epic-id>)
 ──────────────────────────────────────────────────────────────
 ID        状态       类型                  内容摘要
 ──────────────────────────────────────────────────────────────
-HFB-001   resolved   scope_gap_question    OMS前端页面不需要调整吗？
+HFB-001   resolved   scope_gap_question    前端页面不需要调整吗？
 HFB-002   closed     scope_gap_question    [duplicate of HFB-001]
 HFB-003   submitted  correction            议会发现问题不会回退...
 ──────────────────────────────────────────────────────────────

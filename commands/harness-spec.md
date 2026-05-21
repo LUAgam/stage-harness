@@ -110,10 +110,20 @@ $HARNESSCTL dispatch register <epic-id> SPEC --via=skill:harness-spec
 `specs/<epic-id>.md` 必须包含：
 - 功能需求（来自 clarification-notes）
 - 非功能需求（来自 impact-scan）
-- 验收标准（可测试、可量化）
+- 验收标准（可测试、可量化）— **每条验收标准必须具体到可直接对照代码验证的粒度**，包括但不限于：UI 文案原文、数据格式规则、条件分支完整枚举、接口返回值结构。禁止使用括号摘要（如「标题动态、内容选择」）替代逐条列举
 - 超出范围声明（来自 deferrable 决策）
 - 开放问题（中优先级 unknowns）
 - 当 `generated-scenarios.json` / `scenario-coverage.json` 中存在高/中置信度且非 `dropped_invalid` 的 `SCN-xxx` 条目时，规格须包含与之对应的结构化场景或时序表达，并写清可验证的闭合行为；语义提示与严格模式由 `scripts/harnessctl.py` 的 `_spec_semantic_warnings` 与 `spec_semantic_hints_strict` 配置共同约束
+
+**验收标准保真度规则（硬性）**：
+
+规格文档中的验收标准是整个流水线的"信息保真基准"。下游 bridge-spec、PLAN、EXECUTE、VERIFY 均以此为对照源。因此：
+
+1. 每个 FR/REQ 的验收标准必须逐条编号列出，不可合并或省略
+2. 涉及 UI 文案的验收标准必须包含精确文案字符串（如：`hover 提示「暂无可导出的转换结果」`）
+3. 涉及数据格式的验收标准必须包含格式模板（如：`文件名格式：{项目名}_{YYYY-MM-DD}.zip`）
+4. 涉及状态/条件的验收标准必须枚举所有状态分支（如：进行中/完成/失败/过期各自的行为）
+5. 议会审查时，requirement-analyst 必须逐条比对 clarification-notes 中的原始需求与规格中的验收标准，确认无遗漏
 
 ## 出口条件（门禁规则）
 

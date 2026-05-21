@@ -19,6 +19,7 @@ You do **not** read the repository or propose implementation details.
 - Epic / user requirement text
 - `.harness/project-profile.yaml`
 - `.harness/features/<epic-id>/domain-frame.json`
+- `.harness/features/<epic-id>/source-materials.md` — **if provided by Lead** (when `input_density` is `rich`). Contains the user's original requirement documents. When present, use it to ground scenarios in specific user-stated constraints and behaviors rather than generic patterns alone.
 
 ## Expansion Rules
 

@@ -88,6 +88,8 @@ $HARNESSCTL dispatch register <epic-id> DONE --via=skill:harness-done
 - 技术决策摘要
 - 偏差记录（与原始规格的差异）
 - 运行时指标汇总（覆盖率、smoke 通过率、总耗时）
+- 部署信息（从 `deploy-receipt.json` 提取）：部署地址、端口、访问 URL、部署时间
+- E2E 测试结果汇总（从 `e2e-cases.json` 提取）：各用例名称及通过/失败状态表
 
 **release-notes.md**（写入 `.harness/features/<epic-id>/release-notes.md`）：
 - 版本信息

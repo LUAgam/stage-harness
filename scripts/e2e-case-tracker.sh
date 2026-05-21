@@ -11,7 +11,7 @@ HARNESS_DIR="${HARNESS_DIR:-.harness}"
 CMD="${1:-}"
 EPIC_ID="${2:-}"
 
-if [[ -z "$CMD" || -z "$EPIC_ID" ]]; then
+if [[ -z "$CMD" ]]; then
   cat >&2 <<'EOF'
 usage: e2e-case-tracker.sh <command> <epic-id> [args...]
 
@@ -37,10 +37,19 @@ EOF
   exit 2
 fi
 
-FEATURES_DIR="$HARNESS_DIR/features/$EPIC_ID"
-VERIFY_DIR="$FEATURES_DIR/verify-cases"
-TRACKER_FILE="$VERIFY_DIR/case-tracker.json"
-GATE_FILE="$VERIFY_DIR/e2e-gate-status.json"
+# gate 命令自行解析 epic-id，其他命令需要全局 EPIC_ID
+if [[ "$CMD" != "gate" && -z "$EPIC_ID" ]]; then
+  echo "ERROR: 缺少 epic-id 参数" >&2
+  echo "usage: e2e-case-tracker.sh <command> <epic-id> [args...]" >&2
+  exit 2
+fi
+
+if [[ "$CMD" != "gate" ]]; then
+  FEATURES_DIR="$HARNESS_DIR/features/$EPIC_ID"
+  VERIFY_DIR="$FEATURES_DIR/verify-cases"
+  TRACKER_FILE="$VERIFY_DIR/case-tracker.json"
+  GATE_FILE="$VERIFY_DIR/e2e-gate-status.json"
+fi
 
 # ── 工具函数 ──────────────────────────────────────────────────────────
 
@@ -469,7 +478,19 @@ else:
 # ── 门禁（Gate）命令 ─────────────────────────────────────────────────
 
 cmd_gate() {
-  local subcmd="${3:-}"
+  local subcmd="${2:-}"
+  # gate 命令格式: gate <subcmd> <epic-id> [args...]
+  # 全局 EPIC_ID=$2 此时实际是 subcmd，需要从 $3 重新取 epic-id
+  EPIC_ID="${3:-}"
+  if [[ -z "$EPIC_ID" ]]; then
+    echo "ERROR: gate 命令缺少 epic-id 参数" >&2
+    echo "usage: e2e-case-tracker.sh gate <init|validate-step1|set|check|dump> <epic-id> [args...]" >&2
+    exit 2
+  fi
+  FEATURES_DIR="$HARNESS_DIR/features/$EPIC_ID"
+  VERIFY_DIR="$FEATURES_DIR/verify-cases"
+  TRACKER_FILE="$VERIFY_DIR/case-tracker.json"
+  GATE_FILE="$VERIFY_DIR/e2e-gate-status.json"
   case "$subcmd" in
     init)           _gate_init ;;
     validate-step1) _gate_validate_step1 ;;
@@ -478,7 +499,7 @@ cmd_gate() {
     dump)           _gate_dump ;;
     *)
       echo "ERROR: unknown gate subcommand '$subcmd'" >&2
-      echo "usage: e2e-case-tracker.sh gate <epic-id> <init|validate-step1|set|check|dump> [args...]" >&2
+      echo "usage: e2e-case-tracker.sh gate <init|validate-step1|set|check|dump> <epic-id> [args...]" >&2
       exit 2
       ;;
   esac
@@ -673,7 +694,8 @@ prerequisites = {
     ],
     "step_2_5_complete": [
         ("step_2_verify", "status", "PASS", "Step 2 (verify) must PASS first"),
-        ("step_2_verify", "dispatched_via", "skill:", "Step 2 must be dispatched via skill (prefix match)")
+        ("step_2_verify", "dispatched_via", "skill:", "Step 2 must be dispatched via skill (prefix match)"),
+        ("step_2_verify", "dispatch_tool", "Skill", "Step 2 must use Skill tool (not Agent)")
     ],
     "step_3_artifacts": [
         ("step_2_5_complete", "status", "PASS", "Step 2.5 (complete) must PASS first")
@@ -715,6 +737,13 @@ if errors:
     sys.exit(1)
 else:
     print(f"✅ Gate check PASSED for '{target}'")
+    if target == "step_2_verify":
+        print("─── DISPATCH INSTRUCTION ───")
+        print("DISPATCH_METHOD: Skill (NOT Agent)")
+        print("REQUIRED_SKILL: stage-harness:verify-and-fix-cases")
+        print("DISPATCH_VIA: Skill tool — shared context with main session")
+        print("REASON: verify-and-fix-cases needs AskUserQuestion for credentials")
+        print("────────────────────────────")
     sys.exit(0)
 PYEOF
 }

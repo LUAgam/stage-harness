@@ -53,7 +53,7 @@ For each new requirement/surface:
 - Given: User navigates to endpoint creation
 - When: User selects PostgreSQL type
 - Then: Form shows Host, Port, Username, Password, DB Name, Schema fields
-- Verification: Already supported in oms-ui, no code change needed
+- Verification: Already supported in the existing frontend, no code change needed
 <!-- /Amendment -->
 ```
 

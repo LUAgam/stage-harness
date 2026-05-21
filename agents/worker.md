@@ -29,6 +29,15 @@ git log -5 --oneline
 - `.harness/memory/<epic-id>-*.md`（如存在）
 - `.harness/features/<epic-id>/coverage-matrix.json`（了解本 task 的风险映射）
 
+**Context Depth Loading（上下文深度加载）**：
+
+根据 task JSON 中的 `spec_refs` 字段，定向读取 SPEC 中对应章节：
+- 读取 `.harness/specs/<epic-id>.md` 中与 `spec_refs` 列出的 REQ/FR 编号相关的段落
+- 若 task JSON 含 `source_context_hint`（如 `"SRC-001:L42-L58"`），读取 `.harness/features/<epic-id>/source-materials.md` 中对应行范围，获取用户原始需求的精确表述
+- 若 `.harness/features/<epic-id>/requirement-index.json` 存在且 `input_density` 为 `rich`，但 task 无 `source_context_hint`，仍建议快速浏览 `source-materials.md` 的 Inline Requirements 段落以获取全局上下文
+
+此步骤确保 Worker 在实现时直接对齐用户原始需求，而非仅依赖经过多层摘要的 task description。
+
 输出摘要：
 - task 目标（来自 `acceptance_criteria`）
 - 所属 `surface`
@@ -104,6 +113,49 @@ BASE_COMMIT=$(git rev-parse HEAD)
 
 ---
 
+## Phase 4.5 — 验收标准逐条自检（硬性）
+
+在 commit 之前，Worker 必须逐条对照 task JSON 中 `acceptance_criteria_full` 字段的每条验收标准，验证其在代码中的实现位置。
+
+**执行步骤**：
+
+1. 读取当前 task 的 `acceptance_criteria_full` 列表
+2. 对每条验收标准，定位其在代码中的实现位置（文件路径:行号）
+3. 对涉及 UI 文案的验收标准，grep 代码确认文案字符串与验收标准原文一致
+4. 对涉及条件分支的验收标准，确认代码中存在对应的所有分支
+5. 对涉及数据格式的验收标准，确认代码中的格式模板与验收标准一致
+
+**输出 acceptance_checklist**：
+
+```json
+{
+  "acceptance_checklist": [
+    {
+      "ac_id": "FR-008.AC-1",
+      "ac_text": "进行中状态：蓝色，显示「正在打包（已完成 X / N）」",
+      "status": "pass",
+      "evidence_location": "ExportProgressBar/index.tsx:83"
+    },
+    {
+      "ac_id": "FR-008.AC-3",
+      "ac_text": "失败状态：红色，显示「导出失败，请重试」+ [重试] 按钮",
+      "status": "fail",
+      "evidence_location": null,
+      "gap_description": "失败态只有关闭按钮，缺少重试按钮"
+    }
+  ]
+}
+```
+
+**阻断规则**：
+- 若任何验收标准的 status 为 `fail`，Worker **不得进入 Phase 5**
+- 必须先修复代码使该验收标准通过，然后重新执行 Phase 4（smoke）和 Phase 4.5（自检）
+- 若修复后仍有 `fail` 项且已重试 2 次，标记为 `plan_patch` 并停止，报告给主会话
+
+**为什么这是硬性要求**：Worker 是验收标准落地为代码的最后执行者。若 Worker 不逐条自检就提交，偏差只能在 VERIFY 阶段被发现，增加修复循环次数。前置自检可将大部分偏差消灭在 EXECUTE 阶段内部。
+
+---
+
 ## Phase 5 — Commit + Receipt
 
 原子提交，写 receipt，标记 task done。
@@ -132,6 +184,14 @@ HEAD_COMMIT=$(git rev-parse HEAD)
     "files_changed": <n>
   },
   "smoke": {"passed": true, "commands": ["<test-command>"]},
+  "acceptance_checklist": [
+    {
+      "ac_id": "<FR-xxx.AC-y>",
+      "ac_text": "<验收标准原文>",
+      "status": "pass",
+      "evidence_location": "<file:line>"
+    }
+  ],
   "evidence": {"<key>": "<path>"},
   "new_risks": [],
   "timestamp": "<iso8601>"

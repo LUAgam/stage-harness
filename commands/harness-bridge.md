@@ -67,12 +67,40 @@ ${CLAUDE_PLUGIN_ROOT}/scripts/bridge-shipspec-to-deepplan.sh <feature> <epic-id>
 
 输出到：`.harness/features/<epic-id>/bridge-spec.md`
 
+### Step 2.5：保留完整验收标准（硬性）
+
+bridge-spec.md 必须包含 `## Acceptance Criteria（完整验收标准）` 章节，该章节**逐条原文引用** `requirements-draft.md`（或 `.harness/specs/<epic-id>.md`）中每个 REQ/FR 的所有验收标准。
+
+**格式要求**：
+
+```markdown
+## Acceptance Criteria（完整验收标准）
+
+### FR-001 <标题>
+1. <验收标准原文第1条>
+2. <验收标准原文第2条>
+...
+
+### FR-002 <标题>
+1. <验收标准原文第1条>
+...
+```
+
+**禁止行为**：
+- 禁止将多条验收标准压缩为一行括号摘要（如 `AC-001: 导出弹窗（标题动态、内容选择）`）
+- 禁止省略任何验收标准条目，即使看似"显而易见"
+- 禁止用自己的语言改写验收标准，必须保留原文
+
+**为什么这是硬性要求**：bridge-spec 是 PLAN 和 EXECUTE 阶段的唯一输入源。验收标准中的 UI 文案、格式规则、交互行为细节一旦在此处丢失，下游所有阶段都无法恢复，导致实现与需求系统性偏差。
+
 ### Step 3：验证桥接输出
 
 验证 bridge-spec.md 满足条件：
 - 文件非空（> 100 bytes）
 - 包含 `## Requirements` 章节
 - 包含 `## Technical Design` 章节
+- 包含 `## Acceptance Criteria（完整验收标准）` 章节
+- Acceptance Criteria 章节中的 FR/REQ 条目数量 >= requirements-draft 中的 REQ 数量（允许合并但不允许减少）
 - 若 unknowns-ledger 有 open 条目，确认 `## Open Unknowns` 章节存在
 
 ## 产物要求
@@ -87,6 +115,7 @@ ${CLAUDE_PLUGIN_ROOT}/scripts/bridge-shipspec-to-deepplan.sh <feature> <epic-id>
 
 - `bridge-spec.md` 存在且非空
 - 包含 `## Requirements` 与 `## Technical Design` 章节
+- 包含 `## Acceptance Criteria（完整验收标准）` 章节，且该章节逐条列出了所有 FR/REQ 的验收标准原文
 
 ## 错误处理
 

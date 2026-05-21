@@ -112,7 +112,7 @@ LOOP:
 | `run_spec` | `Skill(skill="stage-harness:harness-spec", args="<epic-id>")` |
 | `run_plan` | `Skill(skill="stage-harness:harness-plan", args="<epic-id>")` |
 | `run_execute` | `Skill(skill="stage-harness:harness-work", args="<epic-id>")` |
-| `run_verify` | **按 risk_level 分支(见下方 "VERIFY 跳过策略")** |
+| `run_verify` | `Skill(skill="stage-harness:harness-review", args="<epic-id>")` |
 | `run_build` | `Skill(skill="stage-harness:harness-build", args="<epic-id>")` |
 | `run_deploy` | `Skill(skill="stage-harness:harness-deploy", args="<epic-id>")` |
 | `run_e2e` | `Skill(skill="stage-harness:harness-e2e-test", args="<epic-id>")` |
@@ -143,30 +143,19 @@ Agent(prompt="执行E2E测试...", subagent_type="general-purpose")
 Bash("curl localhost:9000/api/v1/...")
 ```
 
-### VERIFY 跳过策略（auto 模式专属）
+### VERIFY 阶段（auto 模式 — 不跳过）
 
-收到 `run_verify` 时，按 epic 风险等级派发：
+收到 `run_verify` 时，**所有风险等级均执行完整 VERIFY**：
 
 ```bash
-RISK_LEVEL=$($HARNESSCTL state get <epic-id> --field risk_level)
-
-if [ "$RISK_LEVEL" = "high" ]; then
-  # 高风险：必须完整审查，不跳过
-  # 执行：Skill(skill="stage-harness:harness-review", args="<epic-id>")
-else
-  # low/medium：跳过 VERIFY 议会，直接进入 BUILD
-  $HARNESSCTL state transition <epic-id> VERIFY --skip-dispatch-check
-  $HARNESSCTL state transition <epic-id> BUILD --skip-dispatch-check
-  export HARNESS_SKIP_VERIFY_GATE=1
-  # 执行：Skill(skill="stage-harness:harness-build", args="<epic-id>")
-fi
+# 所有 risk_level 统一执行完整审查
+Skill(skill="stage-harness:harness-review", args="<epic-id>")
 ```
 
 **说明**：
-- 该跳过仅在 auto 自治循环内生效。手动调用 `/harness:review` 或 `/stage-harness:harness-build` 不受影响。
-- 跳过时不写 `verification.json`，但状态机正常经过 VERIFY → BUILD（保留 state log 可追溯）。
-- `HARNESS_SKIP_VERIFY_GATE=1` 仅用于让 `harness-build` 前置检查放宽 VERIFY 产物校验，改查 EXECUTE 产物。
-- 用户可通过 `.harness/config.json` 设置 `auto_skip_verify: false` 关闭该跳过（默认开启）；关闭时即使 low/medium 也走完整 VERIFY。
+- VERIFY 是防止需求丢失和实现偏差的最后一道防线，不应因风险等级低而跳过。
+- 即使 low/medium 风险的 epic，VERIFY 议会仍可能发现 spec compliance 偏差、遗漏的验收标准、或与用户原始需求不一致的实现。
+- 用户可通过 `.harness/config.json` 设置 `auto_skip_verify: true` 恢复旧行为（按 risk_level 跳过），但默认不跳过。
 
 ### E2E-TEST 结果处理策略（auto 模式专属）
 

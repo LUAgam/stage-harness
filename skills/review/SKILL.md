@@ -79,7 +79,9 @@ done
       "spec_path": ".harness/specs/<epic-id>.md",
       "domain_frame_path": ".harness/features/<epic-id>/domain-frame.json",
       "generated_scenarios_path": ".harness/features/<epic-id>/generated-scenarios.json",
-      "scenario_coverage_path": ".harness/features/<epic-id>/scenario-coverage.json"
+      "scenario_coverage_path": ".harness/features/<epic-id>/scenario-coverage.json",
+      "source_requirement_checklist_path": ".harness/features/<epic-id>/source-requirement-checklist.json",
+      "contracts_dir": ".harness/features/<epic-id>/contracts/"
     }
   Task C: test-reviewer
     Input: {
@@ -93,7 +95,7 @@ done
     }
 ```
 
-若相应文件不存在，logic-reviewer 与 test-reviewer 的输入中可省略 `domain_frame_path`、`generated_scenarios_path`、`scenario_coverage_path`。
+若相应文件不存在，logic-reviewer 与 test-reviewer 的输入中可省略 `domain_frame_path`、`generated_scenarios_path`、`scenario_coverage_path`。`source_requirement_checklist_path` 和 `contracts_dir` 同理——仅当对应文件/目录存在时传入；logic-reviewer 使用 checklist 逐条核对实现细节，使用 contracts 验证跨 surface 接口一致性。
 
 等待各 agent 完成，收集 verdict；**logic-reviewer** 与 **test-reviewer** 须核对 spec 场景矩阵 / 事件序列，以及 `domain-frame` 与 `generated-scenarios.json` / `scenario-coverage.json` 中的高风险条目是否在实现与测试或 receipt 中有可验证证据。
 
@@ -109,7 +111,9 @@ Input: {
   "epic_id": "<epic-id>",
   "spec_path": ".harness/specs/<epic-id>.md",
   "receipts_dir": ".harness/features/<epic-id>/receipts/",
-  "coverage_matrix": ".harness/features/<epic-id>/coverage-matrix.json"
+  "coverage_matrix": ".harness/features/<epic-id>/coverage-matrix.json",
+  "source_requirement_checklist_path": ".harness/features/<epic-id>/source-requirement-checklist.json",
+  "contracts_dir": ".harness/features/<epic-id>/contracts/"
 }
 ```
 
@@ -117,6 +121,9 @@ runtime-auditor 输出：
 - spec compliance 报告
 - 漂移清单（实现超出或偏离 spec 的地方）
 - 不变量违反情况
+- 接口契约一致性报告（若 `contracts_dir` 存在）：provider/consumer 双方实现是否符合 contract 中的 `shared_enums`、`required_fields`、`response_schema`
+
+`source_requirement_checklist_path` 和 `contracts_dir` 为可选输入——仅当对应文件/目录存在时传入。runtime-auditor 使用 checklist 对照原始需求逐条验证 spec compliance，使用 contracts 检查跨 surface 实现是否与约定一致。
 
 ---
 

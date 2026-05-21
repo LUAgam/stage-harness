@@ -3871,6 +3871,8 @@ def cmd_start(args, project_root: Path) -> None:
     risk_level = getattr(args, "risk_level", None) or config.get("risk_level", "medium")
     title = _derive_start_title(args.requirements, getattr(args, "title", ""))
     epic = _create_epic(h, title, risk_level, args.requirements.strip())
+    source_docs = getattr(args, "source_docs", []) or []
+    _write_requirement_index(h, epic["id"], args.requirements.strip(), source_docs)
     state = load_state(h, epic["id"])
     next_action = _next_action_for_state(state)
     next_command = f"/harness:auto {epic['id']}" if next_action == "run_clarify" else next_action
@@ -3928,6 +3930,77 @@ def cmd_start(args, project_root: Path) -> None:
         print(f"  next_step:      {next_command}")
         if manual_next_command != next_command:
             print(f"  manual_step:    {manual_next_command}")
+
+
+def _write_requirement_index(h: Path, epic_id: str, requirements: str, source_docs: list) -> dict:
+    """Write requirement-index.json and source-materials.md for an epic.
+
+    Classifies input density as 'minimal' (no source docs, short text) or 'rich'
+    (has source docs or long requirements text). Downstream stages use input_density
+    to decide how aggressively to preserve and reference source material.
+    """
+    feat_dir = h / "features" / epic_id
+    feat_dir.mkdir(parents=True, exist_ok=True)
+
+    req_text = requirements.strip()
+    has_docs = bool(source_docs)
+    input_density = "rich" if (has_docs or len(req_text) > 500) else "minimal"
+
+    sources = []
+    if req_text:
+        sources.append({
+            "id": "SRC-inline",
+            "type": "inline",
+            "content_excerpt": req_text[:200],
+            "char_count": len(req_text),
+        })
+    for i, doc_path in enumerate(source_docs, 1):
+        p = Path(doc_path).resolve()
+        entry = {
+            "id": f"SRC-{i:03d}",
+            "type": "file",
+            "path": str(p),
+            "exists": p.exists(),
+        }
+        if p.exists():
+            try:
+                content = p.read_text(encoding="utf-8", errors="replace")
+                entry["char_count"] = len(content)
+            except OSError:
+                entry["char_count"] = 0
+        sources.append(entry)
+
+    index = {
+        "version": "1.0",
+        "epic_id": epic_id,
+        "input_density": input_density,
+        "sources": sources,
+        "created_at": now_iso(),
+    }
+    atomic_write_json(feat_dir / "requirement-index.json", index)
+
+    mat_path = feat_dir / "source-materials.md"
+    lines = [f"# Source Materials — {epic_id}\n"]
+    lines.append(f"\n> input_density: {input_density}\n")
+    lines.append("\n## Inline Requirements\n\n")
+    lines.append(req_text + "\n")
+
+    for entry in sources:
+        if entry["type"] != "file":
+            continue
+        lines.append(f"\n## {entry['id']}: {entry['path']}\n\n")
+        p = Path(entry["path"])
+        if p.exists():
+            try:
+                content = p.read_text(encoding="utf-8", errors="replace")
+                lines.append(content + "\n")
+            except OSError:
+                lines.append("*(unreadable)*\n")
+        else:
+            lines.append("*(file not found)*\n")
+
+    mat_path.write_text("".join(lines), encoding="utf-8")
+    return index
 
 
 def cmd_epic_create(args, h: Path) -> None:
@@ -5208,6 +5281,23 @@ def cmd_stage_gate_check(args, h: Path, project_root: Path) -> None:
         task_files = list(iter_task_files(h, epic_id) or [])
         if not task_files:
             missing.append(f".harness/tasks/{epic_id}.*.json (no tasks created)")
+
+        # AC coverage check: every task must have non-empty acceptance_criteria
+        tasks_missing_ac = []
+        for tf in task_files:
+            try:
+                task_data = load_json(tf)
+                ac = task_data.get("acceptance_criteria", [])
+                if not ac:
+                    tid = task_data.get("id", tf.stem)
+                    tasks_missing_ac.append(tid)
+            except SystemExit:
+                pass
+        if tasks_missing_ac:
+            missing.append(
+                f"acceptance_criteria empty for tasks: {', '.join(tasks_missing_ac)} "
+                f"(every task must have at least 1 verifiable AC)"
+            )
 
         matrix_path = features_dir / "coverage-matrix.json"
         if matrix_path.exists():
@@ -9184,6 +9274,13 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
             err(f"All {len(rejected_votes)} votes rejected (invalid schema). "
                 f"See {rejection_path}. Valid decisions: {', '.join(FEEDBACK_TRIAGE_OUTCOMES)}")
 
+    # Helper: normalize confidence to comparable int (handles both string and int)
+    def _confidence_rank(val):
+        if isinstance(val, int):
+            return val
+        mapping = {"high": 3, "medium": 2, "low": 1}
+        return mapping.get(str(val).lower(), 0)
+
     # Categorize votes
     stage_priority = {"CLARIFY": 0, "SPEC": 1, "PLAN": 2, "EXECUTE": 3}
     reopen_votes = [v for v in votes if v.get("decision", "").startswith("REOPEN_")]
@@ -9203,7 +9300,7 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
 
         # Classification from highest-confidence vote at that stage
         same_stage = [v for v in reopen_votes if v.get("decision") == final_decision]
-        best = max(same_stage, key=lambda v: v.get("confidence", 0))
+        best = max(same_stage, key=lambda v: _confidence_rank(v.get("confidence", 0)))
         classification = best.get("classification", "requirement_gap")
         max_confidence = best.get("confidence", 0)
     elif len(no_reopen_votes) == total:
@@ -9218,7 +9315,7 @@ def cmd_feedback_aggregate_triage(args, h: Path) -> None:
             final_decision = "NO_REOPEN_WITH_EVIDENCE"
             target_stage = ""
             classification = ""
-            max_confidence = max((v.get("confidence", 0) for v in votes), default=0)
+            max_confidence = max((_confidence_rank(v.get("confidence", 0)) for v in votes), default=0)
     else:
         # Mixed: some no_reopen, some other (REJECT, DEFER, etc.)
         final_decision = "INSUFFICIENT_EVIDENCE"
@@ -12206,6 +12303,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_start = sub.add_parser("start", help="Bootstrap harness and create an epic from a fuzzy requirement")
     p_start.add_argument("requirements", help="Fuzzy requirement or problem statement")
     p_start.add_argument("--title", default="", help="Optional explicit epic title")
+    p_start.add_argument("--source-doc", dest="source_docs", action="append", default=[], help="Path to source document (repeatable). Preserved verbatim for downstream stages.")
     p_start.add_argument("--risk-level", dest="risk_level", choices=RISK_LEVELS)
     p_start.add_argument("--json", action="store_true")
 

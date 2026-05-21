@@ -42,11 +42,13 @@ Spawn **one** agent:
 ```
 Task: domain-scout
   Description: domain product framing
-  Input: epic description + intake summary + project-profile.yaml (paths or inlined)
+  Input: epic description + intake summary + project-profile.yaml (paths or inlined) + source-materials.md (if input_density=rich)
   Output: .harness/features/<epic-id>/domain-frame.json
 ```
 
 Wait for completion. Then merge a short **Domain Frame** section into `clarification-notes.md` (or create the file with that section first): business goals, top constraints, and 3–7 highest-signal edge cases / open questions from `domain-frame.json` (do not paste the entire JSON).
+
+**Source Material Awareness**: Before dispatching domain-scout, check `.harness/features/<epic-id>/requirement-index.json`. If `input_density` is `"rich"`, include `source-materials.md` path in the domain-scout dispatch prompt so it can reference original user requirements verbatim. If `"minimal"` or file absent, skip — no overhead.
 
 **`domain-frame.json` Step 0 gate contract:** Top level must include `business_goals`, `domain_constraints`, `semantic_signals`, `candidate_edge_cases`, `candidate_open_questions` (same set as `DOMAIN_FRAME_REQUIRED_KEYS` in `scripts/clarify_gate_shared.py`). Legacy-only keys such as `domain`, `subdomain`, or `domain_signals` **do not** satisfy the gate — use the current names. Full schema remains authoritative in `agents/domain-scout.md`.
 
@@ -58,10 +60,12 @@ Operational constraint:
 ### Step 3 — Parallel Analysis
 Spawn FOUR agents simultaneously using the Task tool:
 
+**Source Material rule**: If `requirement-index.json` has `input_density: "rich"`, add `source-materials.md` path to the Input of Tasks 1, 3, and 4. Agents must read it and preserve precise references (e.g. `[SRC-001:L42]`) in their outputs. If `input_density` is `"minimal"` or the file is absent, do not pass it.
+
 ```
 Task 1: requirement-analyst
   Description: decompose requirements
-  Input: epic description + project-profile.yaml + domain-frame.json
+  Input: epic description + project-profile.yaml + domain-frame.json + source-materials.md (if rich)
   Output: .harness/features/<epic-id>/requirements-draft.md
 
 Task 2: impact-analyst
@@ -71,12 +75,12 @@ Task 2: impact-analyst
 
 Task 3: challenger
   Description: stress test assumptions
-  Input: epic description + initial assumptions + domain-frame.json
+  Input: epic description + initial assumptions + domain-frame.json + source-materials.md (if rich)
   Output: .harness/features/<epic-id>/challenge-report.md
 
 Task 4: scenario-expander
   Description: expand edge cases
-  Input: epic description + project-profile.yaml + domain-frame.json
+  Input: epic description + project-profile.yaml + domain-frame.json + source-materials.md (if rich)
   Output: .harness/features/<epic-id>/generated-scenarios.json
 ```
 
@@ -98,6 +102,8 @@ Before routing surfaces, reconcile **combined semantics** across `domain-frame.j
 - Append a short **Semantic Reconciliation** subsection to `clarification-notes.md` (or merge into Traceability): what was merged, what was escalated, and any remaining deferrals.
 
 This step is **Lead-owned** (no new specialist agent required); use `generated-scenarios.json` as the primary scenario inventory, while `challenger` continues to contribute adversarial findings rather than exhaustive scenario generation.
+
+- **REQ Numbering Alignment**: All REQ-xxx references in `scenario-coverage.json`, `clarification-notes.md`, and any other cross-referencing artifact MUST use the final numbering from `requirements-draft.md`. If parallel agents used provisional numbering, Lead must perform a reconciliation pass to align all references before proceeding to Step 5. No stale REQ-xxx identifiers may survive into downstream artifacts.
 
 ### Step 5 — Surface Routing
 Spawn `project-surface-router` agent:
@@ -141,6 +147,36 @@ If must_confirm > 0:
 - If remaining == 0: apply Budget Exhaustion Protocol (safe default + CRITICAL-BLOCKED flag)
 - Decrement remaining in state.json (interrupt_budget field)
 
+**DEC ↔ UNK Sync Rule**: When the same issue is tracked in both `decision-bundle.json` (DEC-xxx) and `unknowns-ledger.json` (UNK-xxx):
+- Each entry must cross-reference the other via `"linked_unk"` / `"linked_dec"` fields
+- Status must be consistent: if one is resolved, the other must also be resolved with matching conclusion
+- Lead must verify DEC↔UNK consistency before proceeding to Step 8
+
+### Step 7.5 — Source Coverage Audit (when input_density = rich)
+
+When `requirement-index.json` has `input_density: "rich"`, Lead must verify that source materials are fully covered before finalizing:
+
+1. **Segment**: Identify all top-level sections/chapters in `source-materials.md` (by markdown headings or numbered chapters in the original documents)
+2. **Trace**: For each section, check whether it is referenced by at least one CLARIFY artifact:
+   - `requirements-draft.md` (via `[SRC-xxx:§...]` references or semantic coverage in REQ/AC)
+   - `clarification-notes.md` (in scope boundary, deferred items, or domain frame)
+   - `decision-bundle.json` or `unknowns-ledger.json` (as evidence source)
+   - Explicit exclusion in `requirements-draft.md ## Non-Goals` or `## Explicit Exclusions`
+3. **Gap list**: Sections not covered by any of the above are gaps
+4. **Disposition**: For each gap, Lead must choose one:
+   - Promote to a new REQ or AC (update requirements-draft.md)
+   - Add to `## Deferred to SPEC` with category tag
+   - Add to `## Non-Goals` / `## Explicit Exclusions` with rationale
+   - Add to `unknowns-ledger.json` as open question
+5. **Record**: Write the audit result as a `## Source Coverage Audit` section in `clarification-notes.md`:
+   - Total source sections: N
+   - Covered: X
+   - Deferred to SPEC: Y
+   - Excluded (non-goal): Z
+   - Gaps resolved in this pass: W
+
+When `input_density` is `"minimal"` or `requirement-index.json` is absent, skip this step (no overhead for simple epics).
+
 ### Step 8 — CLARIFY Summary
 Finalize `.harness/features/<epic-id>/clarification-notes.md` with:
 - **Domain Frame** (from Step 2, concise)
@@ -151,6 +187,7 @@ Finalize `.harness/features/<epic-id>/clarification-notes.md` with:
 - Risk level (may be updated from impact scan)
 - **Scenario Coverage Summary**: a concise roll-up of which `SCN-xxx` items were covered, escalated, deferred, or dropped as invalid
 - **Traceability Matrix**: A concise mapping showing how every high/medium confidence edge case, open question, **state transition**, and **constraint conflict** from `domain-frame.json` was resolved, each tied to a REQ, CHK, or Decision identifier.
+- **Deferred to SPEC**: Items from source materials that are product-level specifications (UI states, error display rules, visual norms, state-dependent behaviors) but were not closed as REQ acceptance criteria. Each carries a category tag (`deferred:interaction-design`, `deferred:visual-spec`, `deferred:error-ux`, `deferred:performance-target`) and a source reference so SPEC stage can pick them up directly.
 - **`## 六轴澄清覆盖`** using the canonical axis labels exactly once each: `StateAndTime / 行为与流程`, `ConstraintsAndConflict / 规则与边界`, `CostAndCapacity / 规模与代价`, `CrossSurfaceConsistency / 多入口`, `OperationsAndRecovery / 运行与维护`, `SecurityAndIsolation / 权限与隔离`. Do not substitute product-specific labels like “功能边界” or “可观测性”.
 - When conflict / retry / rewrite / amplification / performance / capacity semantics appear, explicitly close the resulting cost/risk in `CostAndCapacity / 规模与代价` and reflect it in `SCN-xxx`, `DEC-xxx`, `UNK-xxx`, or a requirement. Do not leave this only in free-form prose.
 

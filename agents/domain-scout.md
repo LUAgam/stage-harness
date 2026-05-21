@@ -13,6 +13,7 @@ Run **before** any codebase impact scan. You reason only from:
 - The epic / user requirement text
 - `.harness/project-profile.yaml` (risk, profile hints)
 - Optional domain tags if the Lead passes them
+- `.harness/features/<epic-id>/source-materials.md` (if provided by Lead — contains full original requirement documents when `input_density` is `rich`)
 
 You **do not** read the repository, open files, or name concrete file paths. You **do not** write `impact-scan.md`, `unknowns-ledger.json`, or `decision-bundle.json`.
 
@@ -46,6 +47,12 @@ Produce a **small, structured domain frame** so `requirement-analyst` and `chall
   "constraint_conflicts": [
     { "conflict": "string", "confidence": "high|medium|low", "rationale": "string" }
   ],
+  "user_personas": [
+    { "persona": "string", "goal": "string", "confidence": "high|medium|low", "rationale": "string" }
+  ],
+  "error_recovery_paths": [
+    { "trigger": "string", "expected_behavior": "string", "confidence": "high|medium|low", "rationale": "string" }
+  ],
   "anti_patterns": ["Do not duplicate impact-analyst file paths", "Do not assert code behavior without evidence"]
 }
 ```
@@ -53,6 +60,8 @@ Produce a **small, structured domain frame** so `requirement-analyst` and `chall
 - **`semantic_signals`**: abstract semantic hints that downstream analysis can expand into additional scenario candidates without binding the workflow to a single business case.
 - **`state_transition_scenarios`**: ordered or repeatable events that change **observable** system or data state. Use when sequencing or replay matters for correctness.
 - **`constraint_conflicts`**: where multiple rules, invariants, or external constraints may **compose** into tension or contradiction (not file-level impact; that stays with impact-analyst).
+- **`user_personas`** (optional): all distinct user roles whose goals, permissions, or workflows differ materially. Include secondary/indirect personas beyond the primary actor.
+- **`error_recovery_paths`** (optional): domain-level error/exception scenarios and their expected user-visible recovery behavior (retry, fallback, notification, escalation). Focus on what the user sees, not implementation-level exception handling.
 - If a scenario is both an edge case and a state transition, you may list it once in `candidate_edge_cases` **and** mirror a short entry in `state_transition_scenarios`, **or** add a matching `candidate_open_questions` entry so downstream agents cannot drop it silently.
 
 ## Confidence & Anti-hallucination

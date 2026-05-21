@@ -113,9 +113,12 @@ $E2E_TRACKER gate init <epic-id>
 
 若 `e2e-gate-status.json` 已存在（断点恢复场景），复用已有状态，不重新初始化。
 
-### Step 1 — 生成测试 case 列表
+### Step 1 — 生成测试 case 列表 [DISPATCH: Agent]
 
 **REQUIRED: 通过 Agent 工具调度 `stage-harness:generate-test-cases` 子代理**
+
+> ℹ️ **调度方式：Agent 工具**（独立 context 窗口）。
+> 原因：执行时间长（5-10 分钟），内联会导致主会话 turn 过长或 cache TTL 过期。
 
 使用 `Agent` 工具启动子代理，`subagent_type` 设为 `stage-harness:generate-test-cases`。Agent 调用参数：
 
@@ -129,6 +132,7 @@ prompt: |
   clarification_path: .harness/features/<epic-id>/clarification-notes.md
   build_receipt_path: .harness/features/<epic-id>/build-receipt.json
   deploy_receipt_path: .harness/features/<epic-id>/deploy-receipt.json
+  source_materials_path: .harness/features/<epic-id>/source-materials.md  # 若 requirement-index.json 存在且 input_density=rich 则传入；否则省略此行
 ```
 
 子代理内部会（方法论已内置于 agent 定义，无需外部 SKILL.md）：
@@ -207,6 +211,12 @@ $E2E_TRACKER gate set <epic-id> step_1_5_register PASS \
 $E2E_TRACKER gate check <epic-id> step_2_verify
 ```
 
+**凭证合规性门禁**：若 `test-cases.md` 中存在需要认证态的 case（API / UI / API+UI 维度），且 `session-state.json` 中已有凭证记录，则校验：
+- `credentials.raw.type` 必须为 `real_login_api` / `real_login_browser` / `user_provided` 之一
+- 若存在 UI / API+UI 维度 case：`credentials.browser_storage_state` 不得为 null
+
+若凭证记录不合规：清除 `session-state.json` 中的 `credentials` 字段，使 verify-and-fix-cases 技能在执行时重新通过合法途径获取凭证。
+
 **C-NO-INLINE-VERIFY（硬性）**：orchestrator 严禁自行执行 case 验证逻辑。
 Step 2 的全部验证工作**必须且只能**通过调度 `verify-and-fix-cases` 技能完成。
 
@@ -219,9 +229,14 @@ Step 2 的全部验证工作**必须且只能**通过调度 `verify-and-fix-case
 上述行为即使在子代理失败、技能不可用等异常场景下也不允许。
 正确做法是报告阻塞并终止。
 
-### Step 2 — 逐个验证与修复 case
+### Step 2 — 逐个验证与修复 case [DISPATCH: Skill]
 
 **REQUIRED SKILL:** Use `stage-harness:verify-and-fix-cases` skill
+
+> ⚠️ **调度方式：Skill 工具（非 Agent）。**
+> 与 Step 1 不同：Step 1 用 Agent（独立 context），Step 2 用 Skill（共享主会话 context）。
+> 原因：verify-and-fix-cases 需要通过 AskUserQuestion 向用户索取凭证，必须在主会话内执行。
+> **严禁**使用 Agent 工具调度此步骤。
 
 传入：
 - `epic_id`
@@ -242,7 +257,7 @@ Step 2 的全部验证工作**必须且只能**通过调度 `verify-and-fix-case
 6. **单 case 修复闭环上限 3 次**：超过即标 `failed-after-max-retries`，不阻塞后续 case；外层由本命令决定是否走 FIX 兜底。
 6. **跳过必须有理由**：仅允许跳过 case 本身错误、外部依赖确实不可用、与本次需求无关的前置无法满足；难测/耗时长不是合法理由。
 7. **部署环境端口主动探测（硬性前置）**：禁止硬编码端口号。探测方式全面覆盖：`deploy-receipt.json` → `docker ps`/`docker-compose ps` → `ss -tlnp`/`netstat -tlnp` → `systemctl list-units` → `pm2 list` → `ps aux | grep` → nginx/Apache 配置检查。
-8. **认证凭证严禁伪造（硬性）**：必须中断并向用户索取登录信息，严禁自行伪造。
+8. **认证凭证严禁伪造（硬性）**：必须中断并向用户索取登录信息，严禁自行伪造。「伪造」的判定标准：凭证未经过被测应用的认证流程签发（包括但不限于：读取应用密钥自签、操作数据库写入会话、使用硬编码凭证）。判定方法：`session-state.json` 中 `credentials.raw.type` 必须为 `real_login_api` / `real_login_browser` / `user_provided` 之一。违反后果：E2E 结果无效，gate-status 标记为 FAIL。
 9. **Playwright 不可用时必须尝试替代方案**：按优先级尝试 ① python+playwright库 ② python+selenium ③ 其他方案；全部不可用时方可 skip。
 10. **质量/准确率测试必须完整执行**：不得抽样、截断或提前终止。
 11. **状态变更必须通过 tracker 脚本**：所有 case 状态变更必须通过 `e2e-case-tracker.sh` 执行，禁止直接编辑 JSON。
@@ -256,12 +271,16 @@ verify-and-fix-cases 技能返回后，写入门禁状态：
 ```bash
 $E2E_TRACKER gate set <epic-id> step_2_verify PASS \
   --field dispatched_via=skill:verify-and-fix-cases \
+  --field dispatch_tool=Skill \
   --field credential_groups_total=<凭证组数> \
   --field credential_groups_resolved=<已解决组数>
 ```
 
-`dispatched_via` 字段由后续 `gate check step_2_5_complete` 校验，
-必须以 `skill:` 前缀开头。内联执行不会产生该字段。
+`dispatched_via` 和 `dispatch_tool` 字段由后续 `gate check step_2_5_complete` 校验：
+- `dispatched_via` 必须以 `skill:` 前缀开头
+- `dispatch_tool` 必须精确等于 `Skill`（非 `Agent`）
+
+内联执行或 Agent 调度不会产生正确的字段值，门禁将拒绝通过。
 
 ### Step 2.5 — 完成门禁（强制）
 
@@ -333,11 +352,81 @@ $E2E_TRACKER gate set <epic-id> step_3_artifacts PASS \
 | 验证总结 | `.harness/features/<epic-id>/verify-cases/verify-summary.md` |
 | 验证回执 | `.harness/features/<epic-id>/verify-cases/verify-receipt.json` |
 | Case 级产物 | `.harness/features/<epic-id>/verify-cases/<case_id>/` |
+| 降级验证报告 | `.harness/features/<epic-id>/verify-cases/fallback-verification.json`（仅当触发降级验证时生成） |
 
 `verify-receipt.json` 整体 `status` 三态：
 - `PASS`：全部通过或所有 skipped 均合理
 - `PARTIAL`：有 `failed-after-max-retries`，但所有 P0 已通过
 - `FAIL`：P0 有未通过
+
+### 跳过率阻断与降级验证策略（硬性）
+
+当 E2E 测试存在大量跳过时，必须触发降级验证以防止验证真空。
+
+**跳过率阻断规则**：
+
+```
+skipped_rate = skipped_count / total_count × 100%
+```
+
+| 跳过率 | 处理方式 |
+|--------|---------|
+| <= 30% | 正常通过，skipped case 记录原因即可 |
+| 30% ~ 50% | 警告，在 verify-summary.md 中标注「跳过率偏高」，但不阻断 |
+| > 50% | **阻断**：E2E 阶段不可直接标记为 PASS，必须执行降级验证策略 |
+
+**降级验证策略（当跳过率 > 50% 时触发）**：
+
+当 UI/API+UI 测试因环境问题（认证服务不可达、浏览器不可用等）大面积跳过时，执行以下静态代码审查作为替代验证：
+
+**Step F1：提取需求文案清单**
+
+从原始需求文档（通过 source-materials.md 定位）和 requirements-draft 中提取所有 UI 文案要求，生成文案对照清单。
+
+**Step F2：代码级文案验证**
+
+对文案对照清单中的每一项：
+1. 在前端代码中 grep 对应的文案字符串
+2. 检查文案是否与需求文档原文完全一致
+3. 标记 `MATCH` / `MISMATCH` / `NOT_FOUND`
+
+**Step F3：代码级交互逻辑验证**
+
+对需求文档中的每个交互行为要求：
+1. 定位对应的事件处理函数
+2. 检查条件分支是否覆盖所有需求枚举的状态
+3. 检查行为是否完整（如：下载后是否清除状态、是否有重试按钮等）
+4. 标记 `COMPLETE` / `INCOMPLETE` / `MISSING`
+
+**Step F4：生成降级验证报告**
+
+```json
+{
+  "fallback_reason": "UI tests skipped due to auth service unreachable",
+  "skipped_rate": 0.65,
+  "text_verification": [
+    {"requirement": "REQ-001.AC-5", "expected": "暂无可导出的转换结果", "found_in_code": "没有转换成功的任务可导出", "status": "MISMATCH"}
+  ],
+  "interaction_verification": [
+    {"requirement": "REQ-008.AC-5", "description": "重试按钮", "status": "MISSING"}
+  ],
+  "overall_status": "FAIL"
+}
+```
+
+**Step F5：降级验证结果路由**
+
+- 降级验证 `overall_status` 为 `PASS` → E2E 阶段可标记为 `PARTIAL`（附注降级验证通过）
+- 降级验证 `overall_status` 为 `FAIL` → 将 MISMATCH/MISSING 项合成为 CRITICAL issues，走 FIX 兜底流程
+
+**跳过原因分类**：
+
+| 分类 | 标记 | 处理 |
+|------|------|------|
+| 环境问题（认证不可达、浏览器不可用） | `env_blocked` | 不计入失败率，但触发降级验证 |
+| 功能缺失（接口不存在、组件未实现） | `impl_missing` | 计入失败率，触发 FIX |
+| 测试脚本错误 | `test_bug` | 修复测试后重试，不计入功能失败 |
+| 外部依赖不可用（第三方服务） | `external_dep` | 不计入失败率，记录在案 |
 
 ## 出口条件
 

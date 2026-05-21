@@ -9,5 +9,7 @@
   "candidate_open_questions": [],
   "state_transition_scenarios": [],
   "constraint_conflicts": [],
+  "user_personas": [],
+  "error_recovery_paths": [],
   "anti_patterns": []
 }
